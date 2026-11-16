@@ -47,3 +47,62 @@ logic.
   days to seconds without touching workflow logic.
 - Self-hosting Temporal leaves the production hosting choice open (tracked separately).
 - Two model providers mean two API keys, but tests use fake LLMs and need neither.
+
+---
+
+## ADR-002: Rule engine and rulebook design
+
+- **Date:** 2026-11-16
+- **Status:** Accepted
+
+### Context
+Money amounts and deadlines must be exactly right and traceable to the RBI text. The rules come
+from five primary sources (see `docs/sources/SOURCES.md`), some of which change with the
+transaction date, and several points in them are open to interpretation.
+
+### Decision
+1. **Rules are data.** `backend/recourse/rules/rulebook/*.yaml` holds every number (TATs, ₹/day,
+   liability windows and caps, compensation limits, Ombudsman windows). Strict Pydantic models
+   (`extra="forbid"`) parse it; a broken rulebook fails at load time and in CI.
+2. **Every value carries exact quotes from its source.** `tests/rules/test_rulebook.py` extracts
+   the text of the local PDF and fails if any quote is missing (whitespace is ignored because PDF
+   extraction inserts stray spaces). Golden tests then check the numbers themselves.
+3. **`verified` flags start as `false`.** A human sets one to `true` only after checking that rule
+   against the PDF line by line. Unverified rules raise a `RULE_NOT_VERIFIED` flag on every result.
+4. **The engine is pure.** `assess_failed_transaction`, `assess_fraud` and `assess_escalation` take
+   an explicit `as_of` date and never read the clock, network or an LLM (enforced by a test).
+5. **Regime by transaction date (and bank type) for fraud:**
+   - `FRAUD-A-2017` (6 Jul 2017 – 27 Nov 2025): 2017 circular. Covers scheduled commercial banks,
+     RRBs, Small Finance Banks and Payments Banks (its addressees).
+   - `FRAUD-A-2025` (28 Nov 2025 – 31 Dec 2026): RBC Directions 2025, Section D. Same rules,
+     renumbered; commercial banks only.
+   - `FRAUD-B-2027` (from 1 Jan 2027): Third Amendment Directions 2026, Section DA; commercial
+     banks only.
+6. **Fail closed for bank types we have not read the rules for** (Small Finance Banks, Payments
+   Banks, RRBs and Local Area Banks after 27 Nov 2025; co-operative banks; NBFCs): the engine
+   returns `BANK_TYPE_NOT_IN_RULEBOOK` with no liability figures, but still shows the urgent
+   1930 / cybercrime.gov.in guidance.
+7. **Day-counting conventions:**
+   - "Within N days of D" excludes D (General Clauses Act, 1897, s.9): the last day is D + N.
+   - Delay compensation = (reversal date, or today) − (T + TAT) calendar days, floored at 0.
+   - Regime A working days are approximated: Sundays, 2nd/4th Saturdays and 26 Jan, 15 Aug,
+     2 Oct are non-working. Results are flagged `WORKING_DAYS_APPROXIMATE`, and a count within one
+     day of a liability bucket edge is flagged `BORDERLINE_WORKING_DAYS` ("confirm with your
+     branch").
+   - Regime B small-value compensation applies to frauds occurring 1 Jan 2027 – 31 Dec 2027
+     inclusive ("up to one year from the effective date", para 76U).
+   - Money is `Decimal`; 85% of net loss is rounded half-up to the paisa.
+8. **Credit-push payee ambiguity.** Annex principle 1(a) of the 2019 circular says the penalty for
+   a credit-push transfer that is not credited "has to be paid to the beneficiary", while the
+   table rows describe reversal to the remitter. We show the ₹100/day as owed to the customer
+   and raise `PAYEE_AMBIGUOUS` citing principle 1(a). Open question until clarified.
+9. **Ombudsman waiting period** is the higher of 30 days and the regulatory reply time for the
+   case (90 days for Regime A fraud, 45/60 for Regime B), per RB-IOS 2026 clause 10(1)(f). The
+   fraud `Entitlement` hands its reply time and citation to `assess_escalation`.
+
+### Consequences
+- Adding a rule means adding YAML with quotes, plus golden cases; no engine change for a new row.
+- Regime A working-day results can be off by a day for customers whose branch has state
+  holidays; the borderline flag makes this visible instead of hiding it.
+- Fraud cases at non-commercial banks get guidance but no numbers until their directions are
+  added to the rulebook.

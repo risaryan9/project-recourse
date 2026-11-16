@@ -191,68 +191,68 @@ These are inspired by ElimentaryLabs/agent-harness-starter (MIT); credit it in t
 
 > ⚠️ Check every rule against the **primary RBI/NPCI PDF** before setting `verified: true`. Items marked **VERIFY** had conflicting or secondary-only sources. Never mark a rule verified from memory or a blog.
 
-Each rulebook entry has: `id`, `regime`, `effective_from`, `effective_to`, `channel`, `scenario`, `tat`, `compensation`, `source {doc, para, url}`, `verified: bool`, `notes`.
-The engine **selects the regime by transaction date** and returns citations with every output.
+**The YAML rulebook is the single source of truth**; this section is a summary of it. Every value in the YAML carries exact `quotes` from its source, and `tests/rules/test_rulebook.py` fails if a quote is not found in the local PDF. Design and conventions: `docs/decisions.md` ADR-002.
+The engine (`rules/engine.py`) **selects the regime by transaction date (and bank type for fraud)**, takes an explicit `as_of` date, and returns citations with every output. All rules start `verified: false`; Aryan flips them after checking the PDF.
 
-### 4.1 Failed transactions: TAT and compensation
-- **Source:** RBI circular RBI/2019-20/67, DPSS.CO.PD No.629/02.01.014/2019-20, 20 Sep 2019, "Harmonisation of Turn Around Time (TAT) and customer compensation for failed transactions using authorised Payment Systems". URL: https://www.rbi.org.in/scripts/FS_Notification.aspx?Id=11693&Mode=0
-- `T` = transaction date (calendar date; **VERIFY** the circular's wording).
-- Compensation is ₹100 per day of delay beyond the TAT.
+### 4.1 Failed transactions: TAT and compensation (`failed_transactions.yaml`)
+- **Source:** RBI/2019-20/67 (20 Sep 2019), effective **15 Oct 2019**, Annex. Domestic transactions only.
+- `T` = day of transaction, a **calendar date** (Annex item 4). Compensation is ₹100 per calendar day of delay beyond T+TAT, credited suo moto (para 5).
 
-| Channel / scenario | TAT | Compensation |
-|---|---|---|
-| UPI fund transfer: debited, beneficiary not credited | Auto-reversal by T+1 | ₹100/day beyond T+1 |
-| UPI merchant payment: debited, merchant confirmation not received | Auto-reversal by T+5 | ₹100/day beyond T+5 |
-| IMPS: debited, beneficiary not credited | Reversal by T+1 | ₹100/day beyond T+1 |
-| ATM / micro-ATM: debited, cash not dispensed | Pro-active reversal by T+5 | ₹100/day beyond T+5 |
-| Card-to-card transfer: debited, beneficiary card not credited | Reversal by T+1 | ₹100/day beyond T+1 |
-| Card PoS (card present): debited, charge-slip not generated | Auto-reversal by T+5 | ₹100/day beyond T+5 |
-| Card not present (e-commerce): debited, merchant confirmation not received | **VERIFY** (T+5 per most secondary sources) | ₹100/day beyond TAT |
+| Channel / scenario (Annex row) | TAT |
+|---|---|
+| ATM / micro-ATM: cash not dispensed (1a) | T+5 |
+| Card-to-card: beneficiary card not credited (2a) | T+1 |
+| Card PoS (card present): charge-slip not generated (2b) | T+5 |
+| Card not present (e-commerce): no merchant confirmation (2c, merged cell with 2b) | T+5 |
+| IMPS: beneficiary not credited (3a) | T+1 |
+| UPI transfer: beneficiary not credited (4a) | T+1 |
+| UPI merchant payment: no merchant confirmation (4b) | T+5 |
+| AePS: merchant not confirmed / beneficiary not credited (5a, 5b merged) | T+5 |
+| APBS: beneficiary not credited (6a) | T+1 |
+| NACH: not credited (7a); debit despite revoked mandate (7b, shares 7a's compensation cell) | T+1 |
+| PPI on-us: beneficiary not credited / merchant not confirmed (8b) | T+1 |
 
-Customer errors (e.g. sending money to a wrong UPI ID) are not covered by this framework. Handle them as "not covered — here's what you can try".
+- PPI off-us transactions follow the underlying rail (8a).
+- **Open question (flagged `PAYEE_AMBIGUOUS`):** principle 1(a) says the penalty for an uncredited credit-push transfer "has to be paid to the beneficiary"; we show it as owed to the customer.
+- Customer errors (e.g. a wrong UPI ID) are not covered. Handle them as "not covered — here's what you can try".
 
-### 4.2 Unauthorised / fraudulent electronic banking transactions (two regimes)
+### 4.2 Unauthorised / fraudulent electronic banking transactions (`fraud_liability.yaml`)
 
-**Regime A: transactions before 1 Jan 2027**
-- **Source:** RBI circular DBR.No.Leg.BC.78/09.07.005/2017-18, 6 Jul 2017, "Customer Protection – Limiting Liability of Customers in Unauthorised Electronic Banking Transactions" (consolidated into RBI (Commercial Banks – Responsible Business Conduct) Directions, 2025).
-- **Liability by case:**
-  - Bank negligence or deficiency → **zero liability**, regardless of when it's reported.
-  - Third-party breach reported within **3 working days** → zero liability.
-  - Reported in **4–7 working days** → limited liability of ₹5,000 / ₹10,000 / ₹25,000 depending on account type (**VERIFY** the account-type table).
-  - Reported after 7 working days → decided by the bank's board-approved policy.
-- **Shadow credit** within **10 working days** of reporting.
-- **Working days** are counted per the home branch schedule (**VERIFY**). Approximate them with weekends, 2nd/4th Saturdays and a 2026–27 national holiday list, and label the result an approximation in the UI.
+| Regime | Transactions | Source | Bank types covered |
+|---|---|---|---|
+| `FRAUD-A-2017` | 6 Jul 2017 – 27 Nov 2025 | 2017 circular DBR.No.Leg.BC.78 (now withdrawn) | Commercial, RRB, SFB, Payments Bank |
+| `FRAUD-A-2025` | 28 Nov 2025 – 31 Dec 2026 | RBC Directions 2025, paras 64–76 (same rules) | Commercial banks only |
+| `FRAUD-B-2027` | from 1 Jan 2027 | RBC Third Amendment Directions 2026, paras 76A–76V | Commercial banks only |
 
-**Regime B: transactions on/after 1 Jan 2027**
-- **Source:** RBI (Commercial Banks – Responsible Business Conduct) Third Amendment Directions, 2026, issued 24 Jun 2026.
-- **Scope:** covers **fraudulent** transactions, including authorised-but-coerced or tricked ones, not just unauthorised ones.
-- **Burden of proof:** proving customer liability is on the bank.
-- **Liability by case:**
-  - Bank negligence → zero liability and reversal, regardless of reporting.
-  - Third-party breach reported within **5 calendar days** → zero liability (**VERIFY**: counted "from occurrence" vs "from bank communication").
-  - Reported after 5 days → bank policy.
-  - Customer negligence → customer bears the loss that isn't eligible for compensation.
-  - Losses after the customer reports → borne by the bank.
-- **Bank response:** within **45 calendar days** (60 for cross-border). Reversals are value-dated to the original date, and rejections must state reasons.
-- **Small-value compensation:**
-  - For gross loss ≤ ₹50,000: 85% of net loss or ₹25,000, whichever is lower.
-  - Once per lifetime.
-  - Requires reporting to the bank **and** to NCRP (cybercrime.gov.in) or helpline **1930** within 5 calendar days.
-- **Alerts:** banks must send instant SMS alerts for transactions above ₹500.
+Other bank types → **fail closed** (`BANK_TYPE_NOT_IN_RULEBOOK`): no liability figures, but still the 1930 guidance.
+
+**Regime A**
+- Bank negligence → zero liability, regardless of reporting.
+- Third-party breach, counted in **working days from receipt of the bank's alert**, excluding that day (home-branch schedule; approximated, see ADR-002): ≤3 → zero; 4–7 → min(txn value, Table 1 cap: ₹5,000 BSBD / ₹10,000 savings, PPI, MSME, individual current ≤₹25 lakh, credit card ≤₹5 lakh / ₹25,000 other current, credit card >₹5 lakh); >7 → bank policy.
+- Customer negligence → customer bears the loss until reporting; the bank bears losses after.
+- Shadow reversal within **10 working days** of notification; bank must resolve within **90 days**. Burden of proof on the bank.
+
+**Regime B**
+- Covers fraudulent EBTs, including coerced approvals (para 4(15A)). Burden of proof on the bank (76K).
+- Bank negligence → zero liability and reversal (76L).
+- Third-party breach reported within **5 calendar days from the transaction** → zero; later → bank policy (76M). No limited-liability tier.
+- Customer negligence → customer bears the loss not covered by compensation, until reporting (76N); losses after reporting → bank (76O).
+- Bank must resolve within **45 calendar days** (60 cross-border) of the complaint (76Q). Reversals are value-dated; rejections need reasons (76R, 76S).
+- Shadow reversal within 5 calendar days **for credit cards only** (76R).
+- **Small-value compensation (76T/76U), customer-negligence cases only:** individual (incl. sole proprietor), gross loss ≤ ₹50,000, min(85% of net loss, ₹25,000), once per lifetime, reported to the bank **and** NCRP/1930 within 5 calendar days, for frauds occurring up to 31 Dec 2027. Subject to the bank's bona fide check.
+- Banks must send instant SMS alerts for EBTs above ₹500 (76D).
 
 Fraud cases always trigger **urgent mode**: a countdown to the reporting deadline, "call 1930 / file at cybercrime.gov.in now", and a draft report to the bank.
 
-### 4.3 Escalation: RBI Integrated Ombudsman Scheme, 2026 (RB-IOS 2026)
-- **Dates:** notified 16 Jan 2026; **effective 1 Jul 2026**. It replaces RB-IOS 2021; complaints received before 1 Jul 2026 stay under the 2021 scheme.
-- **Before escalating:** the customer must **complain to the bank first**.
-- **When to escalate:** if there's no reply within **30 days**, or the reply is unsatisfactory.
-- **Deadline:** the customer must approach the Ombudsman within **90 days** of the bank's final reply or the expiry of the reply period (it was 1 year under the 2021 scheme).
-- **Awards:** up to **₹30 lakh** for actual loss, plus up to **₹3 lakh** for harassment / loss of time.
-  - The customer must accept an award within 30 days.
-  - Appeals go to the Appellate Authority within 30 days.
-- **Covered entities:** commercial banks, NBFCs with assets ≥ ₹100 crore, non-bank PPI issuers, credit information companies.
-- **How to file:** at https://cms.rbi.org.in, by email to crpc@rbi.org.in, or with CRPC, RBI, Chandigarh. Lawyers can't represent the customer; an authorised representative can.
-- **Not maintainable:** commercial decisions, matters pending or decided in court, unregulated services, complaints without sufficient evidence (**VERIFY** the full list).
+### 4.3 Escalation: RB-IOS 2026 (`ombudsman.yaml`)
+- **Dates:** notified 16 Jan 2026; **effective 1 Jul 2026**. Complaints received before then stay under RB-IOS 2021 (not modelled).
+- **Complain to the bank first** (10(1)(e)).
+- **Waiting period:** no reply within the **higher** of 30 days and the RBI/NPCI/card-network timeline (90 days for Regime A fraud, 45/60 for Regime B), or an unsatisfactory reply (10(1)(f)).
+- **Deadline:** within **90 days** of the later of the waiting period's end and the bank's last communication (10(1)(g)).
+- **Awards:** no cap on the disputed amount; up to **₹30 lakh** for consequential loss and **₹3 lakh** for time/harassment (8(3)). Accept within 30 days (15(4)); appeal within 30 days (17(3)).
+- **Covered:** all commercial banks (incl. SFB, Payments Bank, LAB), RRBs, non-bank PPI issuers, credit information companies. Co-operative banks and NBFCs only above size thresholds → `CONDITIONAL`.
+- **How to file:** https://cms.rbi.org.in, crpc@rbi.org.in, or CRPC, RBI, Chandigarh. No advocates (unless they are the aggrieved person); an authorised representative is allowed.
+- **Not maintainable / excluded:** see clause 10(1)–(2) of the scheme (same grievance pending in court or already decided, commercial judgment, vendor disputes, Limitation Act expiry, etc.).
 
 ### 4.4 Motivation facts (README; cite sources, **VERIFY** before use)
 - UPI processed 23,201.93 million transactions worth ₹29.90 lakh crore in May 2026 (NPCI data).
