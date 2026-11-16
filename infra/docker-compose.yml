@@ -1,0 +1,64 @@
+# Full local stack: Temporal dev server + API + worker.
+# Postgres is external (Neon) and configured via DATABASE_URL in ../.env.
+#
+#   docker compose -f infra/docker-compose.yml up --build
+#
+# Temporal UI: http://localhost:8233   API: http://localhost:8000/health
+# Stop any locally running `temporal server start-dev` first (ports 7233/8233).
+
+name: recourse
+
+services:
+  temporal:
+    image: temporalio/temporal:1.10.1
+    command:
+      - server
+      - start-dev
+      - --ip=0.0.0.0
+      - --ui-port=8233
+      - --db-filename=/data/temporal.db
+    ports:
+      - "7233:7233"
+      - "8233:8233"
+    volumes:
+      - temporal-data:/data
+    healthcheck:
+      test: ["CMD", "temporal", "operator", "cluster", "health", "--address", "127.0.0.1:7233"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  api:
+    build:
+      context: ../backend
+      dockerfile: ../infra/Dockerfile.backend
+    image: recourse-backend:local
+    env_file:
+      - path: ../.env
+        required: false
+    environment:
+      TEMPORAL_ADDRESS: temporal:7233
+      CORS_ORIGINS: '["http://localhost:3000"]'
+    ports:
+      - "8000:8000"
+    depends_on:
+      temporal:
+        condition: service_healthy
+
+  worker:
+    image: recourse-backend:local
+    command: ["python", "-m", "recourse.temporal.worker"]
+    env_file:
+      - path: ../.env
+        required: false
+    environment:
+      TEMPORAL_ADDRESS: temporal:7233
+    depends_on:
+      temporal:
+        condition: service_healthy
+      api:
+        condition: service_started  # ensures the shared image is built first
+    restart: unless-stopped
+
+volumes:
+  temporal-data:
