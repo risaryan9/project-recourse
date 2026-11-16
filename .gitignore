@@ -32,3 +32,6 @@ out/
 Thumbs.db
 .idea/
 .vscode/
+
+# Claws terminal orchestration runtime
+.claws/
