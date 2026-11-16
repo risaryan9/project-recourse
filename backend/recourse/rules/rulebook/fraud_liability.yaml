@@ -1,0 +1,274 @@
+# Customer liability for unauthorised / fraudulent electronic banking transactions.
+#
+# Three regimes, chosen by the TRANSACTION date (and the bank type):
+#   FRAUD-A-2017  2017-07-06 .. 2025-11-27  RBI circular DBR.No.Leg.BC.78 (2017)
+#   FRAUD-A-2025  2025-11-28 .. 2026-12-31  RBC Directions 2025, Section D (same rules, renumbered)
+#   FRAUD-B-2027  2027-01-01 ..             RBC Third Amendment Directions 2026, Section DA
+#
+# Bank types outside a regime's `covered_bank_types` are NOT covered by this rulebook: the engine
+# fails closed for them (decision recorded in docs/decisions.md).
+#
+# Every value has a `source` with exact quotes; a test checks each quote against the local PDF.
+# `verified` is set to true only by a human after checking the regime against the PDF.
+
+regimes:
+  # ---------------------------------------------------------------------------------------------
+  - id: FRAUD-A-2017
+    name: Limiting liability of customers in unauthorised electronic banking transactions (2017)
+    doc: RBI-2017-CUSTOMER-LIABILITY
+    effective_from: 2017-07-06
+    effective_to: 2025-11-27
+    verified: false
+    covered_bank_types: [COMMERCIAL_BANK, REGIONAL_RURAL_BANK, SMALL_FINANCE_BANK, PAYMENTS_BANK]
+    scope:
+      para: "Addressees"
+      quotes:
+        - "All Scheduled Commercial Banks (including RRBs)"
+        - "All Small Finance Banks and Payments Banks"
+    burden_of_proof:
+      para: "para 12"
+      quotes:
+        - "The burden of proving customer liability in case of unauthorised electronic"
+    bank_fault:
+      outcome: ZERO
+      source:
+        para: "para 6(i)"
+        quotes:
+          - "Contributory fraud/ negligence/ deficiency on the part of the bank"
+    third_party:
+      clock_start: BANK_COMMUNICATION
+      day_kind: WORKING
+      zero_liability_max_days: 3
+      zero_source:
+        para: "para 6(ii)"
+        quotes:
+          - "the bank within three working days of receiving the communication from"
+      limited_liability_max_days: 7
+      limited_source:
+        para: "para 7(ii)"
+        quotes:
+          - "elsewhere in the system and when there is a delay (of four to seven"
+          - "transaction liability of the customer shall be limited to the transaction value"
+      beyond_outcome: BANK_POLICY
+      beyond_source:
+        para: "para 7 (after Table 1)"
+        quotes:
+          - "Further, if the delay in reporting is beyond seven working days, the customer"
+          - "liability shall be determined as per the bank’s Board approved policy."
+      day_count_source:
+        para: "para 8 (note to Table 2)"
+        quotes:
+          - "working schedule of the home branch of the customer excluding the date of receiving"
+    customer_negligence:
+      source:
+        para: "para 7(i)"
+        quotes:
+          - "In cases where the loss is due to negligence by a customer, such as"
+          - "Any loss occurring after the reporting of the unauthorised transaction shall be"
+    liability_caps:
+      source:
+        para: "para 7(ii), Table 1"
+        quotes:
+          - "Maximum Liability of a Customer under paragraph 7 (ii)"
+          - "BSBD Accounts 5,000"
+          - "Credit cards with limit up to Rs.5 lakh"
+          - "Credit cards with limit above Rs.5 lakh"
+      caps:
+        - max_inr: 5000
+          account_types: [BSBD]
+        - max_inr: 10000
+          account_types:
+            - SAVINGS
+            - PPI_OR_GIFT_CARD
+            - MSME_CURRENT_CC_OD
+            - INDIVIDUAL_CURRENT_CC_OD_UP_TO_25_LAKH
+            - CREDIT_CARD_UP_TO_5_LAKH
+        - max_inr: 25000
+          account_types: [OTHER_CURRENT_CC_OD, CREDIT_CARD_ABOVE_5_LAKH]
+    shadow_reversal:
+      days: 10
+      day_kind: WORKING
+      credit_card_only: false
+      source:
+        para: "para 9"
+        quotes:
+          - "within 10 working days from the date of such notification by the customer"
+    bank_resolution:
+      domestic_days: 90
+      cross_border_days: 90
+      source:
+        para: "para 10(i)"
+        quotes:
+          - "not exceeding 90 days from the date of receipt of the complaint"
+    small_value_compensation: null
+
+  # ---------------------------------------------------------------------------------------------
+  - id: FRAUD-A-2025
+    name: RBC Directions 2025, Section D (limiting liability in unauthorised EBTs)
+    doc: RBI-2025-RBC-DIRECTIONS
+    effective_from: 2025-11-28
+    effective_to: 2026-12-31
+    verified: false
+    covered_bank_types: [COMMERCIAL_BANK]
+    scope:
+      para: "paras 2 and 3"
+      quotes:
+        - "These Directions shall come into effect immediately upon issuance, unless indicated otherwise."
+        - "‘Commercial Banks’ mean banking companies (other than Small Finance Banks, Payments Banks, and Local Area Banks), corresponding new banks, and the State Bank of India"
+    burden_of_proof:
+      para: "para 75"
+      quotes:
+        - "The burden of proving customer liability in case of unauthorised electronic banking transactions shall lie on the bank."
+    bank_fault:
+      outcome: ZERO
+      source:
+        para: "para 67(1)"
+        quotes:
+          - "Contributory fraud / negligence / deficiency on the part of the bank (irrespective of whether the transaction is reported by the customer or not)."
+    third_party:
+      clock_start: BANK_COMMUNICATION
+      day_kind: WORKING
+      zero_liability_max_days: 3
+      zero_source:
+        para: "para 67(2)"
+        quotes:
+          - "the customer notifies the bank within three working days of receiving the communication from the bank regarding the unauthorised transaction."
+      limited_liability_max_days: 7
+      limited_source:
+        para: "para 68(2)"
+        quotes:
+          - "the customer notifies the bank of such a transaction within four to seven working days of receiving a communication of the transaction"
+          - "the per transaction liability of the customer shall be limited to the transaction value or the amount mentioned in Table 1"
+      beyond_outcome: BANK_POLICY
+      beyond_source:
+        para: "para 69"
+        quotes:
+          - "if the delay in reporting is beyond seven working days, the customer liability shall be determined as per the bank’s policy"
+      day_count_source:
+        para: "para 71"
+        quotes:
+          - "The number of working days mentioned in Table 2 shall be counted as per the working schedule of the home branch of the customer excluding the date of receiving the communication."
+    customer_negligence:
+      source:
+        para: "para 68(1)"
+        quotes:
+          - "the customer will bear the entire loss until she / he reports the unauthorised transaction to the bank."
+          - "Any loss occurring after the reporting of the unauthorised transaction shall be borne by the bank."
+    liability_caps:
+      source:
+        para: "para 68(2), Table 1"
+        quotes:
+          - "Maximum liability of a customer under paragraph 68 (2)"
+      caps:
+        - max_inr: 5000
+          account_types: [BSBD]
+        - max_inr: 10000
+          account_types:
+            - SAVINGS
+            - PPI_OR_GIFT_CARD
+            - MSME_CURRENT_CC_OD
+            - INDIVIDUAL_CURRENT_CC_OD_UP_TO_25_LAKH
+            - CREDIT_CARD_UP_TO_5_LAKH
+        - max_inr: 25000
+          account_types: [OTHER_CURRENT_CC_OD, CREDIT_CARD_ABOVE_5_LAKH]
+    shadow_reversal:
+      days: 10
+      day_kind: WORKING
+      credit_card_only: false
+      source:
+        para: "para 72"
+        quotes:
+          - "within 10 working days from the date of such notification by the customer"
+    bank_resolution:
+      domestic_days: 90
+      cross_border_days: 90
+      source:
+        para: "para 73(1)"
+        quotes:
+          - "but not exceeding 90 days from the date of receipt of the complaint"
+    small_value_compensation: null
+
+  # ---------------------------------------------------------------------------------------------
+  - id: FRAUD-B-2027
+    name: RBC Third Amendment Directions 2026, Section DA (fraudulent EBTs)
+    doc: RBI-2026-RBC-THIRD-AMENDMENT
+    effective_from: 2027-01-01
+    effective_to: null
+    verified: false
+    covered_bank_types: [COMMERCIAL_BANK]
+    scope:
+      para: "preamble and para 3(2)"
+      quotes:
+        - "for Commercial Banks (other than Small Finance Banks, Payments Banks, Regional Rural Banks, and Local Area Banks)"
+        - "These Directions shall apply in cases of electronic banking transactions undertaken by customers of a bank on or after January 1, 2027."
+    burden_of_proof:
+      para: "para 76K"
+      quotes:
+        - "The burden of proving customer liability in complaints involving fraudulent EBTs shall lie on the bank."
+    bank_fault:
+      outcome: ZERO
+      source:
+        para: "para 76L"
+        quotes:
+          - "A customer shall be entitled to zero liability and reversal of the transaction in cases where the fraudulent EBT occurs due to negligence / deficiency on the part of the bank, irrespective of whether the transaction is reported by the customer or not."
+    third_party:
+      clock_start: TRANSACTION
+      day_kind: CALENDAR
+      zero_liability_max_days: 5
+      zero_source:
+        para: "para 76M"
+        quotes:
+          - "fraudulent EBT to the bank within five calendar days from the date of its occurrence."
+      limited_liability_max_days: null
+      limited_source: null
+      beyond_outcome: BANK_POLICY
+      beyond_source:
+        para: "para 76M"
+        quotes:
+          - "In cases of third-party breach reported to the bank after five calendar days, the customer’s liability shall be determined as per the bank’s policy."
+      day_count_source:
+        para: "para 76M"
+        quotes:
+          - "within five calendar days from the date of its occurrence"
+    customer_negligence:
+      source:
+        para: "paras 76N, 76O"
+        quotes:
+          - "In cases where the fraudulent EBT occurs due to negligence by the customer, he / she shall be liable for the loss incurred by him / her, to the extent of loss not eligible for compensation as per the mechanism detailed at paragraph 76T below, until he / she reports the fraudulent EBT to the bank."
+          - "Loss arising from any unauthorised transaction occurring after the reporting of the fraudulent EBT by a customer to a bank shall be borne by the bank."
+    liability_caps: null
+    shadow_reversal:
+      days: 5
+      day_kind: CALENDAR
+      credit_card_only: true
+      source:
+        para: "para 76R"
+        quotes:
+          - "in case of a complaint arising out of fraudulent EBT(s) in a credit card, a bank shall provide shadow reversal"
+          - "equivalent to the amount involved in the fraudulent EBT(s) within five calendar days from the date of receipt of notification from the customer."
+    bank_resolution:
+      domestic_days: 45
+      cross_border_days: 60
+      source:
+        para: "para 76Q"
+        quotes:
+          - "this timeline shall not exceed 45 calendar days from the date of receipt of the complaint by the bank in case of a complaint arising out of domestic fraudulent EBT(s) and 60 calendar days from the date of receipt of the complaint by the bank in case of a complaint arising out of cross-border fraudulent EBT(s)."
+    small_value_compensation:
+      applies_to_fault: CUSTOMER
+      individuals_only: true
+      max_gross_loss_inr: 50000
+      percent_of_net_loss: 85
+      cap_inr: 25000
+      report_within_calendar_days: 5
+      requires_ncrp_or_1930_report: true
+      once_per_lifetime: true
+      occurrence_on_or_before: 2027-12-31
+      source:
+        para: "para 76T(1)"
+        quotes:
+          - "A bona fide victim, being an individual person, including a sole proprietor, and having lodged a complaint involving gross loss of an amount up to ₹50,000 on account of fraudulent EBT(s) covered under paragraph 76N above, shall be compensated 85 per cent of the net loss amount (calculated after reducing recoveries made, whether before or after paying the compensation, from the gross loss amount), or ₹25,000, whichever is less, once during her / his lifetime"
+          - "the victim has reported the fraudulent EBT(s) on the National Cyber Crime Reporting Portal or National Cyber Crime Helpline (1930) and to the bank within five calendar days from its occurrence."
+      window_source:
+        para: "para 76U"
+        quotes:
+          - "The compensation shall be payable for losses incurred on fraudulent EBTs occurring up to one year from the effective date of these Directions."

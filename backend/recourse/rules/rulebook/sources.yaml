@@ -1,0 +1,52 @@
+# Primary source documents. Every rule in this rulebook cites one of these by `id`.
+# Local copies live in docs/sources/ (see docs/sources/SOURCES.md). A test checks that every
+# `quote` in the rulebook appears verbatim in the local copy of the cited document.
+
+documents:
+  - id: RBI-2019-FAILED-TXN-TAT
+    title: >-
+      Harmonisation of Turn Around Time (TAT) and customer compensation for failed transactions
+      using authorised Payment Systems
+    ref: RBI/2019-20/67, DPSS.CO.PD No.629/02.01.014/2019-20
+    issued: 2019-09-20
+    url: https://www.rbi.org.in/scripts/FS_Notification.aspx?Id=11693&Mode=0
+    local_file: rbi-2019-failed-txn-tat-compensation.pdf
+
+  - id: RBI-2017-CUSTOMER-LIABILITY
+    title: >-
+      Customer Protection – Limiting Liability of Customers in Unauthorised Electronic Banking
+      Transactions
+    ref: RBI/2017-18/15, DBR.No.Leg.BC.78/09.07.005/2017-18
+    issued: 2017-07-06
+    url: https://www.rbi.org.in/scripts/NotificationUser.aspx?Id=11040&Mode=0
+    local_file: rbi-2017-limiting-liability-unauthorised-ebanking.pdf
+    notes: >-
+      Withdrawn and consolidated into the RBC Directions, 2025 (Section D, paras 64-76) for
+      commercial banks. Still the operative text for transactions before 2025-11-28.
+
+  - id: RBI-2025-RBC-DIRECTIONS
+    title: Reserve Bank of India (Commercial Banks - Responsible Business Conduct) Directions, 2025
+    ref: RBI/DOR/2025-26/170, DOR.MCS.REC.No.89/01-01-032/2025-26
+    issued: 2025-11-28
+    url: https://www.rbi.org.in/Scripts/BS_ViewMasDirections.aspx?id=13140
+    local_file: rbi-2025-rbc-directions.pdf
+    notes: >-
+      Applies to commercial banks other than Small Finance Banks, Payments Banks, Regional Rural
+      Banks and Local Area Banks. In force from issuance (para 2). Section D (paras 64-76) is
+      replaced by the Third Amendment Directions, 2026 for transactions on/after 2027-01-01.
+
+  - id: RBI-2026-RBC-THIRD-AMENDMENT
+    title: >-
+      Reserve Bank of India (Commercial Banks - Responsible Business Conduct) Third Amendment
+      Directions, 2026
+    ref: RBI/2026-27/167, DOR.MCS.REC.No.130/01-01-032/2026-27
+    issued: 2026-06-24
+    url: https://rbi.org.in/Scripts/NotificationUser.aspx?Id=13543&Mode=0
+    local_file: rbi-2026-rbc-third-amendment-directions.pdf
+
+  - id: RBI-IOS-2026
+    title: Reserve Bank – Integrated Ombudsman Scheme, 2026
+    ref: RB-IOS 2026
+    issued: 2026-01-16
+    url: https://www.rbi.org.in/Scripts/BS_PressReleaseDisplay.aspx?prid=62052
+    local_file: rbi-2026-integrated-ombudsman-scheme.pdf

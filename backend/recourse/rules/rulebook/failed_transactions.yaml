@@ -1,0 +1,291 @@
+# Failed transactions: Turn Around Time (TAT) for reversal, and compensation for delay.
+#
+# Source: RBI circular RBI/2019-20/67 (20 Sep 2019), effective 15 Oct 2019 (para 7), and its Annex.
+#
+# How to read a rule:
+#   tat_days            -> the reversal must be complete by T + tat_days (T = transaction date)
+#   compensation_per_day_inr -> paid for each calendar day the reversal is late after T + tat_days
+#   quotes              -> exact text from the source; a test fails if any is not in the PDF
+#   verified            -> set to true only by a human after checking the rule against the PDF
+#
+# Merged table cells: in the Annex table, rows 2(b)/2(c), 5(a)/5(b) and the compensation cell of
+# 7(a)/7(b) are single merged cells (checked visually on PDF pages 4-5). The rows that sit under a
+# merged cell share that cell's text, so their quotes repeat it.
+
+regime:
+  id: FAILED-TXN-2019
+  name: Failed transactions TAT and compensation framework (2019)
+  doc: RBI-2019-FAILED-TXN-TAT
+  effective_from: 2019-10-15
+  effective_to: null
+  domestic_only: true
+  verified: false  # covers the `general` provisions below; each rule has its own flag
+
+general:
+  effective_date:
+    para: "para 7"
+    quotes:
+      - "shall come into effect from October 15, 2019"
+  t_definition:
+    para: "Annex, General Instructions, item 4"
+    quotes:
+      - "T is the day of transaction and refers to the calendar date."
+  r_definition:
+    para: "Annex, General Instructions, item 5"
+    quotes:
+      - "R is the day on which the reversal is concluded and the funds are received by"
+  failed_transaction_definition:
+    para: "Annex, General Instructions, item 2"
+    quotes:
+      - "A ‘failed transaction’ is a transaction which has not been fully completed due to"
+      - "any reason not attributable to the customer"
+  domestic_only:
+    para: "Annex, General Instructions, item 7"
+    quotes:
+      - "those where both the originator and beneficiary are within India are covered under this framework."
+  suo_moto_compensation:
+    para: "para 5"
+    quotes:
+      - "Wherever financial compensation is involved, the same shall be effected to the"
+      - "without waiting for a complaint or claim from the"
+  credit_push_payee_principle:
+    para: "Annex, General Instructions, item 1(a)"
+    quotes:
+      - "If the transaction is a ‘credit-push’ funds transfer and the beneficiary account"
+      - "be paid to the beneficiary;"
+  tat_is_outer_limit:
+    para: "para 4"
+    quotes:
+      - "the prescribed TAT is the outer limit for resolution of failed transactions;"
+
+rules:
+  - id: FT-ATM-CASH-NOT-DISPENSED
+    channel: ATM
+    scenario: CASH_NOT_DISPENSED
+    description: ATM or micro-ATM. Account debited but cash not dispensed.
+    tat_days: 5
+    compensation_per_day_inr: 100
+    credit_push: false
+    source:
+      para: "Annex, Sl. 1(a)"
+      quotes:
+        - "Customer’s account debited but cash not dispensed."
+        - "Pro-active reversal (R) of failed transaction within a maximum of T + 5 days."
+        - "₹ 100/- per day of delay beyond T + 5 days, to the credit of the account holder."
+    verified: false
+
+  - id: FT-CARD-TO-CARD-NOT-CREDITED
+    channel: CARD_TO_CARD
+    scenario: BENEFICIARY_NOT_CREDITED
+    description: Card-to-card transfer. Card account debited but beneficiary card not credited.
+    tat_days: 1
+    compensation_per_day_inr: 100
+    credit_push: true
+    source:
+      para: "Annex, Sl. 2(a)"
+      quotes:
+        - "Card account debited but the beneficiary card account not credited."
+        - "Transaction to be reversed (R) latest within T + 1 day"
+        - "₹ 100/- per day of delay beyond T + 1 day."
+    verified: false
+
+  - id: FT-CARD-POS-NOT-CONFIRMED
+    channel: CARD_POS
+    scenario: MERCHANT_NOT_CONFIRMED
+    description: >-
+      Card present at a PoS terminal (including cash at PoS). Account debited but no
+      confirmation at the merchant (charge-slip not generated).
+    tat_days: 5
+    compensation_per_day_inr: 100
+    credit_push: false
+    source:
+      para: "Annex, Sl. 2(b)"
+      quotes:
+        - "Account debited but confirmation not received at merchant location i.e., charge-slip not generated."
+        - "Auto-reversal within T + 5 days."
+        - "₹ 100/- per day of delay beyond T + 5 days."
+    verified: false
+
+  - id: FT-CARD-CNP-NOT-CONFIRMED
+    channel: CARD_NOT_PRESENT
+    scenario: MERCHANT_NOT_CONFIRMED
+    description: >-
+      Card not present (e-commerce). Account debited but no confirmation at the merchant's
+      system.
+    tat_days: 5
+    compensation_per_day_inr: 100
+    credit_push: false
+    source:
+      para: "Annex, Sl. 2(c) (TAT and compensation in the cell merged with 2(b))"
+      quotes:
+        - "Card Not Present (CNP) (e- commerce)"
+        - "Account debited but confirmation not received at merchant’s system."
+        - "Auto-reversal within T + 5 days."
+        - "₹ 100/- per day of delay beyond T + 5 days."
+    verified: false
+    notes: >-
+      Row 2(c) has no TAT text of its own; it shares the merged TAT and compensation cells of
+      row 2(b). Checked visually on PDF page 4.
+
+  - id: FT-IMPS-NOT-CREDITED
+    channel: IMPS
+    scenario: BENEFICIARY_NOT_CREDITED
+    description: IMPS. Account debited but beneficiary account not credited.
+    tat_days: 1
+    compensation_per_day_inr: 100
+    credit_push: true
+    source:
+      para: "Annex, Sl. 3(a)"
+      quotes:
+        - "Immediate Payment System (IMPS)"
+        - "If unable to credit to beneficiary account, auto reversal (R) by the Beneficiary bank latest on T + 1 day."
+        - "₹100/- per day if delay is beyond T + 1 day."
+    verified: false
+
+  - id: FT-UPI-P2P-NOT-CREDITED
+    channel: UPI
+    scenario: BENEFICIARY_NOT_CREDITED
+    description: UPI fund transfer. Account debited but beneficiary account not credited.
+    tat_days: 1
+    compensation_per_day_inr: 100
+    credit_push: true
+    source:
+      para: "Annex, Sl. 4(a)"
+      quotes:
+        - "Account debited but the beneficiary account is not credited (transfer of funds)."
+        - "If unable to credit the beneficiary account, auto reversal (R) by the Beneficiary bank latest on T + 1 day."
+        - "₹100/- per day if delay is beyond T + 1 day."
+    verified: false
+
+  - id: FT-UPI-MERCHANT-NOT-CONFIRMED
+    channel: UPI
+    scenario: MERCHANT_NOT_CONFIRMED
+    description: UPI payment to a merchant. Account debited but no confirmation at the merchant.
+    tat_days: 5
+    compensation_per_day_inr: 100
+    credit_push: false
+    source:
+      para: "Annex, Sl. 4(b)"
+      quotes:
+        - "Account debited but transaction confirmation not received at merchant location (payment to merchant)."
+        - "Auto-reversal within T + 5 days."
+        - "₹100/- per day if delay is beyond T + 5 days."
+    verified: false
+
+  - id: FT-AEPS-MERCHANT-NOT-CONFIRMED
+    channel: AEPS
+    scenario: MERCHANT_NOT_CONFIRMED
+    description: AePS (including Aadhaar Pay). Account debited but no confirmation at the merchant.
+    tat_days: 5
+    compensation_per_day_inr: 100
+    credit_push: false
+    source:
+      para: "Annex, Sl. 5(a)"
+      quotes:
+        - "Aadhaar Enabled Payment System (including Aadhaar Pay)"
+        - "Acquirer to initiate “Credit Adjustment” within T + 5 days."
+        - "₹100/- per day if delay is beyond T + 5 days."
+    verified: false
+
+  - id: FT-AEPS-NOT-CREDITED
+    channel: AEPS
+    scenario: BENEFICIARY_NOT_CREDITED
+    description: AePS. Account debited but beneficiary account not credited.
+    tat_days: 5
+    compensation_per_day_inr: 100
+    credit_push: false
+    source:
+      para: "Annex, Sl. 5(b) (TAT and compensation in the cell merged with 5(a))"
+      quotes:
+        - "Account debited but beneficiary account not credited."
+        - "Acquirer to initiate “Credit Adjustment” within T + 5 days."
+        - "₹100/- per day if delay is beyond T + 5 days."
+    verified: false
+    notes: >-
+      Row 5(b) shares the merged TAT and compensation cells of row 5(a). Checked visually on
+      PDF page 5.
+
+  - id: FT-APBS-NOT-CREDITED
+    channel: APBS
+    scenario: BENEFICIARY_NOT_CREDITED
+    description: Aadhaar Payment Bridge System. Delay in crediting the beneficiary's account.
+    tat_days: 1
+    compensation_per_day_inr: 100
+    credit_push: true
+    source:
+      para: "Annex, Sl. 6(a)"
+      quotes:
+        - "Aadhaar Payment Bridge System (APBS)"
+        - "Beneficiary bank to reverse the transaction within T + 1 day."
+        - "₹100/- per day if delay is beyond T + 1 day."
+    verified: false
+
+  - id: FT-NACH-NOT-CREDITED
+    channel: NACH
+    scenario: BENEFICIARY_NOT_CREDITED
+    description: NACH. Delay in crediting the beneficiary's account or reversal of the amount.
+    tat_days: 1
+    compensation_per_day_inr: 100
+    credit_push: true
+    source:
+      para: "Annex, Sl. 7(a)"
+      quotes:
+        - "National Automated Clearing House (NACH)"
+        - "Beneficiary bank to reverse the uncredited transaction within T + 1 day."
+        - "₹100/- per day if delay is beyond T + 1 day."
+    verified: false
+
+  - id: FT-NACH-MANDATE-REVOKED
+    channel: NACH
+    scenario: MANDATE_REVOKED_DEBIT
+    description: NACH. Account debited despite the customer having revoked the debit mandate.
+    tat_days: 1
+    compensation_per_day_inr: 100
+    credit_push: false
+    source:
+      para: "Annex, Sl. 7(b) (compensation in the cell merged with 7(a))"
+      quotes:
+        - "Account debited despite revocation of debit mandate with the bank by the customer."
+        - "Customer’s bank will be responsible for such debit. Resolution to be completed within T + 1 day."
+        - "₹100/- per day if delay is beyond T + 1 day."
+    verified: false
+    notes: >-
+      Row 7(b) has its own TAT text but shares the merged compensation cell of row 7(a).
+      Checked visually on PDF page 5.
+
+  - id: FT-PPI-ON-US-NOT-CREDITED
+    channel: PPI_ON_US
+    scenario: BENEFICIARY_NOT_CREDITED
+    description: PPI (card/wallet) on-us transaction. Beneficiary's PPI not credited.
+    tat_days: 1
+    compensation_per_day_inr: 100
+    credit_push: false
+    source:
+      para: "Annex, Sl. 8(b)"
+      quotes:
+        - "Beneficiary’s PPI not credited."
+        - "Reversal effected in Remitter’s account within T + 1 day."
+        - "₹100/- per day if delay is beyond T + 1 day."
+    verified: false
+
+  - id: FT-PPI-ON-US-MERCHANT-NOT-CONFIRMED
+    channel: PPI_ON_US
+    scenario: MERCHANT_NOT_CONFIRMED
+    description: PPI on-us transaction. PPI debited but no confirmation at the merchant.
+    tat_days: 1
+    compensation_per_day_inr: 100
+    credit_push: false
+    source:
+      para: "Annex, Sl. 8(b)"
+      quotes:
+        - "PPI debited but transaction confirmation not received at merchant location."
+        - "Reversal effected in Remitter’s account within T + 1 day."
+        - "₹100/- per day if delay is beyond T + 1 day."
+    verified: false
+
+# PPI off-us transactions (Annex, Sl. 8(a)) "ride on" the underlying rail (UPI, card network,
+# IMPS, ...), so intake must record the underlying channel. There is no separate rule for them.
+ppi_off_us:
+  para: "Annex, Sl. 8(a)"
+  quotes:
+    - "The transaction will ride on UPI, card network, IMPS, etc., as the case may be."
