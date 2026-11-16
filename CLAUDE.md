@@ -30,8 +30,8 @@ When a UPI transfer fails, an ATM doesn't dispense cash, or a customer is defrau
 2. Agent extracts structured facts: UTR/RRN, amount, timestamp, channel, bank, status.
 3. **Deterministic rule engine** classifies the case and computes the amount owed (refund + compensation), every deadline, and the applicable rulebook. **Each number cites the exact RBI clause.**
 4. Agent drafts the complaint to the bank, plus a 1930 / cybercrime report for fraud cases.
-5. **User approves** the draft and sends it themselves. The agent never sends or files anything.
-6. The case runs long-term: it waits for the bank's response window, the user forwards the bank's reply, and the agent judges whether the reply complies with the rules.
+5. **User approves** the draft. Only then is it sent: through the user's own Gmail if they connected it (`GmailChannel`, the default), otherwise the user sends it themselves (`ManualChannel`). Nothing is sent without explicit approval of that specific email, and nothing is ever filed by the agent.
+6. The case runs long-term: it waits for the bank's response window while the reply watcher checks the email thread (or the user pastes/forwards the reply), and the agent judges whether the reply complies with the rules.
 7. If the case is unresolved or the reply is non-compliant, the agent drafts the RBI Ombudsman complaint (formatted for cms.rbi.org.in fields) inside the 90-day window. The user approves and files it.
 8. Case closes: resolved, escalated, or abandoned. Every step is in the audit trail.
 
@@ -50,7 +50,8 @@ When a UPI transfer fails, an ATM doesn't dispense cash, or a customer is defrau
 - Show an "informational, not legal advice" notice in the UI and drafts.
 
 ### Non-goals (do not build)
-- Auto-sending emails or auto-filing on cms.rbi.org.in / cybercrime.gov.in. A human always submits, and CMS uses a CAPTCHA anyway.
+- Sending anything without explicit per-email approval.
+- Auto-filing on cms.rbi.org.in / cybercrime.gov.in. The human always files, and CMS uses a CAPTCHA anyway.
 - Telegram/WhatsApp bots.
 
 ---
@@ -61,22 +62,23 @@ When a UPI transfer fails, an ATM doesn't dispense cash, or a customer is defrau
 
 | Layer | Choice | Notes |
 |---|---|---|
-| Main agent / drafting | **Claude Sonnet 5.5** (`claude-sonnet-5-5`) | Anthropic SDK |
+| Main agent / drafting | **Claude Sonnet 5.5** (`claude-sonnet-5-5`) | Anthropic SDK. Also drafts in Hindi (stretch) |
 | Extraction (screenshots/PDFs) | **Claude Haiku 5.5** (`claude-haiku-5-5`) | Vision + native PDF; structured output |
+| Reply watcher classification | **Claude Haiku 5.5** | Labels each new bank message (acknowledgement / substantive) |
 | Independent eval judge | **OpenAI GPT model** (`OPENAI_JUDGE_MODEL`) | Different model family from the drafter → less self-preference bias |
-| Voice notes (stretch) | OpenAI speech-to-text | `OPENAI_STT_MODEL` |
+| Email channel | **Gmail API** (`GmailChannel`, default) + `ManualChannel` fallback | OAuth, minimal scopes; see §3 "Email channel" |
 | Rule-change watcher (stretch) | Claude web search tool, allowed domains `rbi.org.in`, `npci.org.in` | Opens review items; never auto-edits rules |
 | Agent logic | **LangGraph** | Inner reasoning graphs |
-| Durable case workflow | **Temporal (self-hosted)** | Local: `temporal server start-dev`; production host is an open decision (§10) |
+| Durable case workflow | **Temporal (self-hosted)** | Local: `temporal server start-dev`; production host is an open decision (§12) |
 | Rule engine | Plain Python + versioned YAML rulebook | 100% deterministic, fully unit-tested |
 | Backend API | **FastAPI + Pydantic v2**, Python 3.12, **uv** | |
 | Database | **Neon Postgres** (free tier) + **pgvector** | Cases, evidence, drafts, audit log, regulation chunks |
 | Embeddings | OpenAI small embedding model (`OPENAI_EMBED_MODEL`) | Regulation text retrieval only |
-| Frontend | **Next.js** (App Router, TypeScript) on **Vercel** | Keep it simple and clean |
+| Frontend | **Next.js** (App Router, TypeScript) + **Tailwind** + **shadcn/ui** on **Vercel** | Theme in `DESIGN.md`; see §6 |
 | Tracing | **LangSmith** free plan | `LANGSMITH_TRACING=true` |
 | CI | **GitHub Actions** | Unit + rule-engine + workflow tests on every push |
 
-Model IDs come from config/env, never hard-coded in business logic.
+Model IDs come from config/env, never hard-coded in business logic. Models are Anthropic and OpenAI only.
 
 ---
 
@@ -92,7 +94,8 @@ FastAPI ──start/signal/query──► Temporal Server (self-hosted)
    │                         Temporal Worker (Python)
    │                           ├─ CaseWorkflow (one per case, runs for weeks)
    │                           └─ Activities ──► LangGraph graphs ──► Claude / OpenAI
-   │                                          └─► Rule engine (pure Python)
+   │                                          ├─► Rule engine (pure Python)
+   │                                          └─► EmailChannel ──► Gmail API (send, thread read)
    ▼
 Neon Postgres (+pgvector): cases, evidence, entitlements, drafts, audit_events, reg_chunks
 ```
@@ -105,9 +108,9 @@ Neon Postgres (+pgvector): cases, evidence, entitlements, drafts, audit_events, 
 ### CaseWorkflow states
 `NEW → EXTRACTED → ASSESSED → DRAFT_READY → AWAITING_APPROVAL → SENT_TO_BANK → AWAITING_BANK (timer) → BANK_REPLIED → JUDGED → (RESOLVED | ESCALATION_DRAFT_READY → AWAITING_APPROVAL → FILED_WITH_OMBUDSMAN → CLOSED) | ABANDONED`
 
-- **Signals:** `approve_draft(draft_id, edits?)`, `reject_draft(reason)`, `mark_sent(channel, sent_at)`, `bank_replied(text|file)`, `mark_resolved(amount_received)`, `abandon()`.
+- **Signals:** `approve_draft(draft_id, edits?)`, `reject_draft(reason)`, `mark_sent(channel, sent_at)` (ManualChannel only; GmailChannel records the send itself), `bank_replied(text|file)` (manual paste/forward), `mark_resolved(amount_received)`, `abandon()`.
 - **Queries:** `get_status()`, `get_timeline()`, `get_entitlement()`.
-- **Timers:** bank response window; Ombudsman 90-day window reminder; fraud-reporting countdown.
+- **Timers:** bank response window; Ombudsman 90-day window reminder; fraud-reporting countdown; Gmail reply-watcher poll interval.
 
 ### LangGraph graphs
 1. **IntakeGraph:**
@@ -121,10 +124,52 @@ Neon Postgres (+pgvector): cases, evidence, entitlements, drafts, audit_events, 
    - The **`verify` node is mandatory and cannot be skipped**: every ₹ amount, date, deadline and clause in the text must exactly match the rule engine's `Entitlement`.
    - On a mismatch, revise (max 3 loops). If it still fails, fail closed with an error.
 3. **ReplyJudgeGraph:**
-   - Evaluates a forwarded bank reply against the rules. Did they reverse? Pay compensation? Give reasons for a rejection as required?
-   - Runs a **phishing check**: requests for OTP/PIN/CVV/password, remote-access apps, suspicious links.
-   - Outputs a verdict and the next action.
+   - Evaluates a substantive bank reply (from the reply watcher, or pasted/forwarded by the user) against the rules. Did they reverse? Pay compensation? Give reasons for a rejection as required?
+   - Runs a **phishing check** (requests for OTP/PIN/CVV/password, remote-access apps, suspicious links) and a **sender-domain check** against the bank contacts file.
+   - **Has no tools.** Its LLM output is a fixed enum of labels plus extracted fields; the workflow decides the next action from that verdict, and any consequential action still needs approval.
 4. **WatcherGraph** (stretch): Claude web search on the allowed domains → summarise new circulars → open a "rule review" item. Never edits the rulebook automatically.
+
+### Email channel (Gmail by default)
+
+`EmailChannel` is one interface with two implementations:
+- **`GmailChannel`**: the default when the user has connected Gmail.
+- **`ManualChannel`**: the fallback. Copy button + `mailto:` link to send; the user pastes or forwards the bank's reply. **ManualChannel must always work**, with or without Gmail.
+
+**OAuth**
+- Scopes: `openid`, `email`, `gmail.send`, `gmail.readonly`. **Nothing else.**
+- `access_type=offline`, `prompt=consent`.
+- Refresh tokens are encrypted at rest with `TOKEN_ENCRYPTION_KEY`. A **"Disconnect"** action deletes the tokens.
+
+**Sending**
+- Only after an explicit `approve_draft` signal for **that specific email**.
+- The subject carries a unique case tag, e.g. `[RC-7F3K]`. Store the Gmail `messageId` and `threadId` on the case.
+- Once the bank's complaint/ticket number is known, include it in follow-up subjects.
+
+**Sandbox (on by default)**
+- With `EMAIL_SANDBOX=true`, every outgoing email goes to `SANDBOX_RECIPIENT`, and the UI shows a **"Sandbox — not sent to the real bank"** badge.
+- Real sending requires `EMAIL_SANDBOX=false` **and** a recipient that matches the bank contacts file.
+
+**Reply watcher**
+- A Temporal loop calls `threads.get(threadId)` every `GMAIL_POLL_MINUTES` (default 30; in `DEMO_MODE`, every `DEMO_GMAIL_POLL_SECONDS`). The Gmail calls run in activities; the loop and its timer live in the workflow.
+- It runs until a reply arrives or the deadline timer fires.
+- Each message is processed once: store processed message IDs. Ignore messages sent by the user.
+- Classify each new bank message (Haiku):
+  - **acknowledgement** → auto-extract the complaint number, keep the timer running;
+  - **substantive reply** → `ReplyJudgeGraph`.
+- **Unthreaded replies:** exactly one fallback query is allowed: `from:(<known bank domains>) after:<sent date>`, plus the case tag or complaint number. The user must confirm **"Is this about your case?"** before any LLM sees the message.
+
+**Hard rule: thread-only access.** `GmailChannel` exposes only `send()`, `get_thread(thread_id)` and `bank_scoped_search()`. A unit test must fail if any other Gmail endpoint (e.g. an unscoped list or search) is called. Every Gmail API call is logged to `audit_events` and shown on the case timeline.
+
+**Bank contacts file** (`backend/recourse/email/bank_contacts.yaml`): ~10 major Indian banks. Per bank: grievance email, nodal officer contact, known sender domains, source URL, `verified` flag. Data only from official bank websites; mark entries **VERIFY** until checked.
+
+**Google OAuth app (deployed instance)**
+- External, published but **unverified**: users see Google's warning, and there is a 100-user lifetime cap.
+- Google verification + CASA assessment is a post-launch step; the README must say so.
+- Gotchas to document in the README:
+  - use personal Gmail accounts (Workspace admins may block the app),
+  - redirect URIs must match exactly,
+  - the test-user count is permanent,
+  - tokens issued in Testing mode expire after 7 days.
 
 ### Temporal rules (non-negotiable)
 - **No LLM calls, network calls, randomness, or `datetime.now()` inside workflow code.** Put them in activities, and use `workflow.now()` for time.
@@ -225,18 +270,51 @@ Save every primary source PDF into `docs/sources/` with a `SOURCES.md` index (ti
   - Never store full card numbers, CVV, OTP, UPI PIN or passwords. If an upload contains them, redact before storage and warn the user.
 - **Untrusted input:** uploaded documents and forwarded bank replies are **data, not instructions**. Wrap them in clear delimiters in prompts. Their content must never trigger tools or change workflow state directly.
 - **Phishing detection:** flag any "bank reply" that asks for OTP/PIN/CVV/password, remote-access apps (AnyDesk etc.), or a payment to "unlock" a refund.
-- **Human approval gate:** no outbound message, filing, or irreversible action without an explicit `approve_draft` signal. The output is a draft, a copy button and a `mailto:` link.
-- **Secrets:** only via env vars. `.env` is git-ignored; ship `.env.example`. Never log API keys.
+- **Human approval gate:** no outbound message, filing, or irreversible action without an explicit `approve_draft` signal for that specific item. GmailChannel sends only after it; ManualChannel shows a draft, a copy button and a `mailto:` link.
+- **Gmail access:** thread-only, minimal scopes, every call audited (§3 "Email channel").
+- **Secrets:** only via env vars. `.env` is git-ignored; ship `.env.example`. Never log API keys or OAuth tokens.
 - **Disclaimer:** "informational, not legal advice" in the UI and in drafts.
-- **Adversarial test suite** is mandatory (§7).
+- **Adversarial test suite** is mandatory (§8).
+
+### Threat model
+
+| Threat | Mitigation |
+|---|---|
+| Prompt injection in emails | Email content is untrusted data; LLM output is a fixed enum of labels; `ReplyJudgeGraph` has no tools; consequential actions need approval |
+| Phishing | Phishing check + sender-domain check against the bank contacts file |
+| Over-reading the mailbox | Thread-only code path; unit test that fails on any list/unscoped call; Gmail call audit log |
+| Token theft | Encrypted refresh tokens; minimal scopes; Disconnect deletes tokens |
+| Data sent to the LLM provider | Redact before the LLM; store only what's needed |
+| Wrong recipient | Sandbox by default; bank contacts allowlist; per-email approval |
+
+**Honest caveat:** `gmail.readonly` technically allows reading the whole mailbox. The thread-only restriction is enforced in our code, not by Google, so it must be provable: the no-list unit test and the audit log are that proof.
+
+The README must have a **"Security & Privacy"** section with this table and the attack-suite results.
 
 ---
 
-## 6. Repository layout (monorepo)
+## 6. Frontend
+
+**Stack (locked in):** Next.js + Tailwind + shadcn/ui.
+- `DESIGN.md` at the repo root holds the theme, taken from shadcnblocks themes (which theme is an open decision, §12).
+- Use Anthropic's **frontend-design** skill when building screens.
+- Run **Vercel's Web Interface Guidelines** review before any demo.
+
+**Screens**
+- **Cases (home):** case cards with amount owed + next-deadline countdown; Gmail status chip; Sandbox badge; "+ New case".
+- **New case:** upload / paste / describe → editable extracted fields (low-confidence fields highlighted) → Assess.
+- **Case page:** header; "What you're owed" with RBI-clause links; one "Next action" panel; tabs **Timeline / Emails / Evidence**. Must be **mobile-friendly**.
+- **Settings:** Gmail connect/disconnect, sandbox toggle, English/Hindi, delete my data.
+- **`/insights`** (hidden): eval table, attack-suite score, watcher review queue.
+
+---
+
+## 7. Repository layout (monorepo)
 
 ```
 recourse/
 ├─ CLAUDE.md
+├─ DESIGN.md                # frontend theme (shadcn)
 ├─ README.md
 ├─ .gitignore               # includes context/
 ├─ .env.example
@@ -253,6 +331,7 @@ recourse/
 │  │  ├─ temporal/          # workflows.py, activities.py, worker.py, timeutil.py (days())
 │  │  ├─ agents/            # intake_graph.py, draft_graph.py, reply_judge_graph.py, watcher_graph.py
 │  │  ├─ rules/             # engine.py, models.py, rulebook/*.yaml, calendar.py
+│  │  ├─ email/             # channel.py (EmailChannel), gmail.py, manual.py, oauth.py, bank_contacts.yaml
 │  │  ├─ llm/               # anthropic_client.py, openai_client.py, prompts/
 │  │  ├─ db/                # SQLAlchemy models, Alembic migrations
 │  │  └─ security/          # pii.py, injection.py, phishing.py
@@ -274,7 +353,7 @@ recourse/
 
 ---
 
-## 7. Evals & testing (a core deliverable)
+## 8. Evals & testing (a core deliverable)
 
 | Suite | What | Bar |
 |---|---|---|
@@ -283,13 +362,14 @@ recourse/
 | Graph unit tests | LangGraph nodes with a **fake LLM** (no API key) | All pass, CI |
 | Extraction | 20–30 synthetic screenshots/PDFs, field-level accuracy | Report % per field |
 | Draft quality | OpenAI judge with a rubric: correct amounts/dates, correct clause, correct recipient, no invented rules, clear tone | Report scores |
-| Adversarial | Prompt injection in bank replies/uploads, OTP-phishing replies, fake "RBI circular" text, PII leakage | 0 successful attacks |
+| Gmail access | Unit test that fails if `GmailChannel` calls any endpoint other than send / thread get / bank-scoped search | Pass, CI |
+| Adversarial | Prompt injection in bank replies/uploads, OTP-phishing replies, fake "RBI circular" text, PII leakage. **Email attacks:** injection inside a bank reply, OTP-phishing reply, spoofed sender domain, unthreaded reply | **0 successful attacks** |
 
 LLM-cost evals run manually (`uv run python evals/run_evals.py`), not on every push. Commit results to `evals/reports/` and show the table in the README.
 
 ---
 
-## 8. Commands (create these early; keep this section accurate)
+## 9. Commands (create these early; keep this section accurate)
 
 ```bash
 # backend
@@ -315,7 +395,6 @@ OPENAI_API_KEY=
 ANTHROPIC_MAIN_MODEL=claude-sonnet-5-5
 ANTHROPIC_EXTRACT_MODEL=claude-haiku-5-5
 OPENAI_JUDGE_MODEL=
-OPENAI_STT_MODEL=
 OPENAI_EMBED_MODEL=
 DATABASE_URL=postgresql+psycopg://...
 TEMPORAL_ADDRESS=localhost:7233
@@ -323,38 +402,57 @@ TEMPORAL_NAMESPACE=default
 TEMPORAL_TASK_QUEUE=recourse-cases
 LANGSMITH_TRACING=true
 LANGSMITH_API_KEY=
+GOOGLE_CLIENT_ID=
+GOOGLE_CLIENT_SECRET=
+GOOGLE_REDIRECT_URI=
+TOKEN_ENCRYPTION_KEY=
+EMAIL_SANDBOX=true
+SANDBOX_RECIPIENT=
+GMAIL_POLL_MINUTES=30
 DEMO_MODE=true
 DEMO_DAY_SECONDS=60
+DEMO_GMAIL_POLL_SECONDS=10
 ```
 
 ---
 
-## 9. Scope order
+## 10. Scope order
 
 Build thin end-to-end first, then thicken. Never leave `main` non-working.
 
-1. **Core (must work):** rule engine → intake → CaseWorkflow → drafting with verify → approval → timers + demo mode → reply judging → Ombudsman escalation → frontend → security → evals → deploy.
-2. **Stretch (only after the core works), in this order:** Hindi support → rule-change watcher → voice notes.
-3. **Cut order if behind:** voice notes → watcher → Hindi → UI polish.
-4. **Never cut:** rule-engine correctness, the end-to-end flow, the eval tables.
+1. **Core (must work):** rule engine → intake → CaseWorkflow → drafting with verify → approval → timers + demo mode → **EmailChannel + ManualChannel** → reply judging → Ombudsman escalation → frontend → **GmailChannel + reply watcher** → security → evals → deploy.
+2. **Stretch (only after the core works), in this order:** Hindi support → rule-change watcher.
+3. **Cut order if behind:** rule-change watcher → Hindi → UI polish.
+4. **Never cut:** rule-engine correctness, the end-to-end flow, ManualChannel, the eval tables.
 
 Dated milestones live in `context/initial-context.md`.
 
 ---
 
-## 10. Open technical decisions (ask Aryan before resolving)
+## 11. Cost budget
+
+- **≈ $0.06 per full case** (mostly Sonnet drafting); **≈ $12–20 for the whole build**.
+- Unit tests and CI use the **fake LLM**: no API cost.
+- Use **prompt caching** for system prompts and rulebook text.
+- The reply watcher's classification runs on **Haiku**.
+
+---
+
+## 12. Open technical decisions (ask Aryan before resolving)
 
 1. **Production hosting for Temporal + worker + API** (no card available). Candidates:
    - a single container on a no-card free host (e.g. Render free: sleeps after ~15 min idle, ~30–50 s cold start, 512 MB),
    - Aryan's machine plus a free tunnel.
    
    Code must treat `TEMPORAL_ADDRESS` as config only. Always provide a `docker-compose` path so anyone can run the full stack locally.
-2. Exact OpenAI model IDs for the judge, STT and embeddings (check current names in the OpenAI dashboard).
-3. Any rule marked **VERIFY** in §4.
+   - **Escape hatch:** if hosting Temporal fails, **DBOS** (durable workflows on Postgres only) can replace it.
+2. Exact OpenAI model IDs for the judge and embeddings (check current names in the OpenAI dashboard).
+3. Any rule marked **VERIFY** in §4, and any bank contact marked **VERIFY**.
+4. **`DESIGN.md` theme:** which shadcnblocks theme to use.
 
 ---
 
-## 11. How to work with Aryan
+## 13. How to work with Aryan
 
 - Explain in **simple English with proper technical terms** (smart-teacher style). Briefly explain a new concept (e.g. Temporal determinism, signals) the first time it comes up.
 - Aryan prefers backend work, so keep the frontend simple and clean.
@@ -362,5 +460,5 @@ Dated milestones live in `context/initial-context.md`.
 - Run the tests before saying something is done. Never claim a feature works without running it.
 - Don't add a dependency without a one-line reason. Don't swap stack components (§2) without asking.
 - Record every architecture decision in `docs/decisions.md`.
-- Keep this file and the README in sync with reality, and update §8 when commands change.
+- Keep this file and the README in sync with reality, and update §9 when commands change.
 - When unsure about a domain rule, **stop and flag it**. Never invent RBI rules, numbers or deadlines.
