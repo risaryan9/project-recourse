@@ -73,7 +73,7 @@ When a UPI transfer fails, an ATM doesn't dispense cash, or a customer is defrau
 | Durable case workflow | **Temporal (self-hosted)** | Local: `temporal server start-dev`; production host is an open decision (§12) |
 | Rule engine | Plain Python + versioned YAML rulebook | 100% deterministic, fully unit-tested |
 | Backend API | **FastAPI + Pydantic v2**, Python 3.12, **uv** | |
-| Database | **Neon Postgres** (free tier) + **pgvector** | Cases, evidence, drafts, audit log, regulation chunks |
+| Database | **Neon Postgres** (free tier) + **pgvector** | Cases, evidence, drafts, audit log, regulation chunks. Used from day one, in development too (no local Postgres); branches `main` / `dev` / `test` (ADR-007) |
 | Embeddings | OpenAI small embedding model (`OPENAI_EMBED_MODEL`) | Regulation text retrieval only |
 | Frontend | **Next.js** (App Router, TypeScript) + **Tailwind** + **shadcn/ui** on **Vercel** | Theme in `DESIGN.md`; see §6 |
 | Tracing | **LangSmith** free plan | `LANGSMITH_TRACING=true` |
@@ -379,6 +379,7 @@ cd backend && uv sync
 uv run pytest -q                          # unit + rules + workflow tests
 uv run python -m recourse.temporal.worker # start Temporal worker
 uv run fastapi dev recourse/api/main.py   # start API
+neon checkout dev                         # Neon CLI: pin the dev branch (see ADR-007)
 uv run python scripts/try_intake.py "<text>" [--file img.png]  # one real intake run (synthetic data only)
 
 # temporal (local)
@@ -404,7 +405,8 @@ OPENAI_EXTRACT_MODEL=gpt-6.1-terra
 LLM_PROVIDERS=["anthropic","openai"]
 OPENAI_JUDGE_MODEL=
 OPENAI_EMBED_MODEL=
-DATABASE_URL=postgresql+psycopg://...
+DATABASE_URL=postgresql+psycopg://...neon.tech/neondb?sslmode=require
+TEST_DATABASE_URL=
 TEMPORAL_ADDRESS=localhost:7233
 TEMPORAL_NAMESPACE=default
 TEMPORAL_TASK_QUEUE=recourse-cases

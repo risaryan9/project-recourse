@@ -17,7 +17,7 @@ FastAPI ──start/signal/query──► Temporal server
    │                           └─ Activities ──► LangGraph graphs ──► Claude / OpenAI
    │                                          └─► Rule engine (pure Python)
    ▼
-Postgres (+pgvector): cases, evidence, entitlements, drafts, audit_events, reg_chunks
+Neon Postgres (+pgvector): cases, evidence, entitlements, drafts, audit_events, reg_chunks
 ```
 
 ## Layers and ownership

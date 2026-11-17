@@ -246,3 +246,37 @@ prompt-injection attempts or secrets.
 - One submission produces one `Evidence`. Merging several uploads for one case is a later step.
 - Secrets inside images/PDFs cannot be removed before the model sees them; they are removed from
   the extracted output by `Evidence`.
+
+## ADR-007: Neon Postgres from day one
+
+### Context
+Case data (cases, evidence, drafts, the audit log) needs a durable store before the
+CaseWorkflow and API are built. The options were a local Postgres for development with Neon
+only at deployment, or Neon everywhere.
+
+### Decision
+- Use **Neon Postgres** (free plan, no card required) for development as well as deployment.
+  No local Postgres container.
+- One Neon project with three branches:
+  - `main`: the deployed instance and demo data;
+  - `dev`: local development (`DATABASE_URL`);
+  - `test`: database tests (`TEST_DATABASE_URL`). Tests that need it are skipped when it is
+    unset, so CI and unit tests still run with no database.
+- Use the **direct** (non-pooled) connection string with `sslmode=require`. The app has few
+  connections, and the direct endpoint avoids the PgBouncer transaction-mode limits on prepared
+  statements and on migrations.
+- Driver: SQLAlchemy 2 + psycopg 3 (`postgresql+psycopg://`). Schema changes go through Alembic
+  only. The first migration enables `pgvector` (`CREATE EXTENSION IF NOT EXISTS vector`).
+- Only synthetic data is stored, as everywhere in the project.
+- Project created with the Neon CLI (`neon init`, `--no-config`: no `neon.ts` or Node
+  dependencies in this Python repo). Region `aws-ap-southeast-1` (Singapore, the closest region
+  to India), Postgres 18. The local `.neon` link file is git-ignored.
+
+### Consequences
+- Neon terminates TLS at its proxy, so `pg_stat_ssl` on the server shows `ssl = false`; the
+  client side is encrypted (`sslmode=require`, verified with psycopg's `ssl_in_use`).
+- Development needs internet access, and the free compute auto-suspends when idle, so the first
+  query after a pause takes a moment (cold start).
+- The free plan's storage and compute-hour limits are ample for text case data; check them in the
+  Neon console if usage grows.
+- Branches make it cheap to reset `dev`/`test` from `main` or to throw them away.

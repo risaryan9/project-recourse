@@ -85,8 +85,26 @@ cd backend && uv run python -m recourse.temporal.run_hello Recourse
 ```bash
 docker compose -f infra/docker-compose.yml up --build
 ```
-This starts the Temporal dev server, API and worker. The database is external (set
-`DATABASE_URL`).
+This starts the Temporal dev server, API and worker. The database is external: a Neon
+Postgres database (free plan, no card needed) set in `DATABASE_URL`.
+
+### Database (Neon)
+With the [Neon CLI](https://neon.com/docs/cli) (`npm i -g neon`), from the repo root:
+```bash
+neon init -y --agent claude-code --region-id aws-ap-southeast-1 --project-name recourse --no-config
+neon branches create --name dev && neon branches create --name test
+neon checkout dev
+```
+`neon init` writes a pooled `DATABASE_URL` for `main`; replace it as in step 3 below. Or by hand:
+
+1. Create a free account at [neon.com](https://neon.com) and a project (Postgres 17 or
+   later, region closest to your users).
+2. Create branches `dev` (for local development) and `test` (for database tests).
+3. Copy each branch's **direct** (non-pooled) connection string, change `postgresql://` to
+   `postgresql+psycopg://`, and put them in `.env` as `DATABASE_URL` (dev) and
+   `TEST_DATABASE_URL` (test).
+4. Create the tables: `cd backend && uv run alembic upgrade head`. The first migration also
+   enables the `pgvector` extension.
 
 ### Tests and checks
 ```bash
