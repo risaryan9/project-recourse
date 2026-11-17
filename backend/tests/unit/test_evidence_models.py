@@ -42,6 +42,8 @@ def test_fact_name_literal_matches_model() -> None:
     [
         ("₹1,250.00", Decimal("1250.00")),
         ("Rs. 1250", Decimal("1250")),
+        ("1,250 rupees", Decimal("1250")),
+        ("Rupee 1", Decimal("1")),
         ("INR 1,25,000/-", Decimal("125000")),
         ("499.5", Decimal("499.5")),
         (1250, Decimal("1250")),

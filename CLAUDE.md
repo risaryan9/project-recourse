@@ -330,7 +330,7 @@ recourse/
 │  │  ├─ config.py          # pydantic-settings; all model IDs & flags
 │  │  ├─ api/               # FastAPI routers (cases, uploads, signals, health)
 │  │  ├─ temporal/          # workflows.py, activities.py, worker.py, timeutil.py (days())
-│  │  ├─ agents/            # intake_graph.py, draft_graph.py, reply_judge_graph.py, watcher_graph.py
+│  │  ├─ agents/            # intake_graph.py, intake_schema.py, draft_graph.py, reply_judge_graph.py, watcher_graph.py
 │  │  ├─ evidence/          # models.py (Evidence, Extracted[T]), validators.py (check_evidence)
 │  │  ├─ rules/             # engine.py, models.py, rulebook/*.yaml, calendar.py
 │  │  ├─ email/             # channel.py (EmailChannel), gmail.py, manual.py, oauth.py, bank_contacts.yaml
@@ -379,6 +379,7 @@ cd backend && uv sync
 uv run pytest -q                          # unit + rules + workflow tests
 uv run python -m recourse.temporal.worker # start Temporal worker
 uv run fastapi dev recourse/api/main.py   # start API
+uv run python scripts/try_intake.py "<text>" [--file img.png]  # one real intake run (synthetic data only)
 
 # temporal (local)
 temporal server start-dev --ui-port 8233  # Web UI at http://localhost:8233

@@ -88,11 +88,11 @@ class Origin(StrEnum):
 # Value types (hard checks and normalisation)
 # =================================================================================================
 
-_MONEY_NOISE = re.compile(r"(?i)(₹|rs\.?|inr|/-|,|\s)")
+_MONEY_NOISE = re.compile(r"(?i)(₹|rupees?|rs\.?|inr|/-|,|\s)")
 
 
 def _parse_money(v: Any) -> Any:
-    """'₹1,250.00' / 'Rs. 1250' / 'INR 1,250/-' -> Decimal('1250.00'). Floats go via str."""
+    """'₹1,250.00' / 'Rs. 1250' / 'INR 1,250/-' / '1250 rupees' -> Decimal. Floats go via str."""
     if isinstance(v, float):
         v = repr(v)
     if isinstance(v, str):

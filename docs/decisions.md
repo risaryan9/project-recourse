@@ -213,3 +213,36 @@ Anthropic side would stall every case. The stack already allows OpenAI APIs.
   should use the primary provider.
 - Anthropic's server-side refusal fallback (`allow_fallback`) has no OpenAI equivalent and is
   ignored by `OpenAILLM`.
+
+## ADR-006: IntakeGraph
+
+### Context
+Intake turns a user's submission (typed/pasted text, screenshots, PDFs) into `Evidence` the rule
+engine can trust. Models misread blurry images and ambiguous text, and submissions may contain
+prompt-injection attempts or secrets.
+
+### Decision
+- A LangGraph graph (`recourse/agents/intake_graph.py`): `classify` → (`UNRELATED` → stop) →
+  `extract` → `validate`. Both LLM steps use the `EXTRACT` role through an injected `LLMClient`.
+  The whole submission is passed as untrusted documents/attachments.
+- The model fills a simpler **extraction form** (`intake_schema.ExtractionOutput`: one
+  `Fact[T]` of value/confidence/source_text per `Evidence` fact; every field required and
+  nullable so strict structured output works on both providers). Code converts it to `Evidence`.
+- A value that fails `Evidence`'s hard checks (unparseable amount or date, too-short card
+  number) is **dropped to missing** with a "Could not read …" note. It is never repaired by
+  guessing. `check_evidence` then lists what the user must confirm.
+- Result statuses: `READY`, `NEEDS_CONFIRMATION`, `NOT_PAYMENT_EVIDENCE`.
+- `apply_corrections(evidence, {field: value}, now=…)` applies the user's answers (origin
+  `USER`, confidence 1.0) and re-runs the checks with no LLM call.
+- `now` is an input (IST date passed to the model to resolve "yesterday" or a missing year), so
+  runs are reproducible and safe inside a Temporal activity. LLM errors propagate for the
+  activity's retry policy.
+- Sensitive data found in the typed text (removed before any model saw it) is recorded in
+  `Evidence.redactions`, so the UI can warn the user.
+
+### Consequences
+- Two EXTRACT-model calls per submission (classification is cheap and stops unrelated input
+  before extraction).
+- One submission produces one `Evidence`. Merging several uploads for one case is a later step.
+- Secrets inside images/PDFs cannot be removed before the model sees them; they are removed from
+  the extracted output by `Evidence`.
