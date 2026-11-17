@@ -106,3 +106,40 @@ transaction date, and several points in them are open to interpretation.
   holidays; the borderline flag makes this visible instead of hiding it.
 - Fraud cases at non-commercial banks get guidance but no numbers until their directions are
   added to the rulebook.
+
+---
+
+## ADR-003: Evidence model and intake validation
+
+- **Date:** 2026-11-17
+- **Status:** Accepted
+
+### Context
+The extractor (an LLM reading screenshots, SMS and PDFs) can misread or invent values. The rule
+engine's numbers are only as correct as the facts it is given, and uploads can contain secrets
+(OTP, PIN, full card numbers) that must never be stored.
+
+### Decision
+- `recourse/evidence/models.py`: one `Evidence` object per upload. Every fact is an
+  `Extracted[T]` holding `value`, `confidence` (0-1), `source_text` (the verbatim snippet it was
+  read from) and `origin` (`EXTRACTED` or `USER`). A fact that is not found is `value=None`,
+  never a guess. User-confirmed values carry confidence 1.0.
+- **Two layers of checks.**
+  - *Hard* (Pydantic, at construction): types, enums, amount parsing (`Decimal` rupees,
+    "₹1,250.00" style accepted), card/account numbers cut to the last 4 digits, and PII redaction
+    (`recourse/security/pii.py`) of every string before the object exists.
+  - *Soft* (`recourse/evidence/validators.py`, `check_evidence`): UTR is 12 digits (required for
+    UPI/IMPS), amount > 0, no future dates, reversal/alert dates consistent with the transaction,
+    and minimum confidence (default 0.85). These return issues instead of raising, so a misread
+    becomes a question to the user (`needs_user_confirmation`) rather than a failed upload.
+- **Time zone:** timestamps without a zone are taken as IST, and the rule engine's day `T` is
+  the IST calendar date.
+- `now` is always passed in explicitly, so checks are deterministic and replay-safe.
+- `case_type` and `scenario` (the extractor's reading of what went wrong) live on `Evidence` and
+  are confirmed like any other field before the rule engine runs.
+
+### Consequences
+- Redaction is pattern-based and conservative: it may over-redact (e.g. a postal PIN code after
+  "PIN"), and a bare 12-digit number is never treated as Aadhaar because UTRs are also 12 digits.
+- Facts the documents do not show (fault, reporting dates, bank type) are asked from the user
+  later; merging several uploads into one case is a separate step.

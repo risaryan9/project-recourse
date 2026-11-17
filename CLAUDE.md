@@ -330,6 +330,7 @@ recourse/
 │  │  ├─ api/               # FastAPI routers (cases, uploads, signals, health)
 │  │  ├─ temporal/          # workflows.py, activities.py, worker.py, timeutil.py (days())
 │  │  ├─ agents/            # intake_graph.py, draft_graph.py, reply_judge_graph.py, watcher_graph.py
+│  │  ├─ evidence/          # models.py (Evidence, Extracted[T]), validators.py (check_evidence)
 │  │  ├─ rules/             # engine.py, models.py, rulebook/*.yaml, calendar.py
 │  │  ├─ email/             # channel.py (EmailChannel), gmail.py, manual.py, oauth.py, bank_contacts.yaml
 │  │  ├─ llm/               # anthropic_client.py, openai_client.py, prompts/
