@@ -335,11 +335,13 @@ recourse/
 │  │  ├─ rules/             # engine.py, models.py, rulebook/*.yaml, calendar.py
 │  │  ├─ email/             # channel.py (EmailChannel), gmail.py, manual.py, oauth.py, bank_contacts.yaml
 │  │  ├─ llm/               # base.py, prompting.py, anthropic_client.py, openai_client.py, fallback.py, fake.py
-│  │  ├─ db/                # SQLAlchemy models, Alembic migrations
+│  │  ├─ db/                # models.py (SQLAlchemy), session.py, audit.py, case_tag.py
 │  │  └─ security/          # pii.py, injection.py, phishing.py
+│  ├─ migrations/           # Alembic (env.py, versions/)
 │  └─ tests/
 │     ├─ unit/              # fake-LLM tests, no network
 │     ├─ rules/             # rule-engine golden cases (must be 100%)
+│     ├─ db/                # Postgres tests (Neon test branch, opt-in: -m db)
 │     └─ workflows/         # Temporal time-skipping tests
 ├─ evals/
 │  ├─ datasets/             # cases.jsonl, extraction set, bank replies, attacks
@@ -377,6 +379,8 @@ LLM-cost evals run manually (`uv run python evals/run_evals.py`), not on every p
 # backend
 cd backend && uv sync
 uv run pytest -q                          # unit + rules + workflow tests
+uv run pytest -q -m db                    # database tests on the Neon test branch (TEST_DATABASE_URL)
+uv run alembic upgrade head               # apply migrations to DATABASE_URL (Neon dev branch)
 uv run python -m recourse.temporal.worker # start Temporal worker
 uv run fastapi dev recourse/api/main.py   # start API
 neon checkout dev                         # Neon CLI: pin the dev branch (see ADR-007)

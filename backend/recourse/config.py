@@ -37,6 +37,7 @@ class Settings(BaseSettings):
 
     # --- Database ---
     database_url: str | None = None
+    test_database_url: str | None = None  # Neon "test" branch; used only by `pytest -m db`
 
     # --- Temporal ---
     temporal_address: str = "localhost:7233"

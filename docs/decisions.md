@@ -280,3 +280,34 @@ only at deployment, or Neon everywhere.
 - The free plan's storage and compute-hour limits are ample for text case data; check them in the
   Neon console if usage grows.
 - Branches make it cheap to reset `dev`/`test` from `main` or to throw them away.
+
+## ADR-008: Database schema v1 (cases, evidence, audit log)
+
+### Context
+The CaseWorkflow and API need somewhere to keep cases, the facts extracted for them, and a
+record of every step (CLAUDE.md quality bar: auditable).
+
+### Decision
+- SQLAlchemy 2 models (`recourse/db/models.py`), async engine with psycopg 3
+  (`sqlalchemy[asyncio]`, which brings `greenlet`). Alembic migrations in `backend/migrations/`,
+  hand-reviewed; the URL comes from settings, never from `alembic.ini`.
+- Three tables:
+  - `cases`: UUID id, unique short `case_tag` (`RC-XXXX`, for email subjects), `status`
+    (the CaseWorkflow states), timestamps.
+  - `evidence`: one row per accepted submission. Stores the `Evidence` object and the
+    validator result as JSONB, plus `schema_version`. **Raw uploads are not stored**, only the
+    redacted, structured facts.
+  - `audit_events`: append-only (a trigger rejects `UPDATE`); `actor`, dotted `event_type`,
+    JSONB `details` that are PII-redacted before insert (`record_event`).
+- Enums are stored as `VARCHAR` without database enum types or CHECK constraints, so adding a
+  workflow state needs no migration; Python validates values.
+- `ON DELETE CASCADE` from `cases`, so deleting a case removes all its data.
+- The first migration enables `pgvector`; the `reg_chunks` table comes with regulation search,
+  once the embedding model (and so the vector size) is chosen.
+- Database tests run against the Neon `test` branch and are opt-in (`pytest -m db`); a test
+  fails if the models and the migrations drift apart.
+
+### Consequences
+- The default test run stays offline. Run `pytest -m db` after any model or migration change.
+- Case status is stored in two places (Temporal and `cases.status`); Temporal is the source of
+  truth, and the workflow updates the table through an activity.
