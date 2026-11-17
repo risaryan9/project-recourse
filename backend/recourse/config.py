@@ -4,6 +4,7 @@ Every model ID, address and feature flag lives here so business logic never hard
 """
 
 from functools import lru_cache
+from typing import Literal
 
 from pydantic import Field, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -24,6 +25,15 @@ class Settings(BaseSettings):
     openai_judge_model: str | None = None
     openai_stt_model: str | None = None
     openai_embed_model: str | None = None
+    anthropic_max_retries: int = Field(default=2, ge=0)  # SDK-level retries per call
+    anthropic_timeout_seconds: float = Field(default=120.0, gt=0)
+    # OpenAI as the fallback provider for the MAIN / EXTRACT roles (used when Anthropic fails).
+    openai_main_model: str = "gpt-6.1-sol"
+    openai_extract_model: str = "gpt-6.1-terra"
+    openai_max_retries: int = Field(default=2, ge=0)
+    openai_timeout_seconds: float = Field(default=120.0, gt=0)
+    # Provider order for get_llm(); providers without an API key are skipped.
+    llm_providers: list[Literal["anthropic", "openai"]] = ["anthropic", "openai"]
 
     # --- Database ---
     database_url: str | None = None

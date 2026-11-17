@@ -65,6 +65,7 @@ When a UPI transfer fails, an ATM doesn't dispense cash, or a customer is defrau
 | Main agent / drafting | **Claude Sonnet 5.5** (`claude-sonnet-5-5`) | Anthropic SDK. Also drafts in Hindi (stretch) |
 | Extraction (screenshots/PDFs) | **Claude Haiku 5.5** (`claude-haiku-5-5`) | Vision + native PDF; structured output |
 | Reply watcher classification | **Claude Haiku 5.5** | Labels each new bank message (acknowledgement / substantive) |
+| LLM fallback provider | **OpenAI** `gpt-6.1-sol` (MAIN) / `gpt-6.1-terra` (EXTRACT) | `FallbackLLM`: used only when Anthropic is unavailable or rejects the call (ADR-005) |
 | Independent eval judge | **OpenAI GPT model** (`OPENAI_JUDGE_MODEL`) | Different model family from the drafter → less self-preference bias |
 | Email channel | **Gmail API** (`GmailChannel`, default) + `ManualChannel` fallback | OAuth, minimal scopes; see §3 "Email channel" |
 | Rule-change watcher (stretch) | Claude web search tool, allowed domains `rbi.org.in`, `npci.org.in` | Opens review items; never auto-edits rules |
@@ -333,7 +334,7 @@ recourse/
 │  │  ├─ evidence/          # models.py (Evidence, Extracted[T]), validators.py (check_evidence)
 │  │  ├─ rules/             # engine.py, models.py, rulebook/*.yaml, calendar.py
 │  │  ├─ email/             # channel.py (EmailChannel), gmail.py, manual.py, oauth.py, bank_contacts.yaml
-│  │  ├─ llm/               # anthropic_client.py, openai_client.py, prompts/
+│  │  ├─ llm/               # base.py, prompting.py, anthropic_client.py, openai_client.py, fallback.py, fake.py
 │  │  ├─ db/                # SQLAlchemy models, Alembic migrations
 │  │  └─ security/          # pii.py, injection.py, phishing.py
 │  └─ tests/
@@ -395,6 +396,11 @@ ANTHROPIC_API_KEY=
 OPENAI_API_KEY=
 ANTHROPIC_MAIN_MODEL=claude-sonnet-5-5
 ANTHROPIC_EXTRACT_MODEL=claude-haiku-5-5
+ANTHROPIC_MAX_RETRIES=2
+ANTHROPIC_TIMEOUT_SECONDS=120
+OPENAI_MAIN_MODEL=gpt-6.1-sol
+OPENAI_EXTRACT_MODEL=gpt-6.1-terra
+LLM_PROVIDERS=["anthropic","openai"]
 OPENAI_JUDGE_MODEL=
 OPENAI_EMBED_MODEL=
 DATABASE_URL=postgresql+psycopg://...

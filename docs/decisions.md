@@ -143,3 +143,73 @@ engine's numbers are only as correct as the facts it is given, and uploads can c
   "PIN"), and a bare 12-digit number is never treated as Aadhaar because UTRs are also 12 digits.
 - Facts the documents do not show (fault, reporting dates, bank type) are asked from the user
   later; merging several uploads into one case is a separate step.
+
+---
+
+## ADR-004: LLM client layer
+
+- **Date:** 2026-11-17
+- **Status:** Accepted
+
+### Context
+Several parts of Recourse call a model (extraction, reply classification, drafting, reply
+judging). Tests and CI must run without network access or API keys, model IDs must come from
+configuration, and every prompt must treat uploaded and forwarded content as untrusted.
+
+### Decision
+- One interface, `LLMClient` (`recourse/llm/base.py`), with two async methods:
+  `structured(request, schema)` returns a validated Pydantic object, and `text(request)` returns
+  free text. Business code receives a client and never constructs one (dependency injection).
+- Implementations: `AnthropicLLM` (real API) and `FakeLLM` (scripted answers per call
+  `purpose`, recording every rendered prompt).
+- Requests name a **role** (`MAIN` or `EXTRACT`), mapped to `ANTHROPIC_MAIN_MODEL` /
+  `ANTHROPIC_EXTRACT_MODEL`.
+- Inputs are split by trust. `system` and `task` are ours; `documents` and `attachments` are
+  untrusted. `recourse/llm/prompting.py` (shared by both clients) wraps documents in
+  `<untrusted_document>` tags, neutralises any tag-like text inside them, redacts PII, places our
+  task after the data, and prefixes a fixed safety preamble to the system prompt.
+- The system prompt carries a prompt-cache breakpoint and contains no per-call data.
+- Structured output uses `output_config.format` with `anthropic.transform_schema`. We check
+  `stop_reason` (refusal, truncation) before validating the JSON ourselves.
+- Errors map to `LLMUnavailableError` (retryable: rate limits, 5xx, network),
+  `LLMRejectedError`, `LLMRefusalError` and `LLMOutputError` (not retryable), so Temporal
+  retry policies can use the `retryable` flag.
+- `allow_fallback=True` enables the server-side refusal fallback for the main model.
+- Logs record purpose, model, stop reason, token usage and request ID, never content.
+
+### Consequences
+- Images and PDFs cannot be redacted before they are sent; their extracted output is redacted by
+  the `Evidence` model.
+- The real client is tested through a mock HTTP transport (real SDK, no network). Model quality
+  is measured separately by the eval suites.
+
+## ADR-005: OpenAI as a fallback LLM provider
+
+### Context
+A single provider is a single point of failure: an outage, rate limit or key problem on the
+Anthropic side would stall every case. The stack already allows OpenAI APIs.
+
+### Decision
+- `OpenAILLM` (`recourse/llm/openai_client.py`) implements `LLMClient` on the OpenAI Responses
+  API. It uses the same `render_prompt` output (redaction, untrusted-data wrapping, safety
+  preamble, task last), translated to Responses input parts, so both providers get the same
+  prompt and the same safety rules.
+- Role mapping: `MAIN` → `OPENAI_MAIN_MODEL` (default `gpt-6.1-sol`), `EXTRACT` →
+  `OPENAI_EXTRACT_MODEL` (default `gpt-6.1-terra`, positioned by OpenAI for visual reasoning).
+- Structured output uses a strict JSON schema; refusals, content-filter stops and truncation are
+  checked before validation, like the Anthropic client. Requests are sent with `store=False`.
+- `FallbackLLM` (`recourse/llm/fallback.py`) tries providers in `LLM_PROVIDERS` order
+  (default Anthropic, then OpenAI), skipping any provider without an API key. It falls back only
+  on `LLMUnavailableError` and `LLMRejectedError`. It does **not** fall back on refusals (a
+  safety decision is not shopped around) or on output errors.
+- If all providers fail and any failure was retryable, the result is `LLMUnavailableError`, so
+  Temporal retries later.
+
+### Consequences
+- Redacted case text may be sent to OpenAI when the fallback runs; both providers are allowed by
+  the stack, and the same redaction applies.
+- `LLMResult.served_model` records which provider's model answered; drafts and evals should keep
+  it. When OpenAI drafted, the OpenAI judge is no longer a different model family, so eval runs
+  should use the primary provider.
+- Anthropic's server-side refusal fallback (`allow_fallback`) has no OpenAI equivalent and is
+  ignored by `OpenAILLM`.
