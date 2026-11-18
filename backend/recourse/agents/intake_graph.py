@@ -50,6 +50,8 @@ class IntakeInput(BaseModel):
 
     text: str | None = Field(default=None, max_length=20_000)
     attachments: list[Attachment] = Field(default_factory=list, max_length=5)
+    # Sensitive data already removed from `text` before it was stored (so the warning survives).
+    prior_redactions: list[RedactionKind] = Field(default_factory=list)
 
     @model_validator(mode="after")
     def _not_empty(self) -> IntakeInput:
@@ -276,10 +278,10 @@ def _input_redactions(intake: IntakeInput) -> set[RedactionKind]:
 
     Images and PDFs cannot be scanned here; secrets in them are caught on the extracted output.
     """
-    if not intake.text:
-        return set()
-    _, kinds = redact_text(intake.text)
-    return kinds
+    found = set(intake.prior_redactions)
+    if intake.text:
+        found |= redact_text(intake.text)[1]
+    return found
 
 
 def _require_aware(now: datetime) -> None:

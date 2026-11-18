@@ -7,6 +7,10 @@ Tables:
 * `evidence`: the checked facts from one submission (an `Evidence` object as JSON) plus the
   validator result. Raw uploads (images, PDFs, SMS text) are never stored, only the redacted,
   structured facts.
+* `uploads` / `upload_files`: a submission waiting for intake. **Temporary**: deleted as soon
+  as intake has run. Text is PII-redacted before it is stored; images/PDFs cannot be, which is
+  why they are kept only for those seconds.
+* `entitlements`: the rule engine's answer for a case (one row per case, replaced on reassessment).
 * `audit_events`: append-only log of everything that happens to a case. Postgres rejects
   UPDATEs on it (trigger in the first migration). Details are PII-redacted before insert
   (`recourse.db.audit.record_event`).
@@ -17,20 +21,27 @@ Deleting a case deletes its evidence and audit events (`ON DELETE CASCADE`), for
 from __future__ import annotations
 
 import uuid
-from datetime import datetime
+from datetime import date, datetime
+from decimal import Decimal
 from enum import StrEnum
 from typing import Any
 
 from sqlalchemy import (
     BigInteger,
+    Boolean,
+    Date,
     DateTime,
     Enum,
     ForeignKey,
     Index,
     Integer,
+    LargeBinary,
     MetaData,
+    Numeric,
     String,
+    Text,
     func,
+    text,
 )
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
@@ -110,6 +121,10 @@ class Case(_Timestamps, Base):
     # Short tag for email subjects, e.g. "RC-7F3K" (recourse.db.case_tag).
     case_tag: Mapped[str] = mapped_column(String(16), unique=True)
     status: Mapped[CaseStatus] = mapped_column(_str_enum(CaseStatus), default=CaseStatus.NEW)
+    # The user's direct answers (recourse.cases.assessment.CaseDetails as JSON).
+    details: Mapped[dict[str, Any]] = mapped_column(
+        JSONB, default=dict, server_default=text("'{}'::jsonb")
+    )
 
     evidence: Mapped[list[EvidenceRecord]] = relationship(
         back_populates="case",
@@ -153,6 +168,51 @@ class EvidenceRecord(_Timestamps, Base):
         if self.schema_version != EVIDENCE_SCHEMA_VERSION:
             raise ValueError(f"evidence {self.id} has schema version {self.schema_version}")
         return Evidence.model_validate(self.data)
+
+
+class Upload(Base):
+    """A submission waiting for intake (temporary; deleted once intake has run)."""
+
+    __tablename__ = "uploads"
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    case_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("cases.id", ondelete="CASCADE"), index=True
+    )
+    text: Mapped[str | None] = mapped_column(Text)  # already PII-redacted
+    # Kinds of sensitive data removed from `text` (so the user can still be warned).
+    redactions: Mapped[list[str]] = mapped_column(JSONB, default=list)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    files: Mapped[list[UploadFile]] = relationship(
+        cascade="all, delete-orphan", passive_deletes=True, order_by="UploadFile.position"
+    )
+
+
+class UploadFile(Base):
+    __tablename__ = "upload_files"
+
+    upload_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("uploads.id", ondelete="CASCADE"), primary_key=True
+    )
+    position: Mapped[int] = mapped_column(Integer, primary_key=True)
+    media_type: Mapped[str] = mapped_column(String(40))
+    data: Mapped[bytes] = mapped_column(LargeBinary)
+
+
+class EntitlementRecord(_Timestamps, Base):
+    """The rule engine's `Entitlement` for a case (money, deadlines, citations)."""
+
+    __tablename__ = "entitlements"
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    case_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("cases.id", ondelete="CASCADE"), unique=True
+    )
+    as_of: Mapped[date] = mapped_column(Date)
+    covered: Mapped[bool] = mapped_column(Boolean)
+    total_owed_inr: Mapped[Decimal] = mapped_column(Numeric(14, 2))
+    data: Mapped[dict[str, Any]] = mapped_column(JSONB)  # Entitlement.model_dump(mode="json")
 
 
 class AuditEvent(Base):

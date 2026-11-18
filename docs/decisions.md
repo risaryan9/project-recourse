@@ -311,3 +311,43 @@ record of every step (CLAUDE.md quality bar: auditable).
 - The default test run stays offline. Run `pytest -m db` after any model or migration change.
 - Case status is stored in two places (Temporal and `cases.status`); Temporal is the source of
   truth, and the workflow updates the table through an activity.
+
+## ADR-009: CaseWorkflow v1 (intake → review → assessment) and the case API
+
+### Context
+The first part of a case: from a submission to the rule engine's answer, with the user
+reviewing the extracted facts in between. It must survive restarts, retry failed steps, keep
+raw uploads out of durable history, and leave an audit trail.
+
+### Decision
+- **One `CaseWorkflow` per case** (`recourse/temporal/case_workflow.py`), workflow ID
+  `case-<uuid>`. Steps: `case.run_intake` → wait for `confirm` signals (re-checked by
+  `case.confirm` until nothing is missing) → `case.assess` → ASSESSED → wait (drafting plugs in
+  next). An `abandon` signal ends it from any waiting point. Query: `get_state`.
+- **Activities do the work and own the writes** (`case_activities.py`): each writes its result,
+  the new `cases.status` and an audit event in one transaction, and is idempotent so Temporal can
+  retry it. Bad user input and permanent LLM failures raise non-retryable `ApplicationError`s,
+  which the workflow handles (keep waiting with `last_error`, or end the case).
+- **The user always reviews the facts once**, even with no issues (the "editable fields →
+  Assess" screen).
+- **Raw uploads never enter Temporal history.** `POST /cases` stores the submission in
+  temporary `uploads` / `upload_files` rows (text PII-redacted first; images/PDFs as-is) and
+  passes only IDs to the workflow. The intake activity deletes them in the same transaction that
+  stores the evidence.
+- **Fraud cases ask the user directly** for facts no evidence shows (`CaseDetails`: bank type,
+  required; account type, fault, reporting dates, optional), stored in `cases.details`.
+- **Temporal payloads use the Pydantic data converter** (`temporalio.contrib.pydantic`);
+  worker and API share `case_runner.connect()`.
+- **API** (`recourse/api/cases.py`): `POST /cases` (202), `GET /cases/{id}`,
+  `POST /cases/{id}/confirm` (validated immediately with the same `review()` the activity uses,
+  then signalled), `POST /cases/{id}/abandon`. Pages read the database, so they work even when
+  Temporal is down; the workflow query adds `last_error`.
+- If the workflow cannot be started, `POST /cases` deletes the case again and returns 503.
+
+### Consequences
+- Case status lives in Temporal and in `cases.status`; the activities keep them in step.
+- **No authentication yet**: anyone with a case ID can read it. Accounts are required before
+  deployment.
+- Changing the workflow code later must keep replay compatibility for running cases (use
+  `workflow.patched()` or a new workflow type).
+- Images/PDFs sit unredacted in Postgres for the seconds between upload and intake.

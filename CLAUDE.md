@@ -329,8 +329,9 @@ recourse/
 │  ├─ recourse/
 │  │  ├─ config.py          # pydantic-settings; all model IDs & flags
 │  │  ├─ api/               # FastAPI routers (cases, uploads, signals, health)
-│  │  ├─ temporal/          # workflows.py, activities.py, worker.py, timeutil.py (days())
+│  │  ├─ temporal/          # case_workflow.py, case_activities.py, case_types.py, case_runner.py, worker.py, timeutil.py (days())
 │  │  ├─ agents/            # intake_graph.py, intake_schema.py, draft_graph.py, reply_judge_graph.py, watcher_graph.py
+│  │  ├─ cases/             # assessment.py (Evidence → rule engine), review.py (user answers)
 │  │  ├─ evidence/          # models.py (Evidence, Extracted[T]), validators.py (check_evidence)
 │  │  ├─ rules/             # engine.py, models.py, rulebook/*.yaml, calendar.py
 │  │  ├─ email/             # channel.py (EmailChannel), gmail.py, manual.py, oauth.py, bank_contacts.yaml

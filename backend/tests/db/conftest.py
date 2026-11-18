@@ -12,7 +12,7 @@ import pytest
 from alembic import command
 from alembic.config import Config
 from sqlalchemy import create_engine, text
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from recourse.config import Settings
 from recourse.db.session import make_engine, make_session_factory
@@ -46,13 +46,19 @@ def db_url() -> Iterator[str]:
 
 
 @pytest.fixture
-async def session(db_url: str) -> AsyncIterator[AsyncSession]:
+async def sessions(db_url: str) -> AsyncIterator[async_sessionmaker[AsyncSession]]:
+    """A session factory on the test branch; every table is emptied first."""
     sync = create_engine(db_url)
     with sync.begin() as conn:
         conn.execute(text("TRUNCATE cases CASCADE"))
     sync.dispose()
 
     engine = make_engine(db_url)
-    async with make_session_factory(engine)() as s:
-        yield s
+    yield make_session_factory(engine)
     await engine.dispose()
+
+
+@pytest.fixture
+async def session(sessions: async_sessionmaker[AsyncSession]) -> AsyncIterator[AsyncSession]:
+    async with sessions() as s:
+        yield s
