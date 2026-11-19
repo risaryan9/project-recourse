@@ -351,3 +351,45 @@ raw uploads out of durable history, and leave an audit trail.
 - Changing the workflow code later must keep replay compatibility for running cases (use
   `workflow.patched()` or a new workflow type).
 - Images/PDFs sit unredacted in Postgres for the seconds between upload and intake.
+
+## ADR-010: DraftGraph with placeholder templates and a mandatory verify step
+
+### Context
+The bank complaint must quote amounts, dates and RBI clauses that exactly match the rule
+engine (CLAUDE.md quality bar: correct numbers, grounded). LLMs copy and transform numbers
+unreliably, and a wrong amount in a letter to a bank is worse than no letter.
+
+### Decision
+- **The LLM never writes a value.** It returns a template (`subject`, `body`) with
+  `{{slot}}` placeholders. `agents/draft_slots.py` builds the slot table from the rule engine's
+  `Entitlement` (money, deadlines, durations, citations) and the user-confirmed `Evidence`
+  (amount, date, UTR, bank and payee names), and `render` fills them in. Indian formatting
+  (`₹1,25,000.00`, `19 November 2026`). A citation names its document in full the first time
+  and as "para X of <ref>" after that.
+- **`verify` is a graph node on the only path to a draft** (`agents/draft_verify.py`, pure
+  Python). It rejects: unknown or malformed placeholders; missing required ones (every money
+  line and the total, the key deadline, the citations behind them, the transaction reference,
+  `{{case.tag}}` in the subject, the sign-off name); any digit, currency marker, number word
+  next to a unit, or web address typed outside a placeholder; mentions of OTP/PIN/CVV/password
+  or remote-access apps; mentions of Recourse; bad length. After rendering, every ₹ amount must
+  be one of the case's amounts (an independent second check).
+- **Revise and fail closed.** On failure the exact error list goes back to the model; at most
+  3 attempts in total, then status `FAILED` with no letter text.
+- **No untrusted text in the drafting prompt.** The model sees placeholder names and
+  descriptions, the case type and rule-engine flags, never evidence values. Payee names, bank
+  names and references (which come from uploads) only enter the letter through `render`.
+- **Written as the customer**, first person, with a `[Your full name]` placeholder the user
+  fills in; Recourse is not mentioned in the letter. The "informational, not legal advice"
+  notice travels with the draft (`DraftResult.disclaimer`) and is shown next to it in the UI,
+  not inside the email to the bank.
+- **Unverified rules:** drafts are produced and carry `rules_verified`; the email channel must
+  refuse a real (non-sandbox) send until every cited rule is verified. Sandbox sends are allowed.
+- Scope: bank complaints only. The 1930/cybercrime report and the Ombudsman complaint reuse the
+  graph later with their own required placeholders.
+
+### Consequences
+- A number the model needs but has no placeholder for is left out of the letter; add a slot
+  rather than relaxing the checker.
+- The no-digits rule is strict, so models sometimes need a second attempt (seen in a real run);
+  three attempts leave room for that.
+- The checker is deterministic and unit-tested, including adversarial templates.

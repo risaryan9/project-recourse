@@ -386,6 +386,7 @@ uv run python -m recourse.temporal.worker # start Temporal worker
 uv run fastapi dev recourse/api/main.py   # start API
 neon checkout dev                         # Neon CLI: pin the dev branch (see ADR-007)
 uv run python scripts/try_intake.py "<text>" [--file img.png]  # one real intake run (synthetic data only)
+uv run python scripts/try_draft.py [--fraud]                    # one real draft on a built-in synthetic case
 
 # temporal (local)
 temporal server start-dev --ui-port 8233  # Web UI at http://localhost:8233
