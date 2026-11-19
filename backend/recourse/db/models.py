@@ -11,6 +11,8 @@ Tables:
   as intake has run. Text is PII-redacted before it is stored; images/PDFs cannot be, which is
   why they are kept only for those seconds.
 * `entitlements`: the rule engine's answer for a case (one row per case, replaced on reassessment).
+* `drafts`: every letter drafted for a case (`seq` 1, 2, ...), its approval state, and the
+  final text the user approved (ADR-011).
 * `audit_events`: append-only log of everything that happens to a case. Postgres rejects
   UPDATEs on it (trigger in the first migration). Details are PII-redacted before insert
   (`recourse.db.audit.record_event`).
@@ -40,6 +42,7 @@ from sqlalchemy import (
     Numeric,
     String,
     Text,
+    UniqueConstraint,
     func,
     text,
 )
@@ -213,6 +216,48 @@ class EntitlementRecord(_Timestamps, Base):
     covered: Mapped[bool] = mapped_column(Boolean)
     total_owed_inr: Mapped[Decimal] = mapped_column(Numeric(14, 2))
     data: Mapped[dict[str, Any]] = mapped_column(JSONB)  # Entitlement.model_dump(mode="json")
+
+
+class DraftKind(StrEnum):
+    BANK_COMPLAINT = "BANK_COMPLAINT"
+
+
+class DraftRecordStatus(StrEnum):
+    PENDING = "PENDING"  # waiting for the user's approval
+    APPROVED = "APPROVED"  # the user approved `final_subject` / `final_body`
+    REJECTED = "REJECTED"  # the user asked for a new draft
+    FAILED = "FAILED"  # DraftGraph failed closed: no letter text
+
+
+class DraftRecord(_Timestamps, Base):
+    """One drafted letter. Text columns are set only for a DRAFTED graph result."""
+
+    __tablename__ = "drafts"
+    __table_args__ = (UniqueConstraint("case_id", "seq", name="uq_drafts_case_id_seq"),)
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    case_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("cases.id", ondelete="CASCADE"), index=True
+    )
+    seq: Mapped[int] = mapped_column(Integer)  # 1, 2, ... per case (the idempotency key)
+    kind: Mapped[DraftKind] = mapped_column(_str_enum(DraftKind))
+    status: Mapped[DraftRecordStatus] = mapped_column(_str_enum(DraftRecordStatus, length=16))
+    letter_date: Mapped[date] = mapped_column(Date)
+    attempts: Mapped[int] = mapped_column(Integer)
+    rules_verified: Mapped[bool] = mapped_column(Boolean)
+    # As drafted (placeholders already filled by code, except the user's own ones).
+    subject: Mapped[str | None] = mapped_column(Text)
+    body: Mapped[str | None] = mapped_column(Text)
+    template: Mapped[dict[str, Any] | None] = mapped_column(JSONB)  # the LLM's template
+    slots_used: Mapped[list[str]] = mapped_column(JSONB, default=list)
+    user_fill: Mapped[list[str]] = mapped_column(JSONB, default=list)
+    errors: Mapped[list[str]] = mapped_column(JSONB, default=list)  # verify errors when FAILED
+    models_used: Mapped[list[str]] = mapped_column(JSONB, default=list)
+    # Written by the API from the user's input; acted on by the workflow's activities.
+    final_subject: Mapped[str | None] = mapped_column(Text)
+    final_body: Mapped[str | None] = mapped_column(Text)
+    reject_reason: Mapped[str | None] = mapped_column(Text)
+    approved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
 class AuditEvent(Base):

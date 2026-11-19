@@ -109,7 +109,7 @@ Neon Postgres (+pgvector): cases, evidence, entitlements, drafts, audit_events, 
 ### CaseWorkflow states
 `NEW → EXTRACTED → ASSESSED → DRAFT_READY → AWAITING_APPROVAL → SENT_TO_BANK → AWAITING_BANK (timer) → BANK_REPLIED → JUDGED → (RESOLVED | ESCALATION_DRAFT_READY → AWAITING_APPROVAL → FILED_WITH_OMBUDSMAN → CLOSED) | ABANDONED`
 
-- **Signals:** `approve_draft(draft_id, edits?)`, `reject_draft(reason)`, `mark_sent(channel, sent_at)` (ManualChannel only; GmailChannel records the send itself), `bank_replied(text|file)` (manual paste/forward), `mark_resolved(amount_received)`, `abandon()`.
+- **Signals:** `approve_draft(draft_id)`, `reject_draft(draft_id)` (edits, name and reason are stored on the draft row by the API, ADR-011), `redraft()` (after a draft failed closed), `mark_sent(channel, sent_at)` (ManualChannel only; GmailChannel records the send itself), `bank_replied(text|file)` (manual paste/forward), `mark_resolved(amount_received)`, `abandon()`.
 - **Queries:** `get_status()`, `get_timeline()`, `get_entitlement()`.
 - **Timers:** bank response window; Ombudsman 90-day window reminder; fraud-reporting countdown; Gmail reply-watcher poll interval.
 

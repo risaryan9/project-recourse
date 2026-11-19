@@ -15,7 +15,13 @@ from temporalio.contrib.pydantic import pydantic_data_converter
 from temporalio.service import RPCError
 
 from recourse.config import Settings
-from recourse.temporal.case_types import AbandonRequest, CaseInput, CaseState, Confirmation
+from recourse.temporal.case_types import (
+    AbandonRequest,
+    CaseInput,
+    CaseState,
+    Confirmation,
+    DraftDecision,
+)
 from recourse.temporal.case_workflow import CaseWorkflow
 
 
@@ -36,6 +42,9 @@ class CaseRunner(Protocol):
     async def start(self, inp: CaseInput) -> None: ...
     async def confirm(self, case_id: uuid.UUID, confirmation: Confirmation) -> None: ...
     async def abandon(self, case_id: uuid.UUID, request: AbandonRequest) -> None: ...
+    async def approve_draft(self, case_id: uuid.UUID, draft_id: uuid.UUID) -> None: ...
+    async def reject_draft(self, case_id: uuid.UUID, draft_id: uuid.UUID) -> None: ...
+    async def redraft(self, case_id: uuid.UUID) -> None: ...
     async def state(self, case_id: uuid.UUID) -> CaseState | None: ...
 
 
@@ -57,6 +66,19 @@ class TemporalCaseRunner:
 
     async def abandon(self, case_id: uuid.UUID, request: AbandonRequest) -> None:
         await self._handle(case_id).signal(CaseWorkflow.abandon, request)
+
+    async def approve_draft(self, case_id: uuid.UUID, draft_id: uuid.UUID) -> None:
+        await self._handle(case_id).signal(
+            CaseWorkflow.approve_draft, DraftDecision(draft_id=draft_id)
+        )
+
+    async def reject_draft(self, case_id: uuid.UUID, draft_id: uuid.UUID) -> None:
+        await self._handle(case_id).signal(
+            CaseWorkflow.reject_draft, DraftDecision(draft_id=draft_id)
+        )
+
+    async def redraft(self, case_id: uuid.UUID) -> None:
+        await self._handle(case_id).signal(CaseWorkflow.redraft)
 
     async def state(self, case_id: uuid.UUID) -> CaseState | None:
         """The live workflow state, or None if the workflow cannot be reached right now."""

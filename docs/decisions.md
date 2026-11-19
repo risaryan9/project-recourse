@@ -393,3 +393,47 @@ unreliably, and a wrong amount in a letter to a bank is worse than no letter.
 - The no-digits rule is strict, so models sometimes need a second attempt (seen in a real run);
   three attempts leave room for that.
 - The checker is deterministic and unit-tested, including adversarial templates.
+
+## ADR-011: Drafting and approval in the CaseWorkflow
+
+### Context
+After assessment, the case needs a bank complaint the user approves before anything is sent
+(CLAUDE.md §3 and §5: per-email approval). The user may want to reword the letter, and must add
+their name, but the amounts and dates must stay the rule engine's (ADR-010).
+
+### Decision
+- **Flow.** `ASSESSED` → (only if the entitlement is covered) `case.draft` activity →
+  `AWAITING_APPROVAL` → `approve_draft` | `reject_draft`. Rejection drafts again with the user's
+  reason as feedback. A draft that fails closed leaves the case at `ASSESSED`, and a new
+  **`redraft`** signal tries again. At most `MAX_DRAFTS_PER_CASE` = 5 drafts per case, which caps
+  the LLM cost. `abandon` works from every wait.
+- **`DRAFT_READY` is not a resting state.** The draft activity stores the draft, records
+  `draft.ready` and sets `AWAITING_APPROVAL` in one transaction, because nothing happens in
+  between. The same pattern will apply to `ESCALATION_DRAFT_READY`.
+- **`drafts` table** (migration 0003), one row per attempt, keyed by `(case_id, seq)`. The
+  workflow passes `seq`, so a retried draft activity finds its row instead of paying for a second
+  LLM run. Statuses: `PENDING`, `APPROVED`, `REJECTED`, `FAILED` (no letter text).
+- **No PII in Temporal history.** The user's name, edited text and reject reason are written to
+  the draft row by the API (`final_subject`, `final_body`, `reject_reason`; the reason is
+  PII-redacted). The signals carry only `draft_id`. The API checks the input first, which gives
+  the user an immediate 422. The approve activity checks the stored text again and makes the
+  decision.
+- **Edits are free text with fixed facts** (`check_final`). The subject must keep the case tag
+  (the reply watcher relies on it), and no placeholder may be left. Every amount written with ₹,
+  Rs or INR, and every long-form date, must be one of the case's slot values. No credential or
+  remote-access wording. The user's name: 2–100 characters, no digits or brackets.
+- **Only the current draft can be decided.** Decisions about an older `draft_id` are refused
+  (workflow and activity), with the reason in `get_state().last_error`.
+- Case status stays `AWAITING_APPROVAL` after approval until the send step exists. The draft row's
+  `APPROVED` status and `get_state().approved_draft_id` record the approval.
+- **Replay safety:** the new code path is behind `workflow.patched("drafting-v1")`, so cases that
+  were already waiting at `ASSESSED` replay on the old path.
+
+### Consequences
+- The edit check does not catch every possible change of fact (e.g. a bare number with no
+  currency marker, a date written as "17/11/2026", or a changed UTR). It catches the
+  consequential ones (amounts, deadlines). The letter is the user's own and they approve it.
+- The entitlement is not recomputed between drafting and approval, so accruing compensation is
+  as of the assessment date. The send step should reassess when the delay matters.
+- Signals are fire-and-forget: the API's own check gives fast feedback, and the activity's refusal
+  appears as `last_error`. Temporal Updates could make this synchronous later.

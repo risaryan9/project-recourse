@@ -23,8 +23,10 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation
 
 from recourse.agents.draft_slots import (
+    CUSTOMER_NAME_PLACEHOLDER,
     SLOT_LIKE_RE,
     SlotTable,
     render,
@@ -44,6 +46,10 @@ _UNITS = (
     r"days?|working|calendar|business|weeks?|months?|years?|hours?|rupees?|paise|percent|"
     r"per\s*cent|%"
 )
+_CREDENTIAL_RE = re.compile(
+    r"\b(otp|one[- ]time[- ]password|cvv|cvc|upi[- ]?pin|m?pin|password|passcode)\b", re.I
+)
+_REMOTE_ACCESS_RE = re.compile(r"\b(anydesk|teamviewer|quick ?support|screen[- ]?shar\w*)\b", re.I)
 _CHECKS: list[tuple[re.Pattern[str], str]] = [
     (re.compile(r"\d"), "contains a digit typed directly ({match!r}); use a placeholder"),
     (
@@ -61,16 +67,10 @@ _CHECKS: list[tuple[re.Pattern[str], str]] = [
         "contains a web address or domain ({match!r}); do not include links",
     ),
     (
-        re.compile(
-            r"\b(otp|one[- ]time[- ]password|cvv|cvc|upi[- ]?pin|m?pin|password|passcode)\b",
-            re.I,
-        ),
+        _CREDENTIAL_RE,
         "mentions a secret credential ({match!r}); never mention OTPs, PINs, CVVs or passwords",
     ),
-    (
-        re.compile(r"\b(anydesk|teamviewer|quick ?support|screen[- ]?shar\w*)\b", re.I),
-        "mentions a remote-access app ({match!r})",
-    ),
+    (_REMOTE_ACCESS_RE, "mentions a remote-access app ({match!r})"),
     (
         re.compile(r"\brecourse\b", re.I),
         "mentions Recourse ({match!r}); the letter must read as the customer's own",
@@ -140,3 +140,75 @@ def verify(subject: str, body: str, table: SlotTable) -> VerifyResult:
 
 
 _RUPEE_RE = re.compile(r"₹[\d,]+(?:\.\d{2})?")
+
+
+# =================================================================================================
+# The final letter the user approves (after their edits)
+# =================================================================================================
+
+# Any amount written with a currency marker, in any common style (₹2,450.00 / Rs. 2450 / INR 2450).
+_ANY_AMOUNT_RE = re.compile(r"(?:₹|\brs\.?|\binr)\s*(\d[\d,]*(?:\.\d{1,2})?)", re.I)
+_MONTHS = "January|February|March|April|May|June|July|August|September|October|November|December"
+_LONG_DATE_RE = re.compile(rf"\b\d{{1,2}} (?:{_MONTHS}) \d{{4}}\b")
+
+
+def _amounts(text: str) -> set[Decimal]:
+    out: set[Decimal] = set()
+    for raw in _ANY_AMOUNT_RE.findall(text):
+        try:
+            out.add(Decimal(raw.replace(",", "")))
+        except InvalidOperation:
+            continue
+    return out
+
+
+def check_final(subject: str, body: str, table: SlotTable) -> VerifyResult:
+    """Check the final letter text the user approves, after their own edits.
+
+    The user may reword the letter freely, but the numbers must still be the rule engine's:
+    every amount and every long-form date in the text must be one of the case's values. The
+    subject must keep the case tag (the reply watcher finds the thread by it), no placeholder
+    may be left unfilled, and the letter must not mention credentials or remote-access apps.
+    """
+    errors: list[str] = []
+    if not subject.strip():
+        errors.append("subject is empty")
+    if not body.strip():
+        errors.append("body is empty")
+    if "\n" in subject.strip():
+        errors.append("subject must be a single line")
+    if len(subject) > MAX_SUBJECT_CHARS:
+        errors.append(f"subject is longer than {MAX_SUBJECT_CHARS} characters")
+    if len(body) > MAX_BODY_CHARS:
+        errors.append(f"body is longer than {MAX_BODY_CHARS} characters")
+
+    tag = table.slots["case.tag"].value
+    if tag not in subject:
+        errors.append(f"subject must keep the case tag {tag}")
+    for part_name, part in (("subject", subject), ("body", body)):
+        if "{{" in part or "}}" in part or CUSTOMER_NAME_PLACEHOLDER in part:
+            errors.append(f"{part_name} still has a placeholder to fill in")
+
+    values = [s.value for s in table.slots.values()]
+    allowed_amounts = set().union(*(_amounts(v) for v in values))
+    allowed_dates = {d for v in values for d in _LONG_DATE_RE.findall(v)}
+    for part_name, part in (("subject", subject), ("body", body)):
+        for amount in sorted(_amounts(part) - allowed_amounts):
+            errors.append(
+                f"{part_name} contains the amount {amount}, which is not one of this case's "
+                "amounts; keep the amounts from the draft"
+            )
+        for d in _LONG_DATE_RE.findall(part):
+            if d not in allowed_dates:
+                errors.append(
+                    f"{part_name} contains the date {d!r}, which is not one of this case's "
+                    "dates; keep the dates from the draft"
+                )
+        for pattern, what in (
+            (_CREDENTIAL_RE, "a secret credential"),
+            (_REMOTE_ACCESS_RE, "a remote-access app"),
+        ):
+            m = pattern.search(part)
+            if m:
+                errors.append(f"{part_name} mentions {what} ({m.group(0)!r})")
+    return VerifyResult(errors=list(dict.fromkeys(errors)))

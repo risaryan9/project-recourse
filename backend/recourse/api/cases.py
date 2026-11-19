@@ -4,6 +4,14 @@
     GET  /cases/{id}            status, facts, issues, entitlement, timeline
     POST /cases/{id}/confirm    the user's corrections / answers → `confirm` signal (202)
     POST /cases/{id}/abandon    → `abandon` signal (202)
+    GET  /cases/{id}/draft      the current draft (also inside GET /cases/{id})
+    POST /cases/{id}/drafts/{draft_id}/approve   name + optional edits → `approve_draft` (202)
+    POST /cases/{id}/drafts/{draft_id}/reject    optional reason → `reject_draft` (202)
+    POST /cases/{id}/redraft    try again after a draft failed its checks → `redraft` (202)
+
+Draft decisions: the API checks the user's input, stores it on the draft row (so names, edited
+text and reasons never enter Temporal history), then signals the workflow with the draft ID only.
+The workflow's activity re-checks the stored text and makes the decision (ADR-011).
 
 The database is the source for what the page shows; the workflow's live state adds the last
 error from a rejected answer. No authentication yet: anyone with a case ID can see the case
@@ -22,9 +30,19 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from recourse.agents.draft_graph import DISCLAIMER
+from recourse.agents.draft_slots import SlotError
 from recourse.agents.intake_graph import IntakeInput
 from recourse.api.deps import get_runner, get_session, get_session_factory
 from recourse.cases.assessment import CaseDetails, missing_details
+from recourse.cases.drafts import (
+    ApprovalEdits,
+    InvalidEdit,
+    Rejection,
+    final_letter,
+    latest_draft,
+    slot_table_for,
+)
 from recourse.cases.review import InvalidAnswer, review
 from recourse.config import get_settings
 from recourse.db.audit import record_event
@@ -34,6 +52,8 @@ from recourse.db.models import (
     AuditEvent,
     Case,
     CaseStatus,
+    DraftRecord,
+    DraftRecordStatus,
     EntitlementRecord,
     EvidenceRecord,
     Upload,
@@ -93,6 +113,22 @@ class TimelineEntry(BaseModel):
     details: dict[str, Any]
 
 
+class DraftView(BaseModel):
+    id: uuid.UUID
+    seq: int
+    kind: str
+    status: DraftRecordStatus
+    subject: str | None
+    body: str | None
+    user_fill: list[str]  # placeholders the user fills in (e.g. "customer.name")
+    rules_verified: bool  # False → real sending stays blocked until the rules are verified
+    disclaimer: str
+    final_subject: str | None
+    final_body: str | None
+    approved_at: datetime | None
+    created_at: datetime
+
+
 class CaseView(BaseModel):
     id: uuid.UUID
     case_tag: str
@@ -104,6 +140,8 @@ class CaseView(BaseModel):
     missing_details: list[str]
     entitlement: dict[str, Any] | None
     last_error: str | None  # e.g. "Please check: amount_inr" (from the workflow)
+    draft: DraftView | None
+    can_redraft: bool
     timeline: list[TimelineEntry]
 
 
@@ -170,6 +208,7 @@ async def get_case(case_id: uuid.UUID, session: Session, runner: Runner) -> Case
     evidence_view = _evidence_view(record) if record else None
     missing = missing_details(record.to_evidence(), details) if record else []
     live = None if case.status in ENDED else await runner.state(case_id)
+    draft = await latest_draft(session, case_id)
     return CaseView(
         id=case.id,
         case_tag=case.case_tag,
@@ -181,6 +220,8 @@ async def get_case(case_id: uuid.UUID, session: Session, runner: Runner) -> Case
         missing_details=missing,
         entitlement=entitlement.data if entitlement else None,
         last_error=live.last_error if live else None,
+        draft=_draft_view(draft) if draft else None,
+        can_redraft=live.can_redraft if live else False,
         timeline=[
             TimelineEntry(
                 occurred_at=e.occurred_at,
@@ -234,9 +275,110 @@ async def abandon_case(
     return {"status": "abandoning"}
 
 
+@router.get("/{case_id}/draft")
+async def get_draft(case_id: uuid.UUID, session: Session) -> DraftView:
+    await _get_case(session, case_id)
+    draft = await latest_draft(session, case_id)
+    if draft is None:
+        raise HTTPException(404, "no draft yet")
+    return _draft_view(draft)
+
+
+@router.post("/{case_id}/drafts/{draft_id}/approve", status_code=status.HTTP_202_ACCEPTED)
+async def approve_draft(
+    case_id: uuid.UUID,
+    draft_id: uuid.UUID,
+    edits: ApprovalEdits,
+    sessions: Annotated[async_sessionmaker[AsyncSession], Depends(get_session_factory)],
+    runner: Runner,
+) -> DraftView:
+    async with sessions.begin() as s:
+        case, draft = await _pending_draft(s, case_id, draft_id)
+        assert draft.subject is not None and draft.body is not None
+        try:
+            table = await slot_table_for(s, case, draft)
+            subject, body = final_letter(draft.subject, draft.body, edits, table)
+        except InvalidEdit as e:
+            raise HTTPException(
+                422, {"message": "The letter cannot be approved.", "errors": e.errors}
+            ) from e
+        except SlotError as e:
+            raise HTTPException(409, str(e)) from e
+        draft.final_subject, draft.final_body = subject, body
+        await s.flush()
+        view = _draft_view(draft)
+    await runner.approve_draft(case_id, draft_id)
+    return view
+
+
+@router.post("/{case_id}/drafts/{draft_id}/reject", status_code=status.HTTP_202_ACCEPTED)
+async def reject_draft(
+    case_id: uuid.UUID,
+    draft_id: uuid.UUID,
+    sessions: Annotated[async_sessionmaker[AsyncSession], Depends(get_session_factory)],
+    runner: Runner,
+    rejection: Rejection | None = None,
+) -> dict[str, str]:
+    async with sessions.begin() as s:
+        _, draft = await _pending_draft(s, case_id, draft_id)
+        reason = (rejection.reason if rejection else "").strip()
+        draft.reject_reason = redact_text(reason)[0] if reason else None
+    await runner.reject_draft(case_id, draft_id)
+    return {"status": "redrafting"}
+
+
+@router.post("/{case_id}/redraft", status_code=status.HTTP_202_ACCEPTED)
+async def redraft(case_id: uuid.UUID, session: Session, runner: Runner) -> dict[str, str]:
+    case = await _get_case(session, case_id)
+    if case.status is not CaseStatus.ASSESSED:
+        raise HTTPException(409, f"case is {case.status.value}, not waiting for a new draft")
+    live = await runner.state(case_id)
+    if live is None or not live.can_redraft:
+        raise HTTPException(409, "the case is not waiting for a new draft")
+    await runner.redraft(case_id)
+    return {"status": "redrafting"}
+
+
 # =================================================================================================
 # Helpers
 # =================================================================================================
+
+
+async def _pending_draft(
+    s: AsyncSession, case_id: uuid.UUID, draft_id: uuid.UUID
+) -> tuple[Case, DraftRecord]:
+    """The case and its current draft, locked, if that draft is waiting for approval."""
+    case = await s.get(Case, case_id, with_for_update=True)
+    if case is None:
+        raise HTTPException(404, "case not found")
+    if case.status is not CaseStatus.AWAITING_APPROVAL:
+        raise HTTPException(409, f"case is {case.status.value}, not waiting for approval")
+    latest = await latest_draft(s, case_id)
+    if latest is None or latest.id != draft_id:
+        raise HTTPException(409, "that draft is no longer the current one")
+    draft = await s.get(DraftRecord, draft_id, with_for_update=True, populate_existing=True)
+    assert draft is not None
+    if draft.status is not DraftRecordStatus.PENDING:
+        raise HTTPException(409, f"draft is {draft.status.value}, not waiting for approval")
+    return case, draft
+
+
+def _draft_view(d: DraftRecord) -> DraftView:
+    return DraftView(
+        id=d.id,
+        seq=d.seq,
+        kind=d.kind.value,
+        status=d.status,
+        subject=d.subject,
+        body=d.body,
+        user_fill=d.user_fill,
+        rules_verified=d.rules_verified,
+        disclaimer=DISCLAIMER,
+        final_subject=d.final_subject,
+        final_body=d.final_body,
+        approved_at=d.approved_at,
+        created_at=d.created_at,
+    )
 
 
 class _NewCase(BaseModel):

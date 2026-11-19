@@ -13,6 +13,7 @@ from decimal import Decimal
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from recourse.agents.draft_graph import DraftStatus
 from recourse.agents.intake_graph import IntakeStatus
 from recourse.cases.review import Confirmation as Confirmation  # the confirm signal payload
 from recourse.db.models import Actor, CaseStatus
@@ -22,6 +23,9 @@ RUN_INTAKE = "case.run_intake"
 CONFIRM = "case.confirm"
 ASSESS = "case.assess"
 MARK_ABANDONED = "case.mark_abandoned"
+DRAFT = "case.draft"
+APPROVE_DRAFT = "case.approve_draft"
+REJECT_DRAFT = "case.reject_draft"
 
 # Error type for ApplicationErrors caused by bad user input (never retried).
 INVALID_USER_INPUT = "InvalidUserInput"
@@ -51,11 +55,22 @@ class AbandonRequest(_Model):
     reason: str = Field(default="user_abandoned", max_length=200)
 
 
+class DraftDecision(_Model):
+    """Payload of `approve_draft` / `reject_draft`. Only the ID: the user's edits, name and
+    reason are stored on the draft row by the API, so they never enter workflow history."""
+
+    draft_id: uuid.UUID
+
+
 class CaseState(_Model):
     status: CaseStatus
     needs_confirmation: list[str] = Field(default_factory=list)
     missing_details: list[str] = Field(default_factory=list)
     last_error: str | None = None
+    draft_id: uuid.UUID | None = None  # the draft currently waiting for approval
+    approved_draft_id: uuid.UUID | None = None
+    drafts_used: int = 0
+    can_redraft: bool = False  # waiting for a `redraft` signal after a failed draft
 
 
 # --- activities -------------------------------------------------------------------------------
@@ -96,6 +111,24 @@ class AssessInput(_Model):
 class AssessSummary(_Model):
     covered: bool
     total_owed_inr: Decimal
+
+
+class DraftInput(_Model):
+    case_id: uuid.UUID
+    seq: int = Field(ge=1)  # idempotency key: one draft row per (case, seq)
+    letter_date: date
+
+
+class DraftSummary(_Model):
+    draft_id: uuid.UUID
+    status: DraftStatus
+    rules_verified: bool
+
+
+class DraftDecisionInput(_Model):
+    case_id: uuid.UUID
+    draft_id: uuid.UUID
+    now: datetime
 
 
 class MarkAbandonedInput(_Model):

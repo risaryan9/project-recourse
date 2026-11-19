@@ -17,10 +17,12 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from temporalio.testing import ActivityEnvironment
 
+from recourse.agents.draft_graph import DRAFT_PURPOSE
 from recourse.api.deps import get_runner, get_session_factory
 from recourse.api.main import create_app
-from recourse.db.models import Case, CaseStatus, Upload, UploadFile
+from recourse.db.models import Case, CaseStatus, DraftRecord, Upload, UploadFile
 from recourse.evidence.models import IST
+from recourse.llm.fake import FakeLLM
 from recourse.temporal.case_activities import CaseActivities
 from recourse.temporal.case_types import (
     AbandonRequest,
@@ -29,9 +31,11 @@ from recourse.temporal.case_types import (
     CaseState,
     Confirmation,
     ConfirmInput,
+    DraftInput,
     RunIntakeInput,
 )
 from tests.db.test_case_activities import NONE, sms_llm
+from tests.unit.test_draft_graph import GOOD_FAILED
 
 pytestmark = pytest.mark.db
 
@@ -43,8 +47,12 @@ class FakeRunner:
     started: list[CaseInput] = field(default_factory=list)
     confirmed: list[tuple[uuid.UUID, Confirmation]] = field(default_factory=list)
     abandoned: list[uuid.UUID] = field(default_factory=list)
+    approved: list[uuid.UUID] = field(default_factory=list)
+    rejected: list[uuid.UUID] = field(default_factory=list)
+    redrafts: list[uuid.UUID] = field(default_factory=list)
     fail_start: bool = False
     last_error: str | None = None
+    can_redraft: bool = False
 
     async def start(self, inp: CaseInput) -> None:
         if self.fail_start:
@@ -57,8 +65,19 @@ class FakeRunner:
     async def abandon(self, case_id: uuid.UUID, request: AbandonRequest) -> None:
         self.abandoned.append(case_id)
 
+    async def approve_draft(self, case_id: uuid.UUID, draft_id: uuid.UUID) -> None:
+        self.approved.append(draft_id)
+
+    async def reject_draft(self, case_id: uuid.UUID, draft_id: uuid.UUID) -> None:
+        self.rejected.append(draft_id)
+
+    async def redraft(self, case_id: uuid.UUID) -> None:
+        self.redrafts.append(case_id)
+
     async def state(self, case_id: uuid.UUID) -> CaseState | None:
-        return CaseState(status=CaseStatus.EXTRACTED, last_error=self.last_error)
+        return CaseState(
+            status=CaseStatus.EXTRACTED, last_error=self.last_error, can_redraft=self.can_redraft
+        )
 
 
 @pytest.fixture
@@ -208,3 +227,100 @@ async def test_last_error_from_the_workflow_is_shown(
     runner.last_error = "These facts cannot be assessed: reversal_date cannot be before txn_date"
     view = (await client.get(f"/cases/{r.json()['id']}")).json()
     assert view["last_error"] == runner.last_error
+
+
+# =================================================================================================
+# Drafts
+# =================================================================================================
+
+
+async def drafted_case(
+    client: httpx.AsyncClient, runner: FakeRunner, sessions: async_sessionmaker[AsyncSession]
+) -> tuple[str, str]:
+    """A case with one pending draft, as the worker would leave it. Returns (case, draft) IDs."""
+    r = await client.post("/cases", data={"text": "Rs 2,450 debited via UPI, failed"})
+    case_id = r.json()["id"]
+    inp = runner.started[-1]
+    await intake(sessions, inp)
+    env = ActivityEnvironment()
+    acts = CaseActivities(sessions, FakeLLM({DRAFT_PURPOSE: [GOOD_FAILED.model_dump()]}))
+    await env.run(
+        acts.confirm, ConfirmInput(case_id=inp.case_id, confirmation=Confirmation(), now=NOW)
+    )
+    await env.run(acts.assess, AssessInput(case_id=inp.case_id, as_of=NOW.date()))
+    summary = await env.run(
+        acts.draft, DraftInput(case_id=inp.case_id, seq=1, letter_date=NOW.date())
+    )
+    return case_id, str(summary.draft_id)
+
+
+async def test_approve_a_draft(
+    api: tuple[httpx.AsyncClient, FakeRunner], sessions: async_sessionmaker[AsyncSession]
+) -> None:
+    client, runner = api
+    case_id, draft_id = await drafted_case(client, runner, sessions)
+
+    view = (await client.get(f"/cases/{case_id}")).json()
+    assert view["status"] == "AWAITING_APPROVAL"
+    draft = view["draft"]
+    assert draft["id"] == draft_id and draft["status"] == "PENDING"
+    assert draft["user_fill"] == ["customer.name"]
+    assert "not legal advice" in draft["disclaimer"]
+    assert draft["rules_verified"] is False
+    assert (await client.get(f"/cases/{case_id}/draft")).json()["id"] == draft_id
+
+    url = f"/cases/{case_id}/drafts/{draft_id}/approve"
+    # An edit that changes an amount is refused at once, and nothing is signalled.
+    bad_body = draft["body"].replace("₹2,450.00", "₹24,500.00")
+    bad = await client.post(url, json={"customer_name": "Asha Verma", "body": bad_body})
+    assert bad.status_code == 422
+    assert any("amounts" in e for e in bad.json()["detail"]["errors"])
+    assert runner.approved == []
+
+    ok = await client.post(url, json={"customer_name": "Asha Verma"})
+    assert ok.status_code == 202, ok.text
+    assert ok.json()["final_body"].endswith("Asha Verma")
+    assert [str(d) for d in runner.approved] == [draft_id]
+
+    # Another draft ID is refused.
+    other = f"/cases/{case_id}/drafts/{uuid.uuid4()}/approve"
+    assert (await client.post(other, json={"customer_name": "Asha Verma"})).status_code == 409
+
+
+async def test_reject_a_draft_stores_a_redacted_reason(
+    api: tuple[httpx.AsyncClient, FakeRunner], sessions: async_sessionmaker[AsyncSession]
+) -> None:
+    client, runner = api
+    case_id, draft_id = await drafted_case(client, runner, sessions)
+    r = await client.post(
+        f"/cases/{case_id}/drafts/{draft_id}/reject",
+        json={"reason": "Shorter please. My OTP is 482913"},
+    )
+    assert r.status_code == 202
+    assert [str(d) for d in runner.rejected] == [draft_id]
+    async with sessions() as s:
+        row = await s.get(DraftRecord, uuid.UUID(draft_id))
+        assert row is not None and row.reject_reason is not None
+        assert "Shorter please." in row.reject_reason
+        assert "482913" not in row.reject_reason
+
+
+async def test_redraft_only_when_the_workflow_waits_for_it(
+    api: tuple[httpx.AsyncClient, FakeRunner], sessions: async_sessionmaker[AsyncSession]
+) -> None:
+    client, runner = api
+    r = await client.post("/cases", data={"text": "Rs 2,450 debited via UPI, failed"})
+    case_id = r.json()["id"]
+    inp = runner.started[-1]
+    await intake(sessions, inp)
+    env = ActivityEnvironment()
+    acts = CaseActivities(sessions, sms_llm())
+    await env.run(
+        acts.confirm, ConfirmInput(case_id=inp.case_id, confirmation=Confirmation(), now=NOW)
+    )
+    await env.run(acts.assess, AssessInput(case_id=inp.case_id, as_of=NOW.date()))
+
+    assert (await client.post(f"/cases/{case_id}/redraft")).status_code == 409
+    runner.can_redraft = True
+    assert (await client.post(f"/cases/{case_id}/redraft")).status_code == 202
+    assert runner.redrafts == [inp.case_id]

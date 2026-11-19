@@ -12,6 +12,7 @@ Errors:
 
 from __future__ import annotations
 
+import re
 import uuid
 from typing import Any
 
@@ -21,31 +22,45 @@ from sqlalchemy.orm import selectinload
 from temporalio import activity
 from temporalio.exceptions import ApplicationError
 
+from recourse.agents.draft_graph import DraftKind as GraphDraftKind
+from recourse.agents.draft_graph import DraftStatus, run_draft
+from recourse.agents.draft_slots import CUSTOMER_NAME_PLACEHOLDER, SlotError
 from recourse.agents.intake_graph import IntakeInput, IntakeStatus, run_intake
 from recourse.cases.assessment import AssessmentError, CaseDetails, assess, missing_details
+from recourse.cases.drafts import InvalidEdit, latest_draft, recheck_final, slot_table_for
 from recourse.cases.review import InvalidAnswer, review
 from recourse.db.audit import record_event
 from recourse.db.models import (
     Actor,
     Case,
     CaseStatus,
+    DraftKind,
+    DraftRecord,
+    DraftRecordStatus,
     EntitlementRecord,
     EvidenceRecord,
     Upload,
 )
 from recourse.evidence.validators import EvidenceCheck
 from recourse.llm.base import Attachment, LLMClient, LLMError
+from recourse.rules.models import Entitlement
 from recourse.security.pii import RedactionKind
 from recourse.temporal.case_types import (
+    APPROVE_DRAFT,
     ASSESS,
     CONFIRM,
+    DRAFT,
     INVALID_USER_INPUT,
     MARK_ABANDONED,
+    REJECT_DRAFT,
     RUN_INTAKE,
     AssessInput,
     AssessSummary,
     ConfirmInput,
     ConfirmOutcome,
+    DraftDecisionInput,
+    DraftInput,
+    DraftSummary,
     IntakeSummary,
     MarkAbandonedInput,
     RunIntakeInput,
@@ -64,7 +79,15 @@ class CaseActivities:
         self._llm = llm
 
     def all(self) -> list[Any]:
-        return [self.run_intake, self.confirm, self.assess, self.mark_abandoned]
+        return [
+            self.run_intake,
+            self.confirm,
+            self.assess,
+            self.draft,
+            self.approve_draft,
+            self.reject_draft,
+            self.mark_abandoned,
+        ]
 
     # --- intake ---------------------------------------------------------------------------------
 
@@ -223,6 +246,157 @@ class CaseActivities:
                 covered=entitlement.covered, total_owed_inr=entitlement.total_owed_inr
             )
 
+    # --- drafting ---------------------------------------------------------------------------------
+
+    @activity.defn(name=DRAFT)
+    async def draft(self, inp: DraftInput) -> DraftSummary:
+        """Run the DraftGraph once and store the result as draft number `seq`.
+
+        Idempotent: if draft `seq` already exists (an earlier attempt finished), return it
+        without calling the LLM again. A rejected previous draft's reason becomes feedback.
+        """
+        async with self._sessions() as s:
+            existing = await _draft_by_seq(s, inp.case_id, inp.seq)
+            if existing is not None:
+                return _draft_summary(existing)
+            case = await s.get(Case, inp.case_id)
+            if case is None:
+                raise ApplicationError(f"case {inp.case_id} not found", non_retryable=True)
+            evidence = (await _latest_evidence(s, case.id)).to_evidence()
+            ent_row = await s.scalar(
+                select(EntitlementRecord).where(EntitlementRecord.case_id == case.id)
+            )
+            if ent_row is None:
+                raise invalid("The case has not been assessed yet.")
+            entitlement = Entitlement.model_validate(ent_row.data)
+            previous = await _draft_by_seq(s, case.id, inp.seq - 1) if inp.seq > 1 else None
+            feedback = (
+                previous.reject_reason
+                if previous is not None and previous.status is DraftRecordStatus.REJECTED
+                else None
+            )
+            case_tag = case.case_tag
+
+        try:
+            result = await run_draft(
+                self._llm,
+                entitlement,
+                evidence,
+                case_tag=case_tag,
+                letter_date=inp.letter_date,
+                feedback=feedback,
+            )
+        except SlotError as e:
+            raise invalid(f"This case cannot be drafted: {e}") from e
+        except LLMError as e:
+            if e.retryable:
+                raise
+            raise ApplicationError(str(e), type=LLM_FAILED, non_retryable=True) from e
+
+        async with self._sessions.begin() as s:
+            case = await _case_for_update(s, inp.case_id)
+            existing = await _draft_by_seq(s, case.id, inp.seq)
+            if existing is not None:  # a concurrent attempt won the race
+                return _draft_summary(existing)
+            drafted = result.status is DraftStatus.DRAFTED
+            assert result.kind is GraphDraftKind.BANK_COMPLAINT
+            row = DraftRecord(
+                case_id=case.id,
+                seq=inp.seq,
+                kind=DraftKind.BANK_COMPLAINT,
+                status=DraftRecordStatus.PENDING if drafted else DraftRecordStatus.FAILED,
+                letter_date=inp.letter_date,
+                attempts=result.attempts,
+                rules_verified=result.rules_verified,
+                subject=result.subject,
+                body=result.body,
+                template=result.template.model_dump() if result.template else None,
+                slots_used=result.slots_used,
+                user_fill=result.user_fill,
+                errors=result.errors,
+                models_used=result.models_used,
+            )
+            s.add(row)
+            await s.flush()
+            info: dict[str, Any] = {
+                "draft_id": str(row.id),
+                "seq": inp.seq,
+                "attempts": result.attempts,
+                "rules_verified": result.rules_verified,
+                "with_feedback": feedback is not None,
+                "models": result.models_used,
+            }
+            if drafted:
+                # DRAFT_READY and AWAITING_APPROVAL happen together: nothing waits in between.
+                case.status = CaseStatus.AWAITING_APPROVAL
+                record_event(s, case.id, Actor.AGENT, "draft.ready", info)
+            else:
+                case.status = CaseStatus.ASSESSED
+                record_event(
+                    s, case.id, Actor.AGENT, "draft.failed", info | {"errors": result.errors}
+                )
+            return _draft_summary(row)
+
+    @activity.defn(name=APPROVE_DRAFT)
+    async def approve_draft(self, inp: DraftDecisionInput) -> None:
+        """Approve the final text the user submitted (stored on the row by the API).
+
+        The text is checked again here: the API's check gave the user a fast answer, this one
+        is the decision. Idempotent: approving an approved draft does nothing.
+        """
+        async with self._sessions.begin() as s:
+            case = await _case_for_update(s, inp.case_id)
+            draft = await _current_draft_for_update(s, case.id, inp.draft_id)
+            if draft.status is DraftRecordStatus.APPROVED:
+                return
+            if draft.status is not DraftRecordStatus.PENDING:
+                raise invalid("This draft is not waiting for approval.")
+            if draft.final_subject is None or draft.final_body is None:
+                raise invalid("Fill in your name and approve the draft again.")
+            try:
+                table = await slot_table_for(s, case, draft)
+                recheck_final(draft.final_subject, draft.final_body, table)
+            except (InvalidEdit, SlotError) as e:
+                raise invalid(f"The letter cannot be approved: {e}") from e
+            draft.status = DraftRecordStatus.APPROVED
+            draft.approved_at = inp.now
+            record_event(
+                s,
+                case.id,
+                Actor.USER,
+                "draft.approved",
+                {
+                    "draft_id": str(draft.id),
+                    "seq": draft.seq,
+                    "edited_subject": _edited(draft.subject, draft.final_subject),
+                    "edited_body": _edited(draft.body, draft.final_body),
+                    "rules_verified": draft.rules_verified,
+                },
+            )
+
+    @activity.defn(name=REJECT_DRAFT)
+    async def reject_draft(self, inp: DraftDecisionInput) -> None:
+        async with self._sessions.begin() as s:
+            case = await _case_for_update(s, inp.case_id)
+            draft = await _current_draft_for_update(s, case.id, inp.draft_id)
+            if draft.status is DraftRecordStatus.REJECTED:
+                return
+            if draft.status is not DraftRecordStatus.PENDING:
+                raise invalid("This draft is not waiting for approval.")
+            draft.status = DraftRecordStatus.REJECTED
+            case.status = CaseStatus.ASSESSED
+            record_event(
+                s,
+                case.id,
+                Actor.USER,
+                "draft.rejected",
+                {
+                    "draft_id": str(draft.id),
+                    "seq": draft.seq,
+                    "with_reason": bool(draft.reject_reason),
+                },
+            )
+
     # --- end -------------------------------------------------------------------------------------
 
     @activity.defn(name=MARK_ABANDONED)
@@ -244,6 +418,43 @@ async def _case_for_update(s: AsyncSession, case_id: uuid.UUID) -> Case:
     if case is None:
         raise ApplicationError(f"case {case_id} not found", non_retryable=True)
     return case
+
+
+async def _draft_by_seq(s: AsyncSession, case_id: uuid.UUID, seq: int) -> DraftRecord | None:
+    draft: DraftRecord | None = await s.scalar(
+        select(DraftRecord).where(DraftRecord.case_id == case_id, DraftRecord.seq == seq)
+    )
+    return draft
+
+
+async def _current_draft_for_update(
+    s: AsyncSession, case_id: uuid.UUID, draft_id: uuid.UUID
+) -> DraftRecord:
+    """The draft, locked, if it is the case's latest one."""
+    latest = await latest_draft(s, case_id)
+    if latest is None or latest.id != draft_id:
+        raise invalid("That draft is no longer the current one.")
+    draft = await s.get(DraftRecord, draft_id, with_for_update=True, populate_existing=True)
+    assert draft is not None
+    return draft
+
+
+def _draft_summary(row: DraftRecord) -> DraftSummary:
+    return DraftSummary(
+        draft_id=row.id,
+        status=DraftStatus.FAILED
+        if row.status is DraftRecordStatus.FAILED
+        else DraftStatus.DRAFTED,
+        rules_verified=row.rules_verified,
+    )
+
+
+def _edited(drafted: str | None, final: str) -> bool:
+    """True if the user changed more than filling in their name."""
+    if drafted is None:
+        return True
+    parts = [re.escape(p) for p in drafted.strip().split(CUSTOMER_NAME_PLACEHOLDER)]
+    return re.fullmatch(".+?".join(parts), final, flags=re.S) is None
 
 
 async def _latest_evidence(s: AsyncSession, case_id: uuid.UUID) -> EvidenceRecord:
