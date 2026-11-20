@@ -26,7 +26,7 @@ error from a rejected answer. No authentication yet: anyone with a case ID can s
 from __future__ import annotations
 
 import uuid
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, status
@@ -184,6 +184,11 @@ class CaseView(BaseModel):
     email: EmailView | None
     can_retry_send: bool
     bank: BankView | None  # chosen by the user, or matched from the extracted bank name
+    # The bank's reply window: complaint date and the RBI Ombudsman escalation assessment
+    # (rule engine; eligible-from date, filing deadline, citations).
+    bank_complained_on: date | None
+    escalation: dict[str, Any] | None
+    bank_wait_expired: bool  # the bank did not reply within its window
     timeline: list[TimelineEntry]
 
 
@@ -273,6 +278,9 @@ async def get_case(case_id: uuid.UUID, session: Session, runner: Runner) -> Case
         email=_email_view(email) if email else None,
         can_retry_send=live.can_retry_send if live else False,
         bank=_bank_view(bank) if bank else None,
+        bank_complained_on=case.bank_complained_on,
+        escalation=case.escalation,
+        bank_wait_expired=live.bank_wait_expired if live else False,
         timeline=[
             TimelineEntry(
                 occurred_at=e.occurred_at,

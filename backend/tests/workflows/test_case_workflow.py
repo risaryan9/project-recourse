@@ -6,7 +6,7 @@ import asyncio
 import uuid
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass, field
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from typing import Any
 
@@ -29,6 +29,7 @@ from recourse.rules.models import BankType
 from recourse.temporal.case_types import (
     APPROVE_DRAFT,
     ASSESS,
+    ASSESS_ESCALATION,
     CONFIRM,
     DRAFT,
     INVALID_USER_INPUT,
@@ -50,6 +51,8 @@ from recourse.temporal.case_types import (
     DraftDecisionInput,
     DraftInput,
     DraftSummary,
+    EscalationInput,
+    EscalationSummary,
     IntakeSummary,
     MarkAbandonedInput,
     MarkSent,
@@ -57,6 +60,7 @@ from recourse.temporal.case_types import (
     RecordSentInput,
     RunIntakeInput,
     SendSummary,
+    TimeScaleInput,
 )
 from recourse.temporal.case_workflow import CaseWorkflow
 
@@ -83,6 +87,7 @@ class FakeActivities:
     reject: list[Any] = field(default_factory=lambda: [None])
     prepare: list[Any] = field(default_factory=lambda: [prepared()])
     record: list[Any] = field(default_factory=lambda: [None])
+    escalation: list[Any] = field(default_factory=list)  # empty → `waiting()`
     calls: list[tuple[str, Any]] = field(default_factory=list)
 
     def _next(self, name: str, script: list[Any], arg: Any) -> Any:
@@ -130,6 +135,14 @@ class FakeActivities:
         async def record_sent(inp: RecordSentInput) -> None:
             self._next(RECORD_SENT, self.record, inp)
 
+        @activity.defn(name=ASSESS_ESCALATION)
+        async def assess_escalation(inp: EscalationInput) -> EscalationSummary:
+            if not self.escalation:
+                self.calls.append((ASSESS_ESCALATION, inp))
+                return waiting()
+            result: EscalationSummary = self._next(ASSESS_ESCALATION, self.escalation, inp)
+            return result
+
         @activity.defn(name=MARK_ABANDONED)
         async def mark_abandoned(inp: MarkAbandonedInput) -> None:
             self.calls.append((MARK_ABANDONED, inp))
@@ -143,6 +156,7 @@ class FakeActivities:
             reject_draft,
             prepare_send,
             record_sent,
+            assess_escalation,
             mark_abandoned,
         ]
 
@@ -161,6 +175,16 @@ def prepared(status: OutboundStatus = OutboundStatus.PREPARED, *reasons: str) ->
         status=status,
         sandbox=True,
         blocked_reasons=list(reasons),
+    )
+
+
+def waiting(wait_days: int = 30) -> EscalationSummary:
+    return EscalationSummary(
+        entity_coverage="COVERED",
+        can_file_now=wait_days == 0,
+        eligible_from=date(2026, 12, 20),
+        filing_deadline=date(2027, 3, 19),
+        wait_days=wait_days,
     )
 
 
@@ -337,8 +361,10 @@ async def test_intake_failure_ends_the_case(env: WorkflowEnvironment) -> None:
 # =================================================================================================
 
 
-async def to_approval(env: WorkflowEnvironment, fakes: FakeActivities) -> WorkflowHandle[Any, Any]:
-    handle = await start(env, case_input())
+async def to_approval(
+    env: WorkflowEnvironment, fakes: FakeActivities, inp: CaseInput | None = None
+) -> WorkflowHandle[Any, Any]:
+    handle = await start(env, inp or case_input())
     await wait_for(handle, lambda s: s.status is CaseStatus.EXTRACTED)
     await handle.signal(CaseWorkflow.confirm, Confirmation())
     return handle
@@ -519,14 +545,14 @@ async def test_manual_send_to_sent_to_bank(env: WorkflowEnvironment) -> None:
         assert state.awaiting_manual_send
 
         await handle.signal(CaseWorkflow.mark_sent, MarkSent(sent_at=SENT_AT))
-        state = await wait_for(handle, lambda s: s.status is CaseStatus.SENT_TO_BANK)
+        state = await wait_for(handle, lambda s: s.status is CaseStatus.AWAITING_BANK)
         assert not state.awaiting_manual_send and state.last_error is None
 
         await handle.signal(CaseWorkflow.abandon, AbandonRequest())
         await handle.result()
         history = await handle.fetch_history()
 
-    record_arg: RecordSentInput = fakes.calls[-2][1]
+    record_arg: RecordSentInput = [a for n, a in fakes.calls if n == RECORD_SENT][-1]
     assert record_arg.email_id == email.email_id and record_arg.mark.sent_at == SENT_AT
     prepare_arg: PrepareSendInput = next(a for n, a in fakes.calls if n == PREPARE_SEND)
     assert prepare_arg.draft_id == next(a for n, a in fakes.calls if n == APPROVE_DRAFT).draft_id
@@ -559,7 +585,7 @@ async def test_a_channel_that_sends_itself_skips_mark_sent(env: WorkflowEnvironm
     fakes = FakeActivities(prepare=[prepared(OutboundStatus.SENT)])
     async with worker(env, fakes):
         handle = await to_approved(env, fakes)
-        await wait_for(handle, lambda s: s.status is CaseStatus.SENT_TO_BANK)
+        await wait_for(handle, lambda s: s.status is CaseStatus.AWAITING_BANK)
         await handle.signal(CaseWorkflow.abandon, AbandonRequest())
         await handle.result()
     assert RECORD_SENT not in fakes.names()
@@ -588,3 +614,102 @@ async def test_abandon_while_waiting_for_the_user_to_send(env: WorkflowEnvironme
         outcome: CaseOutcome = await handle.result()
     assert outcome.status is CaseStatus.ABANDONED
     assert fakes.names()[-2:] == [PREPARE_SEND, MARK_ABANDONED]
+
+
+# =================================================================================================
+# The bank's reply window
+# =================================================================================================
+
+
+async def to_awaiting_bank(
+    env: WorkflowEnvironment, fakes: FakeActivities, inp: CaseInput | None = None
+) -> WorkflowHandle[Any, Any]:
+    handle = await to_approval(env, fakes, inp)
+    state = await wait_for(handle, lambda s: s.draft_id is not None)
+    assert state.draft_id is not None
+    await handle.signal(CaseWorkflow.approve_draft, DraftDecision(draft_id=state.draft_id))
+    await wait_for(handle, lambda s: s.awaiting_manual_send)
+    await handle.signal(CaseWorkflow.mark_sent, MarkSent(sent_at=SENT_AT))
+    await wait_for(handle, lambda s: s.status is CaseStatus.AWAITING_BANK)
+    return handle
+
+
+async def test_bank_wait_timer_expires(env: WorkflowEnvironment) -> None:
+    fakes = FakeActivities()
+    async with worker(env, fakes):
+        handle = await to_awaiting_bank(env, fakes)
+        state: CaseState = await handle.query(CaseWorkflow.get_state)
+        assert state.escalation_eligible_from == date(2026, 12, 20)
+        assert state.filing_deadline == date(2027, 3, 19)
+        assert not state.bank_wait_expired
+
+        await env.sleep(timedelta(days=29))
+        state = await handle.query(CaseWorkflow.get_state)
+        assert not state.bank_wait_expired
+
+        await env.sleep(timedelta(days=2))
+        state = await wait_for(handle, lambda s: s.bank_wait_expired)
+        assert state.status is CaseStatus.AWAITING_BANK
+        await handle.signal(CaseWorkflow.abandon, AbandonRequest())
+        await handle.result()
+        history = await handle.fetch_history()
+
+    escalations: list[EscalationInput] = [a for n, a in fakes.calls if n == ASSESS_ESCALATION]
+    assert [e.event for e in escalations] == ["bank.wait_started", "bank.wait_expired"]
+    assert escalations[0].new_status is CaseStatus.AWAITING_BANK
+    assert escalations[1].new_status is None
+    await Replayer(
+        workflows=[CaseWorkflow], data_converter=pydantic_data_converter
+    ).replay_workflow(history)
+
+
+async def test_demo_mode_shrinks_the_bank_wait(env: WorkflowEnvironment) -> None:
+    fakes = FakeActivities()
+    inp = CaseInput(
+        case_id=uuid.uuid4(),
+        upload_id=uuid.uuid4(),
+        time_scale=TimeScaleInput(demo_mode=True, demo_day_seconds=60),
+    )
+    async with worker(env, fakes):
+        handle = await to_awaiting_bank(env, fakes, inp)
+        await env.sleep(timedelta(minutes=29))
+        state: CaseState = await handle.query(CaseWorkflow.get_state)
+        assert not state.bank_wait_expired
+        await env.sleep(timedelta(minutes=2))  # 30 "days" of 60 seconds
+        await wait_for(handle, lambda s: s.bank_wait_expired)
+        await handle.signal(CaseWorkflow.abandon, AbandonRequest())
+        await handle.result()
+
+
+async def test_window_already_over_expires_at_once(env: WorkflowEnvironment) -> None:
+    fakes = FakeActivities(escalation=[waiting(0), waiting(0)])
+    async with worker(env, fakes):
+        handle = await to_awaiting_bank(env, fakes)
+        await wait_for(handle, lambda s: s.bank_wait_expired)
+        await handle.signal(CaseWorkflow.abandon, AbandonRequest())
+        await handle.result()
+
+
+async def test_abandon_while_awaiting_bank(env: WorkflowEnvironment) -> None:
+    fakes = FakeActivities()
+    async with worker(env, fakes):
+        handle = await to_awaiting_bank(env, fakes)
+        await handle.signal(CaseWorkflow.abandon, AbandonRequest(reason="bank paid"))
+        outcome: CaseOutcome = await handle.result()
+    assert outcome.reason == "bank paid"
+    assert fakes.names()[-2:] == [ASSESS_ESCALATION, MARK_ABANDONED]
+
+
+async def test_escalation_error_keeps_the_case_open(env: WorkflowEnvironment) -> None:
+    fakes = FakeActivities(
+        escalation=[bad_input("The complaint has not been sent to the bank yet.")]
+    )
+    async with worker(env, fakes):
+        handle = await to_awaiting_bank(env, fakes)
+        state = await wait_for(handle, lambda s: s.last_error is not None)
+        assert "has not been sent" in (state.last_error or "")
+        await env.sleep(timedelta(days=60))
+        state = await handle.query(CaseWorkflow.get_state)
+        assert not state.bank_wait_expired
+        await handle.signal(CaseWorkflow.abandon, AbandonRequest())
+        await handle.result()

@@ -11,6 +11,8 @@ from typing import Literal
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from recourse.rules.models import BankType
+
 CONTACTS_FILE = Path(__file__).with_name("bank_contacts.yaml")
 
 _EMAIL_RE = re.compile(r"^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$")
@@ -39,6 +41,8 @@ class NodalOfficer(_Model):
 class BankContact(_Model):
     id: str = Field(pattern=r"^[a-z0-9_]{2,32}$")
     name: str
+    # RBI category of the bank; selects Ombudsman coverage (and the fraud regime). None = unknown.
+    bank_type: BankType | None = None
     aliases: list[str] = Field(min_length=1)
     grievance_email: str | None = None
     nodal_officer: NodalOfficer | None = None

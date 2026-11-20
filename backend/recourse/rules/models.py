@@ -132,6 +132,7 @@ class FlagCode(StrEnum):
     BANK_NOT_YET_COMPLAINED = "BANK_NOT_YET_COMPLAINED"
     FILING_DEADLINE_PASSED = "FILING_DEADLINE_PASSED"
     BEFORE_SCHEME = "BEFORE_SCHEME"  # filing date before RB-IOS 2026 took effect
+    BANK_TYPE_NEEDED = "BANK_TYPE_NEEDED"  # escalation coverage needs the bank's type
 
 
 # =================================================================================================
@@ -441,7 +442,7 @@ class FraudFacts(_Facts):
 class EscalationFacts(_Facts):
     """Facts for working out the RBI Ombudsman escalation window."""
 
-    entity_type: BankType
+    entity_type: BankType | None  # None = not known yet: coverage UNKNOWN, cannot file
     bank_received_complaint_date: date | None  # None = not yet complained to the bank
     # Longest reply timeline that RBI / NPCI / card-network rules give the bank for this case
     # (e.g. 45 days for Regime B fraud). Taken from the case's Entitlement. None = no such rule.
@@ -578,7 +579,7 @@ class Entitlement(_Out):
 class EscalationAssessment(_Out):
     scheme_id: str
     as_of: date
-    entity_coverage: Literal["COVERED", "CONDITIONAL", "NOT_COVERED"]
+    entity_coverage: Literal["COVERED", "CONDITIONAL", "NOT_COVERED", "UNKNOWN"]
     can_file_now: bool
     eligible_from: date | None  # first day a complaint can be filed; None if not complained yet
     waiting_period_ends: date | None

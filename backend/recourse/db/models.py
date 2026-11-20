@@ -133,6 +133,11 @@ class Case(_Timestamps, Base):
     details: Mapped[dict[str, Any]] = mapped_column(
         JSONB, default=dict, server_default=text("'{}'::jsonb")
     )
+    # Date the bank received the complaint (the day it was sent; IST). Starts the bank's
+    # reply window.
+    bank_complained_on: Mapped[date | None] = mapped_column(Date)
+    # Latest RBI Ombudsman escalation assessment (rules.models.EscalationAssessment as JSON).
+    escalation: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
 
     evidence: Mapped[list[EvidenceRecord]] = relationship(
         back_populates="case",

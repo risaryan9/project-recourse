@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import re
 import uuid
-from datetime import timedelta
+from datetime import date, timedelta
 from typing import Any
 
 from sqlalchemy import delete, select
@@ -29,11 +29,13 @@ from recourse.agents.draft_slots import CUSTOMER_NAME_PLACEHOLDER, SlotError
 from recourse.agents.intake_graph import IntakeInput, IntakeStatus, run_intake
 from recourse.cases.assessment import AssessmentError, CaseDetails, assess, missing_details
 from recourse.cases.drafts import InvalidEdit, latest_draft, recheck_final, slot_table_for
+from recourse.cases.escalation import bank_type_for, days_until, escalation_for
 from recourse.cases.review import InvalidAnswer, review
 from recourse.config import Settings, get_settings
 from recourse.db.audit import record_event
 from recourse.db.models import (
     Actor,
+    AuditEvent,
     Case,
     CaseStatus,
     DraftKind,
@@ -53,6 +55,7 @@ from recourse.email.channel import (
 )
 from recourse.email.contacts import BankContact, BankContacts, load_bank_contacts
 from recourse.email.manual import ManualChannel
+from recourse.evidence.models import IST
 from recourse.evidence.validators import EvidenceCheck
 from recourse.llm.base import Attachment, LLMClient, LLMError
 from recourse.rules.models import Entitlement
@@ -60,6 +63,7 @@ from recourse.security.pii import RedactionKind
 from recourse.temporal.case_types import (
     APPROVE_DRAFT,
     ASSESS,
+    ASSESS_ESCALATION,
     CONFIRM,
     DRAFT,
     INVALID_USER_INPUT,
@@ -75,6 +79,8 @@ from recourse.temporal.case_types import (
     DraftDecisionInput,
     DraftInput,
     DraftSummary,
+    EscalationInput,
+    EscalationSummary,
     IntakeSummary,
     MarkAbandonedInput,
     PrepareSendInput,
@@ -122,6 +128,7 @@ class CaseActivities:
             self.reject_draft,
             self.prepare_send,
             self.record_sent,
+            self.assess_escalation,
             self.mark_abandoned,
         ]
 
@@ -552,6 +559,72 @@ class CaseActivities:
                 },
             )
 
+    # --- the bank's reply window ------------------------------------------------------------------
+
+    @activity.defn(name=ASSESS_ESCALATION)
+    async def assess_escalation(self, inp: EscalationInput) -> EscalationSummary:
+        """Work out the Ombudsman waiting period and filing deadline (rule engine) and store them.
+
+        The complaint date is the day the approved complaint was sent (IST). Idempotent: the
+        assessment is a pure function of the stored facts and `as_of`, and a retry finds its own
+        audit event and does not record it twice.
+        """
+        async with self._sessions.begin() as s:
+            case = await _case_for_update(s, inp.case_id)
+            entitlement_row = await s.scalar(
+                select(EntitlementRecord).where(EntitlementRecord.case_id == case.id)
+            )
+            if entitlement_row is None:
+                raise ApplicationError("the case has not been assessed", non_retryable=True)
+            entitlement = Entitlement.model_validate(entitlement_row.data)
+            sent = await s.scalar(
+                select(OutboundEmail)
+                .where(
+                    OutboundEmail.case_id == case.id,
+                    OutboundEmail.status == OutboundStatus.SENT,
+                )
+                .order_by(OutboundEmail.sent_at)
+                .limit(1)
+            )
+            if sent is None or sent.sent_at is None:
+                raise invalid("The complaint has not been sent to the bank yet.")
+            complained_on = sent.sent_at.astimezone(IST).date()
+
+            evidence = (await _latest_evidence(s, case.id)).to_evidence()
+            details = CaseDetails.model_validate(case.details)
+            contact = self._bank_for(case.bank_id, evidence.payer_bank.value)
+            bank_type = bank_type_for(details.bank_type, contact.bank_type if contact else None)
+            assessment = escalation_for(
+                entitlement,
+                bank_type=bank_type,
+                complained_on=complained_on,
+                as_of=inp.as_of,
+            )
+
+            case.bank_complained_on = complained_on
+            case.escalation = assessment.model_dump(mode="json")
+            if inp.new_status is not None:
+                case.status = inp.new_status
+            info: dict[str, Any] = {
+                "as_of": inp.as_of.isoformat(),
+                "complained_on": complained_on.isoformat(),
+                "bank_type": bank_type.value if bank_type else None,
+                "entity_coverage": assessment.entity_coverage,
+                "eligible_from": _iso(assessment.eligible_from),
+                "filing_deadline": _iso(assessment.filing_deadline),
+                "can_file_now": assessment.can_file_now,
+            }
+            if not await _has_event(s, case.id, inp.event, info):
+                record_event(s, case.id, Actor.SYSTEM, inp.event, info)
+            return EscalationSummary(
+                entity_coverage=assessment.entity_coverage,
+                can_file_now=assessment.can_file_now,
+                eligible_from=assessment.eligible_from,
+                filing_deadline=assessment.filing_deadline,
+                wait_days=days_until(assessment.eligible_from, inp.as_of),
+                needs_bank_type=bank_type is None,
+            )
+
     def _bank_for(self, bank_id: str | None, extracted_name: str | None) -> BankContact | None:
         if bank_id is not None:
             return self._contacts.get(bank_id)
@@ -597,6 +670,26 @@ async def _current_draft_for_update(
     draft = await s.get(DraftRecord, draft_id, with_for_update=True, populate_existing=True)
     assert draft is not None
     return draft
+
+
+def _iso(d: date | None) -> str | None:
+    return d.isoformat() if d is not None else None
+
+
+async def _has_event(
+    s: AsyncSession, case_id: uuid.UUID, event_type: str, details: dict[str, Any]
+) -> bool:
+    """True if this exact audit event was already recorded (a retried activity)."""
+    found = await s.scalar(
+        select(AuditEvent.id)
+        .where(
+            AuditEvent.case_id == case_id,
+            AuditEvent.event_type == event_type,
+            AuditEvent.details == details,
+        )
+        .limit(1)
+    )
+    return found is not None
 
 
 def _send_summary(row: OutboundEmail) -> SendSummary:

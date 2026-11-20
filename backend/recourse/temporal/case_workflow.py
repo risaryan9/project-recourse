@@ -18,7 +18,13 @@
     prepare_send (send policy + channel) ──(blocked)──→ wait for `retry_send`
         │ ManualChannel: PREPARED, the user sends it themselves
         ▼
-    wait for `mark_sent` → record_sent → SENT_TO_BANK → wait (bank timers are the next milestone)
+    wait for `mark_sent` → record_sent → SENT_TO_BANK
+        │
+        ▼
+    assess_escalation (rule engine) → AWAITING_BANK: timer until the Ombudsman waiting period
+        │                              ends (30 days, or the bank's longer timeline for fraud)
+        ▼ timer fires
+    bank_wait_expired → wait (escalation is the next step)
 
 An `abandon` signal ends the case from any waiting point. Every status change is written to the
 database by the activity that causes it (with an audit event), so the API reads the database
@@ -30,7 +36,7 @@ Determinism rules: no I/O, clock or randomness here. Time comes from `workflow.n
 from __future__ import annotations
 
 import uuid
-from datetime import timedelta
+from datetime import date, timedelta
 
 from temporalio import workflow
 from temporalio.common import RetryPolicy
@@ -45,6 +51,7 @@ with workflow.unsafe.imports_passed_through():
     from recourse.temporal.case_types import (
         APPROVE_DRAFT,
         ASSESS,
+        ASSESS_ESCALATION,
         CONFIRM,
         DRAFT,
         INVALID_USER_INPUT,
@@ -66,6 +73,8 @@ with workflow.unsafe.imports_passed_through():
         DraftDecisionInput,
         DraftInput,
         DraftSummary,
+        EscalationInput,
+        EscalationSummary,
         IntakeSummary,
         MarkAbandonedInput,
         MarkSent,
@@ -74,6 +83,7 @@ with workflow.unsafe.imports_passed_through():
         RunIntakeInput,
         SendSummary,
     )
+    from recourse.temporal.timeutil import TimeScale, days
 
 # LLM steps: the LLM client retries quickly itself; Temporal retries over minutes.
 LLM_TIMEOUT = timedelta(minutes=5)
@@ -92,6 +102,12 @@ DB_RETRY = RetryPolicy(
     maximum_attempts=10,
     non_retryable_error_types=[INVALID_USER_INPUT],
 )
+
+
+def _scale(inp: CaseInput) -> TimeScale:
+    return TimeScale(
+        demo_mode=inp.time_scale.demo_mode, demo_day_seconds=inp.time_scale.demo_day_seconds
+    )
 
 
 def _error_message(err: ActivityError) -> str:
@@ -123,6 +139,10 @@ class CaseWorkflow:
         self._awaiting_manual_send = False
         self._retry_send = False
         self._can_retry_send = False
+        # The bank's reply window
+        self._eligible_from: date | None = None
+        self._filing_deadline: date | None = None
+        self._bank_wait_expired = False
 
     # --- signals & queries ----------------------------------------------------------------------
 
@@ -171,6 +191,9 @@ class CaseWorkflow:
             email_id=self._email_id,
             awaiting_manual_send=self._awaiting_manual_send,
             can_retry_send=self._can_retry_send,
+            escalation_eligible_from=self._eligible_from,
+            filing_deadline=self._filing_deadline,
+            bank_wait_expired=self._bank_wait_expired,
         )
 
     # --- main flow --------------------------------------------------------------------------------
@@ -234,8 +257,12 @@ class CaseWorkflow:
                     assert self._abandon is not None
                     return await self._end(inp, self._abandon.reason, Actor.USER)
                 self._status = CaseStatus.SENT_TO_BANK
+                # 6. Wait for the bank's reply, within the window the rules give it.
+                if workflow.patched("bank-wait-v1") and not await self._wait_for_bank(inp):
+                    assert self._abandon is not None
+                    return await self._end(inp, self._abandon.reason, Actor.USER)
 
-        # 6. Next milestone (bank response timers) plugs in here. Until then: wait.
+        # 7. Next milestone (escalation) plugs in here. Until then: wait.
         await workflow.wait_condition(lambda: self._abandoned)
         assert self._abandon is not None
         return await self._end(inp, self._abandon.reason, Actor.USER)
@@ -382,6 +409,58 @@ class CaseWorkflow:
                 continue
             self._last_error = None
             return "approved" if action == "approve" else "rejected"
+
+    # --- the bank's reply window -----------------------------------------------------------------
+
+    async def _wait_for_bank(self, inp: CaseInput) -> bool:
+        """AWAITING_BANK until the Ombudsman waiting period ends. False = abandoned."""
+        summary = await self._assess_escalation(inp, "bank.wait_started", CaseStatus.AWAITING_BANK)
+        self._status = CaseStatus.AWAITING_BANK
+        if summary is None:
+            # Could not work out the window: say so and keep the case open.
+            await workflow.wait_condition(lambda: self._abandoned)
+            return False
+
+        deadline = workflow.now() + days(summary.wait_days, _scale(inp))
+        while not self._abandoned:
+            remaining = deadline - workflow.now()
+            if remaining <= timedelta(0):
+                break
+            try:
+                await workflow.wait_condition(lambda: self._abandoned, timeout=remaining)
+            except TimeoutError:
+                break
+        if self._abandoned:
+            return False
+
+        self._bank_wait_expired = True
+        await self._assess_escalation(inp, "bank.wait_expired", None)
+        return True
+
+    async def _assess_escalation(
+        self, inp: CaseInput, event: str, new_status: CaseStatus | None
+    ) -> EscalationSummary | None:
+        try:
+            summary: EscalationSummary = await workflow.execute_activity(
+                ASSESS_ESCALATION,
+                EscalationInput(
+                    case_id=inp.case_id,
+                    as_of=workflow.now().astimezone(IST).date(),
+                    event=event,
+                    new_status=new_status,
+                ),
+                result_type=EscalationSummary,
+                start_to_close_timeout=DB_TIMEOUT,
+                retry_policy=DB_RETRY,
+            )
+        except ActivityError as err:
+            self._last_error = (
+                f"The bank's reply window could not be worked out: {_error_message(err)}"
+            )
+            return None
+        self._eligible_from = summary.eligible_from
+        self._filing_deadline = summary.filing_deadline
+        return summary
 
     # --- helpers --------------------------------------------------------------------------------
 

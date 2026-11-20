@@ -8,12 +8,15 @@
 # - `sender_domains`: no bank states its sending domains, so these are the domains of the
 #   official contact addresses listed here (`sender_domains_basis: contact_emails`). Banks
 #   moved to the RBI-mandated `.bank.in` domain in 2025; old domains redirect there.
+# - `bank_type`: the RBI category. All ten listed banks are scheduled commercial banks
+#   (public or private sector); covered by `verified` like every other value.
 # - Researched 2026-11-19.
 
 version: 1
 banks:
   - id: sbi
     name: State Bank of India
+    bank_type: COMMERCIAL_BANK
     aliases: [sbi, state bank of india, state bank]
     grievance_email: null
     nodal_officer: null
@@ -27,6 +30,7 @@ banks:
 
   - id: hdfc
     name: HDFC Bank
+    bank_type: COMMERCIAL_BANK
     aliases: [hdfc, hdfc bank, hdfc bank ltd]
     grievance_email: support@hdfcbank.com
     nodal_officer: null
@@ -43,6 +47,7 @@ banks:
 
   - id: icici
     name: ICICI Bank
+    bank_type: COMMERCIAL_BANK
     aliases: [icici, icici bank, icici bank ltd]
     grievance_email: null
     nodal_officer: null
@@ -56,6 +61,7 @@ banks:
 
   - id: axis
     name: Axis Bank
+    bank_type: COMMERCIAL_BANK
     aliases: [axis, axis bank, axis bank ltd]
     grievance_email: null
     nodal_officer: null
@@ -69,6 +75,7 @@ banks:
 
   - id: kotak
     name: Kotak Mahindra Bank
+    bank_type: COMMERCIAL_BANK
     aliases: [kotak, kotak mahindra, kotak mahindra bank, kotak bank]
     grievance_email: null
     nodal_officer:
@@ -88,6 +95,7 @@ banks:
 
   - id: pnb
     name: Punjab National Bank
+    bank_type: COMMERCIAL_BANK
     aliases: [pnb, punjab national bank]
     grievance_email: care@pnb.bank.in
     nodal_officer:
@@ -106,6 +114,7 @@ banks:
 
   - id: bob
     name: Bank of Baroda
+    bank_type: COMMERCIAL_BANK
     aliases: [bob, bank of baroda, baroda]
     grievance_email: cs.ho@bankofbaroda.bank.in
     nodal_officer:
@@ -124,6 +133,7 @@ banks:
 
   - id: canara
     name: Canara Bank
+    bank_type: COMMERCIAL_BANK
     aliases: [canara, canara bank]
     grievance_email: null
     nodal_officer:
@@ -142,6 +152,7 @@ banks:
 
   - id: union
     name: Union Bank of India
+    bank_type: COMMERCIAL_BANK
     aliases: [union bank, union bank of india, ubi]
     grievance_email: customercare@unionbankofindia.bank.in
     nodal_officer: null
@@ -155,6 +166,7 @@ banks:
 
   - id: indusind
     name: IndusInd Bank
+    bank_type: COMMERCIAL_BANK
     aliases: [indusind, indusind bank, indusind bank ltd]
     grievance_email: reachus@indusind.com
     nodal_officer:

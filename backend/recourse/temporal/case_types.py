@@ -29,6 +29,7 @@ APPROVE_DRAFT = "case.approve_draft"
 REJECT_DRAFT = "case.reject_draft"
 PREPARE_SEND = "case.prepare_send"
 RECORD_SENT = "case.record_sent"
+ASSESS_ESCALATION = "case.assess_escalation"
 
 # Error type for ApplicationErrors caused by bad user input (never retried).
 INVALID_USER_INPUT = "InvalidUserInput"
@@ -84,6 +85,10 @@ class CaseState(_Model):
     email_id: uuid.UUID | None = None  # the outbound email for the approved draft
     awaiting_manual_send: bool = False  # waiting for `mark_sent`
     can_retry_send: bool = False  # the send was blocked; waiting for `retry_send`
+    # The bank's reply window (AWAITING_BANK onwards).
+    escalation_eligible_from: date | None = None  # the timer ends at the start of this day
+    filing_deadline: date | None = None  # last day to complain to the RBI Ombudsman
+    bank_wait_expired: bool = False  # the bank did not reply within its window
 
 
 # --- activities -------------------------------------------------------------------------------
@@ -162,6 +167,26 @@ class RecordSentInput(_Model):
     email_id: uuid.UUID
     mark: MarkSent
     now: datetime
+
+
+class EscalationInput(_Model):
+    case_id: uuid.UUID
+    as_of: date
+    # Audit event to record, e.g. "bank.wait_started", "bank.wait_expired".
+    event: str = Field(pattern=r"^[a-z_]+\.[a-z_]+$")
+    # Status to move the case to (None = keep it).
+    new_status: CaseStatus | None = None
+
+
+class EscalationSummary(_Model):
+    """The parts of the rule engine's EscalationAssessment the workflow needs for its timers."""
+
+    entity_coverage: str
+    can_file_now: bool
+    eligible_from: date | None
+    filing_deadline: date | None
+    wait_days: int = Field(ge=0)  # whole days from `as_of` until `eligible_from`
+    needs_bank_type: bool = False
 
 
 class MarkAbandonedInput(_Model):

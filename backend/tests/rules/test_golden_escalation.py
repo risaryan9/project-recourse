@@ -201,3 +201,18 @@ def test_invalid_escalation_facts_are_rejected(kwargs: dict[str, object]) -> Non
     base: dict[str, object] = {"entity_type": COMMERCIAL, "as_of": date(2026, 11, 16)}
     with pytest.raises(ValueError):
         EscalationFacts.model_validate(base | kwargs)
+
+
+def test_unknown_bank_type_keeps_the_dates_but_cannot_file() -> None:
+    # Same dates as the 30-day case; only coverage is unknown.
+    a = _esc(
+        entity_type=None,
+        bank_received_complaint_date=date(2026, 11, 3),
+        as_of=date(2026, 12, 10),
+    )
+    assert a.entity_coverage == "UNKNOWN"
+    assert a.eligible_from == date(2026, 12, 4)
+    assert a.filing_deadline == date(2027, 3, 3)
+    assert a.can_file_now is False  # the user must say which kind of bank it is first
+    flag = next(f for f in a.flags if f.code is FlagCode.BANK_TYPE_NEEDED)
+    assert flag.citation is not None

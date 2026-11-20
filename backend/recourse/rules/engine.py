@@ -568,8 +568,11 @@ def assess_escalation(
         return b.cite(scheme.doc, src, scheme.verified)
 
     entities = scheme.covered_entities
-    coverage: Literal["COVERED", "CONDITIONAL", "NOT_COVERED"]
-    if facts.entity_type in entities.covered:
+    coverage: Literal["COVERED", "CONDITIONAL", "NOT_COVERED", "UNKNOWN"]
+    if facts.entity_type is None:
+        coverage = "UNKNOWN"
+        b.flag(FlagCode.BANK_TYPE_NEEDED, cite(entities.source))
+    elif facts.entity_type in entities.covered:
         coverage = "COVERED"
     elif facts.entity_type in entities.conditional:
         coverage = "CONDITIONAL"
@@ -586,7 +589,7 @@ def assess_escalation(
         eligible_from: date | None, waiting_end: date | None, deadline: date | None
     ) -> EscalationAssessment:
         can_file = (
-            coverage != "NOT_COVERED"
+            coverage in ("COVERED", "CONDITIONAL")
             and not b.has_flag(FlagCode.BEFORE_SCHEME)
             and eligible_from is not None
             and deadline is not None

@@ -487,3 +487,40 @@ must always work; GmailChannel comes later on the same path.
   ManualChannel. GmailChannel must make its send idempotent (e.g. check the thread for the
   case tag before resending), because an activity retry after a successful send would otherwise
   send twice.
+
+## ADR-013: The bank's reply window (AWAITING_BANK timer)
+
+### Context
+After the complaint is sent, the case must wait for the bank for as long as the rules give it,
+then move on to the RBI Ombudsman if the bank did not answer (CLAUDE.md §3 timers, §4.3).
+The wait can last weeks, and must shrink to minutes in `DEMO_MODE`.
+
+### Decision
+- **The timer length comes from the rule engine.** A new `assess_escalation` activity runs
+  `assess_escalation()` (RB-IOS 2026 clause 10(1)(f)-(g)) with:
+  - complaint date = the day the approved complaint was sent (IST). We assume the bank receives
+    an email the day it is sent;
+  - the bank's own timeline from the Entitlement (fraud: 90 days Regime A, 45/60 Regime B);
+    failed transactions have none, so the scheme's 30-day minimum applies;
+  - the bank's type: the user's answer if given, else `bank_type` from the bank contacts file
+    (all ten listed banks are commercial banks), else unknown.
+  It stores the complaint date and the full assessment (dates + citations) on the case
+  (`cases.bank_complained_on`, `cases.escalation`, migration 0005) and returns `wait_days`.
+- **Unknown bank type is not guessed.** `EscalationFacts.entity_type` may be None: the engine
+  still computes the dates, but coverage is `UNKNOWN`, `can_file_now` is False and it flags
+  `BANK_TYPE_NEEDED`. The user is asked before an escalation can be drafted.
+- **The workflow owns the timer.** It moves to `AWAITING_BANK` and waits until
+  `workflow.now() + days(wait_days)`, i.e. until the first day an Ombudsman complaint can be
+  filed. A deadline (not a fixed sleep) is kept, so later signals (bank replies) can wake the
+  workflow without restarting the clock. When it fires: `bank_wait_expired` and a second
+  assessment recorded as `bank.wait_expired`.
+- `days()` uses the `TimeScale` captured in `CaseInput`, so `DEMO_MODE` (1 day = 60 s) replays
+  identically.
+- New code path behind `workflow.patched("bank-wait-v1")`.
+
+### Consequences
+- The wait ends at the start of the eligible day counted from the moment the user marked the
+  email sent, not at midnight IST. Close enough for a reminder; the dates shown to the user are
+  the engine's calendar dates.
+- `assess_escalation` is pure given the stored facts and `as_of`, so it can be re-run whenever
+  something changes (a bank reply, the user's bank type answer).
