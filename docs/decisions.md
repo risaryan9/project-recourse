@@ -772,3 +772,27 @@ approval gate, thread-only access and a full audit trail (CLAUDE.md §3, §5).
   paste it. Phase 5 (bank-scoped search with a confirmation) would cover it.
 - Testing-mode Google apps issue refresh tokens that expire after 7 days; the watcher then
   stops and the user reconnects.
+
+## ADR-021: The bank can still answer while the case is with the Ombudsman
+
+### Context
+In the first hand-test the bank's reply arrived after its (demo) window had ended. The reply
+watcher had stopped at the deadline, as first specified, so the reply was never read, although
+it sat in the thread. Banks often answer late, and a late payment should end the case.
+
+### Decision
+- After the bank's window, the Ombudsman steps (draft, approve, file, outcome) run as before, and
+  beside them a **late-reply watcher**: it reads the Gmail thread (for Gmail cases) and accepts
+  pasted replies, until the case ends. Outside demo mode it checks at least 6 hours apart, at
+  most 1,000 times.
+- A late reply is judged by the same `ReplyJudgeGraph` with `late=True`: the verdict is stored
+  and shown, but the case's status stays on its Ombudsman step. A genuine late reply re-runs the
+  escalation assessment (`bank.replied_late`), because RB-IOS 2026 clause 10(1)(g) counts the
+  90 days from the bank's last communication.
+- `mark_resolved` ("I got my money") is accepted at any Ombudsman step; it ends the case as
+  RESOLVED and cancels the Ombudsman steps. Nothing is filed or sent automatically.
+- Behind `workflow.patched("late-replies-v1")`.
+
+### Consequences
+- The case page shows "your bank can still reply or pay" under the Ombudsman steps.
+- A late "we paid" reply never closes the case by itself; the user confirms the money arrived.

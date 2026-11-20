@@ -146,6 +146,8 @@ export function describeEvent(e: TimelineEntry): string {
       return "Gmail wasn't available, so the letter is ready for you to send yourself.";
     case "gmail.messages.send":
       return d.status === 200 ? "Gmail: the letter was sent from your account." : "Gmail: sending did not succeed.";
+    case "bank.replied_late":
+      return "The bank replied after its window; the Ombudsman deadline was worked out again.";
     case "gmail.threads.get":
       return "Gmail: checked this email's thread for a reply.";
     case "gmail.oauth.refresh":

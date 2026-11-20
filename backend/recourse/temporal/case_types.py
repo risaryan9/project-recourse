@@ -147,6 +147,7 @@ class CaseState(_Model):
     can_close: bool = False  # filed: waiting for `close`
     # GmailChannel
     watching_thread: bool = False  # the reply watcher checks the email's Gmail thread
+    can_resolve: bool = False  # "I got my money" is accepted (`mark_resolved`)
     last_thread_check: datetime | None = None
 
 
@@ -252,6 +253,9 @@ class EscalationSummary(_Model):
 class JudgeReplyInput(_Model):
     case_id: uuid.UUID
     reply_id: uuid.UUID
+    # A reply after the bank's window (the case is with the Ombudsman): judge and record it,
+    # but leave the case's status on its Ombudsman step.
+    late: bool = False
 
 
 class ReplySummary(_Model):

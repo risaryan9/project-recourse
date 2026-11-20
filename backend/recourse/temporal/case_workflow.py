@@ -41,6 +41,7 @@ Determinism rules: no I/O, clock or randomness here. Time comes from `workflow.n
 
 from __future__ import annotations
 
+import asyncio
 import uuid
 from datetime import date, datetime, timedelta
 
@@ -129,6 +130,9 @@ GMAIL_RETRY = RetryPolicy(
     maximum_attempts=3,
     non_retryable_error_types=[INVALID_USER_INPUT],
 )
+# After the bank's window: check the thread less often (escalation can take months).
+LATE_POLL = timedelta(hours=6)
+MAX_LATE_CHECKS = 1000
 # Database / rule-engine steps.
 DB_TIMEOUT = timedelta(seconds=60)
 DB_RETRY = RetryPolicy(
@@ -199,6 +203,8 @@ class CaseWorkflow:
         # GmailChannel reply watcher
         self._watching = False
         self._last_thread_check: datetime | None = None
+        self._via_gmail = False  # the letter went out through Gmail: its thread can be read
+        self._late = False  # with the Ombudsman: late replies and "I got my money" still count
 
     # --- signals & queries ----------------------------------------------------------------------
 
@@ -230,12 +236,12 @@ class CaseWorkflow:
 
     @workflow.signal(name="bank_replied")
     def bank_replied(self, reply: BankReplied) -> None:
-        if self._awaiting_bank:
+        if self._awaiting_bank or self._late:
             self._replies.append(reply)
 
     @workflow.signal(name="mark_resolved")
     def mark_resolved(self, mark: MarkResolved) -> None:
-        if self._awaiting_bank:
+        if self._awaiting_bank or self._late:
             self._resolved.append(mark)
 
     @workflow.signal(name="escalate")
@@ -289,6 +295,7 @@ class CaseWorkflow:
             filing_deadline_passed=self._filing_deadline_passed,
             can_close=self._can_close,
             watching_thread=self._watching,
+            can_resolve=self._awaiting_bank or self._late,
             last_thread_check=self._last_thread_check,
         )
 
@@ -444,7 +451,7 @@ class CaseWorkflow:
             if summary is not None:
                 self._email_id = summary.email_id
                 if summary.status is OutboundStatus.SENT:
-                    self._watching = summary.channel is ChannelKind.GMAIL
+                    self._watching = self._via_gmail = summary.channel is ChannelKind.GMAIL
                     return True
                 if (
                     summary.status is OutboundStatus.PREPARED
@@ -706,6 +713,8 @@ class CaseWorkflow:
             return CaseOutcome(status=CaseStatus.RESOLVED)
         # 7. Escalate to the RBI Ombudsman: draft, approve, the user files.
         if workflow.patched("escalation-v1"):
+            if workflow.patched("late-replies-v1"):
+                return await self._escalate_with_late_replies(inp)
             ended = await self._go_to_ombudsman(inp)
             if ended is None:
                 assert self._abandon is not None
@@ -720,7 +729,7 @@ class CaseWorkflow:
         self._demo_offset_days = r.demo_offset_days
         self._eligible_from, self._filing_deadline = r.eligible_from, r.filing_deadline
         self._last_reply, self._can_escalate = r.last_reply, r.can_escalate
-        self._watching = r.next_poll is not None
+        self._watching = self._via_gmail = r.next_poll is not None
         result = await self._wait_for_bank(inp, r)
         ended = await self._after_bank(inp, result)
         if ended is not None:
@@ -849,11 +858,70 @@ class CaseWorkflow:
             self._last_error = None
             return True
 
-    async def _judge(self, inp: CaseInput, reply: BankReplied) -> ReplySummary | None:
+    async def _escalate_with_late_replies(self, inp: CaseInput) -> CaseOutcome:
+        """The Ombudsman steps, while the bank can still answer: replies after the window (from
+        the Gmail thread, or pasted) are judged and shown, and "I got my money" ends the case
+        as RESOLVED at any step."""
+        self._late = True
+        self._watching = self._via_gmail
+        escalation = asyncio.create_task(self._go_to_ombudsman(inp))
+        watcher = asyncio.create_task(self._watch_late_replies(inp))
+        try:
+            while True:
+                await workflow.wait_condition(lambda: escalation.done() or bool(self._resolved))
+                if escalation.done():
+                    ended = escalation.result()
+                    if ended is None:
+                        assert self._abandon is not None
+                        return await self._end(inp, self._abandon.reason, Actor.USER)
+                    return ended
+                if await self._record_resolved(inp, self._resolved.pop(0)):
+                    escalation.cancel()
+                    try:
+                        await escalation
+                    except asyncio.CancelledError:
+                        pass
+                    self._status = CaseStatus.RESOLVED
+                    self._awaiting_filing = self._can_close = self._can_recheck = False
+                    self._draft_id = None
+                    return CaseOutcome(status=CaseStatus.RESOLVED)
+        finally:
+            self._late = self._watching = False
+            watcher.cancel()
+
+    async def _watch_late_replies(self, inp: CaseInput) -> None:
+        """Read the thread now and then, and judge pasted or found replies, without changing the
+        Ombudsman steps. Checks less often outside demo mode (months of waiting)."""
+        poll = timedelta(seconds=inp.time_scale.gmail_poll_seconds)
+        if not inp.time_scale.demo_mode:
+            poll = max(poll, LATE_POLL)
+        checks = 0
+        while True:
+            timeout = poll if self._watching and checks < MAX_LATE_CHECKS else None
+            try:
+                await workflow.wait_condition(lambda: bool(self._replies), timeout=timeout)
+            except TimeoutError:
+                checked = await self._check_thread(inp)
+                checks += 1
+                if checked is not None and not checked.connected:
+                    self._watching = False
+                elif checked is not None:
+                    self._replies.extend(BankReplied(reply_id=r) for r in checked.new_reply_ids)
+            while self._replies:
+                reply = await self._judge(inp, self._replies.pop(0), late=True)
+                if reply is None:
+                    continue
+                self._last_reply = reply
+                if not reply.suspicious:  # a genuine reply moves the filing deadline (RB-IOS)
+                    await self._assess_escalation(inp, "bank.replied_late", None)
+
+    async def _judge(
+        self, inp: CaseInput, reply: BankReplied, late: bool = False
+    ) -> ReplySummary | None:
         try:
             summary: ReplySummary = await workflow.execute_activity(
                 JUDGE_REPLY,
-                JudgeReplyInput(case_id=inp.case_id, reply_id=reply.reply_id),
+                JudgeReplyInput(case_id=inp.case_id, reply_id=reply.reply_id, late=late),
                 result_type=ReplySummary,
                 start_to_close_timeout=LLM_TIMEOUT,
                 retry_policy=LLM_RETRY,

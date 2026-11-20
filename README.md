@@ -25,10 +25,11 @@ weeks until it is resolved:
 
 **Status:** early development. The backend runs the whole case through its API: intake and
 extraction, the rule engine (amounts, deadlines, citations), the bank complaint with a mandatory
-verify step and per-email approval, sending through `ManualChannel`, the bank's reply window
-(with a demo mode that shrinks days to minutes), judging the bank's reply (with phishing and
-prompt-injection screening), and the complaint to the RBI Ombudsman, which the user files
-themselves. The frontend, Gmail sending and the eval suites are still to come.
+verify step and per-email approval, sending from the user's Gmail (`GmailChannel`) or by hand
+(`ManualChannel`), the bank's reply window (with a demo mode that shrinks days to minutes), a
+reply watcher that reads only the complaint's Gmail thread, judging the bank's reply (with
+phishing and prompt-injection screening), the complaint to the RBI Ombudsman (which the user
+files themselves), the web app and the eval suites. Hosting is still to come.
 
 ## Architecture
 
@@ -109,6 +110,13 @@ your Gmail and watch the thread for the bank's reply:
    `cd backend && uv run python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"`
    into `TOKEN_ENCRYPTION_KEY`. Restart the API.
 5. In the app: **Settings → Connect Gmail**.
+
+Once connected, approving a letter sends it from your Gmail (to `SANDBOX_RECIPIENT` while
+`EMAIL_SANDBOX=true`), and Recourse checks that email's thread for the bank's reply every
+`GMAIL_POLL_MINUTES` (every `DEMO_GMAIL_POLL_SECONDS` in demo mode). It keeps checking after the
+bank's window ends, until the case closes: a late reply is judged and shown without changing the
+Ombudsman steps, and "I got my money" still closes the case. To test it, reply to the letter from
+the sandbox inbox, in the same thread.
 
 Gotchas: use a personal Gmail account (Workspace admins may block unverified apps); Google shows
 an "unverified app" warning (choose Advanced → continue); an app in **Testing** mode issues

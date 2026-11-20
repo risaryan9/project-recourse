@@ -816,12 +816,14 @@ class CaseActivities:
             reply.unsatisfactory = verdict.next_action is NextAction.ESCALATE
             if verdict.complaint_number and not verdict.suspicious:
                 case.bank_complaint_ref = verdict.complaint_number
-            case.status = (
-                CaseStatus.JUDGED
-                if verdict.next_action in JUDGED_ACTIONS
-                else CaseStatus.AWAITING_BANK
-            )
+            if not inp.late:
+                case.status = (
+                    CaseStatus.JUDGED
+                    if verdict.next_action in JUDGED_ACTIONS
+                    else CaseStatus.AWAITING_BANK
+                )
             info: dict[str, Any] = {
+                "late": inp.late,
                 "reply_id": str(reply.id),
                 "label": verdict.label.value,
                 "next_action": verdict.next_action.value,
@@ -852,7 +854,7 @@ class CaseActivities:
             case = await _case_for_update(s, inp.case_id)
             if case.status is CaseStatus.RESOLVED:
                 return
-            if case.status not in (CaseStatus.AWAITING_BANK, CaseStatus.JUDGED):
+            if case.status not in RESOLVABLE:
                 raise invalid(f"A case that is {case.status.value} cannot be marked resolved.")
             ent_row = await s.scalar(
                 select(EntitlementRecord).where(EntitlementRecord.case_id == case.id)
@@ -1279,6 +1281,14 @@ async def _has_event(
     )
     return found is not None
 
+
+# The bank's window has started and the case is still open: "I got my money" is accepted.
+RESOLVABLE = {
+    CaseStatus.AWAITING_BANK,
+    CaseStatus.JUDGED,
+    CaseStatus.ESCALATION_DRAFT_READY,
+    CaseStatus.FILED_WITH_OMBUDSMAN,
+}
 
 # Verdicts after which the case waits for the user (or escalates); the rest keep waiting.
 JUDGED_ACTIONS = {NextAction.PROPOSE_RESOLVED, NextAction.ESCALATE, NextAction.ASK_USER}

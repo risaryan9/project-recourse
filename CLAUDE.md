@@ -152,7 +152,7 @@ Neon Postgres (+pgvector): cases, evidence, entitlements, drafts, audit_events, 
 
 **Reply watcher**
 - A Temporal loop calls `threads.get(threadId)` every `GMAIL_POLL_MINUTES` (default 30; in `DEMO_MODE`, every `DEMO_GMAIL_POLL_SECONDS`). The Gmail calls run in activities; the loop and its timer live in the workflow.
-- It runs until a reply arrives or the deadline timer fires.
+- It runs until the case closes. During the bank's window a reply moves the case on; after the window (Ombudsman steps), late replies are judged and shown without changing the Ombudsman steps, checked at least 6 hours apart outside demo mode (ADR-021).
 - Each message is processed once: store processed message IDs. Ignore messages sent by the user.
 - Classify each new bank message (Haiku):
   - **acknowledgement** → auto-extract the complaint number, keep the timer running;

@@ -747,7 +747,8 @@ async def test_demo_mode_shrinks_the_bank_wait(env: WorkflowEnvironment) -> None
     # rule engine sees the waiting period as over (regression: it looped forever).
     started, expired = [a for n, a in fakes.calls if n == ASSESS_ESCALATION][:2]
     assert expired.event == "bank.wait_expired"
-    assert (expired.as_of - started.as_of).days == 30
+    # 30 skipped days, plus one real day if the 31 test minutes cross midnight (IST).
+    assert (expired.as_of - started.as_of).days in (30, 31)
     await Replayer(
         workflows=[CaseWorkflow], data_converter=pydantic_data_converter
     ).replay_workflow(history)
@@ -1196,3 +1197,76 @@ async def test_disconnected_gmail_stops_the_watcher(env: WorkflowEnvironment) ->
         await handle.signal(CaseWorkflow.abandon, AbandonRequest())
         await handle.result()
     assert fakes.names().count(CHECK_THREAD) == 1
+
+
+async def test_late_reply_is_judged_without_leaving_the_ombudsman_step(
+    env: WorkflowEnvironment,
+) -> None:
+    letter = drafted()
+    late = verdict(NextAction.PROPOSE_RESOLVED, ReplyLabel.RESOLVED)
+    fakes = FakeActivities(
+        escalation=[waiting(30), waiting(0), waiting(0), waiting(0)],
+        draft=[drafted(), letter],
+        judge=[late],
+    )
+    reply_id = uuid.uuid4()
+    async with worker(env, fakes):
+        handle = await to_escalation_draft(env, fakes)
+        state: CaseState = await handle.query(CaseWorkflow.get_state)
+        assert state.can_resolve and not state.watching_thread  # a manual case: paste only
+        await handle.signal(CaseWorkflow.bank_replied, BankReplied(reply_id=reply_id))
+        state = await wait_for(handle, lambda s: s.last_reply is not None)
+        assert state.last_reply == late
+        assert state.status is CaseStatus.ESCALATION_DRAFT_READY  # still on its Ombudsman step
+        assert state.draft_id == letter.draft_id
+
+        await handle.signal(CaseWorkflow.mark_resolved, MarkResolved(amount_received_inr=2950))
+        outcome: CaseOutcome = await handle.result()
+        history = await handle.fetch_history()
+
+    assert outcome == CaseOutcome(status=CaseStatus.RESOLVED)
+    judged: JudgeReplyInput = next(a for n, a in fakes.calls if n == JUDGE_REPLY)
+    assert judged.reply_id == reply_id and judged.late
+    assert events(fakes)[-1] == "bank.replied_late"  # the filing deadline is worked out again
+    assert RECORD_FILED not in fakes.names() and MARK_ABANDONED not in fakes.names()
+    await Replayer(
+        workflows=[CaseWorkflow], data_converter=pydantic_data_converter
+    ).replay_workflow(history)
+
+
+async def test_gmail_watcher_keeps_reading_the_thread_after_the_window(
+    env: WorkflowEnvironment,
+) -> None:
+    email = uuid.uuid4()
+    reply_id = uuid.uuid4()
+    rejected = verdict(NextAction.ESCALATE, ReplyLabel.REJECTED_NO_REASONS)
+    quiet = [ThreadSummary(connected=True) for _ in range(31)]  # daily checks in the window
+    fakes = FakeActivities(
+        prepare=[gmail(email_id=email)],
+        send=[gmail(OutboundStatus.SENT, email)],
+        escalation=[waiting(30), waiting(0), waiting(0), waiting(0)],
+        draft=[drafted(), drafted()],
+        thread=[*quiet, ThreadSummary(connected=True, new_reply_ids=[reply_id], messages=2)],
+        judge=[rejected],
+    )
+    inp = CaseInput(
+        case_id=uuid.uuid4(),
+        upload_id=uuid.uuid4(),
+        time_scale=TimeScaleInput(gmail_poll_seconds=86_400),
+    )
+    async with worker(env, fakes):
+        handle = await gmail_sent(env, fakes, inp)
+        await env.sleep(timedelta(days=31))
+        state: CaseState = await wait_for(
+            handle, lambda s: s.status is CaseStatus.ESCALATION_DRAFT_READY
+        )
+        assert state.watching_thread and state.can_resolve
+        await env.sleep(timedelta(days=2))  # late checks are at least 6 hours apart
+        state = await wait_for(handle, lambda s: s.last_reply is not None)
+        assert state.last_reply == rejected
+        assert state.status is CaseStatus.ESCALATION_DRAFT_READY
+        await handle.signal(CaseWorkflow.abandon, AbandonRequest())
+        await handle.result()
+
+    judged: JudgeReplyInput = next(a for n, a in fakes.calls if n == JUDGE_REPLY)
+    assert judged.reply_id == reply_id and judged.late

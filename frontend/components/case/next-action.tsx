@@ -596,11 +596,36 @@ function Body({ c, refresh }: Props) {
   return <Working>Working on your case.</Working>;
 }
 
+/** With the Ombudsman, the bank can still answer or pay: show late replies, and let the user
+ * add one or close the case as resolved, without leaving the Ombudsman steps. */
+function BankCanStillAnswer({ c, refresh }: Props) {
+  return (
+    <div className="flex flex-col gap-4 border-t border-line pt-6">
+      <p className="text-sm text-text-2">
+        Your bank can still reply or pay while this goes to the Ombudsman.
+        {c.watching_thread
+          ? ` Recourse keeps watching the email's Gmail thread${
+              c.last_thread_check ? ` (last checked ${formatDateTime(c.last_thread_check)})` : ""
+            }.`
+          : ""}{" "}
+        A late reply is checked and shown here; it doesn&apos;t change your Ombudsman steps.
+      </p>
+      {c.last_reply ? <LastReply r={c.last_reply} /> : null}
+      <div className="flex flex-wrap items-start gap-x-6 gap-y-3">
+        <ReplyForm c={c} refresh={refresh} />
+        <ResolvedForm c={c} refresh={refresh} />
+      </div>
+    </div>
+  );
+}
+
 export function NextAction({ c, refresh }: Props) {
   const ended = c.status === "RESOLVED" || c.status === "CLOSED" || c.status === "ABANDONED";
+  const late = c.can_resolve && !["AWAITING_BANK", "JUDGED", "SENT_TO_BANK"].includes(c.status);
   return (
     <Panel lit aria-label="Next action" className="flex flex-col gap-8">
       <Body c={c} refresh={refresh} />
+      {late && !ended ? <BankCanStillAnswer c={c} refresh={refresh} /> : null}
       {!ended && c.status !== "NEW" ? <Stop c={c} refresh={refresh} /> : null}
     </Panel>
   );

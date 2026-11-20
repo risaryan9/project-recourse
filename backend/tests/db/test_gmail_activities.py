@@ -38,7 +38,9 @@ from recourse.temporal.case_activities import CaseActivities
 from recourse.temporal.case_types import (
     CheckThreadInput,
     JudgeReplyInput,
+    MarkResolved,
     PrepareSendInput,
+    RecordResolvedInput,
     SendEmailInput,
     SendSummary,
 )
@@ -298,3 +300,30 @@ async def test_thread_check_stores_each_new_message_once(
         assert row is not None and row.verdict is not None
         assert row.verdict["sender_check"] == SenderCheck.MISMATCH.value
     assert len(llm.calls) == 1  # the spoofed message never reached the model
+
+
+async def test_late_reply_keeps_the_ombudsman_step(
+    sessions: async_sessionmaker[AsyncSession],
+) -> None:
+    llm = FakeLLM({CLASSIFY_PURPOSE: [{"label": "RESOLVED", "amount_reversed_inr": 2450}]})
+    a = acts(sessions, Google(), llm)
+    case_id, draft_id = await gmail_case(sessions)
+    email_id = await prepared(sessions, a, case_id, draft_id)
+    await run(a.send_email, SendEmailInput(case_id=case_id, email_id=email_id))
+    first = await run(a.check_thread, CheckThreadInput(case_id=case_id, email_id=email_id))
+    async with sessions.begin() as s:
+        case = await s.get(Case, case_id)
+        assert case is not None
+        case.status = CaseStatus.ESCALATION_DRAFT_READY  # the bank's window has ended
+    reply = first.new_reply_ids[0]
+    await run(a.judge_reply, JudgeReplyInput(case_id=case_id, reply_id=reply, late=True))
+    async with sessions() as s:
+        case = await s.get(Case, case_id)
+        assert case is not None and case.status is CaseStatus.ESCALATION_DRAFT_READY
+    await run(
+        a.record_resolved,
+        RecordResolvedInput(case_id=case_id, mark=MarkResolved(amount_received_inr=2950), now=NOW),
+    )
+    async with sessions() as s:
+        case = await s.get(Case, case_id)
+        assert case is not None and case.status is CaseStatus.RESOLVED

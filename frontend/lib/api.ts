@@ -224,6 +224,7 @@ export type CaseView = {
   ombudsman_filed_at: string | null;
   ombudsman_ref: string | null;
   watching_thread: boolean;
+  can_resolve: boolean;
   last_thread_check: string | null;
   timeline: TimelineEntry[];
 };

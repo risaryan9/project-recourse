@@ -113,7 +113,13 @@ SENT_OR_LATER = {
     CaseStatus.FILED_WITH_OMBUDSMAN,
 }
 # The case accepts bank replies and "I got my money".
-WAITING_ON_BANK = {CaseStatus.AWAITING_BANK, CaseStatus.JUDGED}
+WAITING_ON_BANK = {
+    CaseStatus.AWAITING_BANK,
+    CaseStatus.JUDGED,
+    # With the Ombudsman: a late reply or payment still counts (ADR-021).
+    CaseStatus.ESCALATION_DRAFT_READY,
+    CaseStatus.FILED_WITH_OMBUDSMAN,
+}
 MAX_REPLY_CHARS = 20_000
 
 Session = Annotated[AsyncSession, Depends(get_session)]
@@ -219,6 +225,7 @@ class CaseView(BaseModel):
     bank_complaint_ref: str | None  # the bank's complaint number, once a reply states it
     last_reply: ReplySummary | None  # verdict on the latest bank reply (warnings included)
     can_escalate: bool  # show "Escalate to the RBI Ombudsman" / "Accept and close"
+    can_resolve: bool  # "I got my money" is accepted
     # Escalation to the RBI Ombudsman
     needs_bank_type: bool  # ask for the bank's type (PUT /bank-type)
     can_recheck_escalation: bool
@@ -440,6 +447,7 @@ async def get_case(case_id: uuid.UUID, session: Session, runner: Runner) -> Case
         bank_complaint_ref=case.bank_complaint_ref,
         last_reply=live.last_reply if live else None,
         can_escalate=live.can_escalate if live else False,
+        can_resolve=live.can_resolve if live else False,
         needs_bank_type=live.needs_bank_type if live else False,
         can_recheck_escalation=live.can_recheck_escalation if live else False,
         awaiting_filing=live.awaiting_filing if live else False,
