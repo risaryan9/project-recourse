@@ -30,9 +30,16 @@ ALL = ["rules", "extraction", "drafts", "attacks"]
 
 
 def markdown(r: dict[str, Any]) -> str:
-    out = ["# Eval results", "", f"Run {r['run_at']} ({r['seconds']} s). Synthetic data only.", ""]
-    if r.get("note"):
-        out += [f"> {r['note']}", ""]
+    out = ["# Eval results", "", "Synthetic data only. Each suite shows its most recent run.", ""]
+    notes = sorted(
+        {
+            f"- **{s}** (run {r[s]['run_at']}): {r[s]['note']}"
+            for s in ALL
+            if s in r and r[s].get("note")
+        }
+    )
+    if notes:
+        out += ["Notes:", *notes, ""]
     out += ["| Suite | Result | Bar |", "|---|---|---|"]
     if "rules" in r:
         x = r["rules"]
@@ -131,7 +138,14 @@ async def main(suites: list[str], note: str | None) -> None:
     (REPORTS / f"{stamp}.json").write_text(
         json.dumps(report, indent=1, default=str, ensure_ascii=False)
     )
-    (REPORTS / "latest.md").write_text(markdown(report))
+    # latest.md shows every suite's most recent result, even after a partial run.
+    merged_path = REPORTS / "latest.json"
+    merged: dict[str, Any] = json.loads(merged_path.read_text()) if merged_path.exists() else {}
+    for suite in ALL:
+        if suite in report:
+            merged[suite] = report[suite] | {"run_at": report["run_at"], "note": report.get("note")}
+    merged_path.write_text(json.dumps(merged, indent=1, default=str, ensure_ascii=False))
+    (REPORTS / "latest.md").write_text(markdown(merged))
     print(f"wrote evals/reports/{stamp}.json and evals/reports/latest.md")
 
 
