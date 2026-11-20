@@ -36,6 +36,8 @@ JUDGE_REPLY = "case.judge_reply"
 RECORD_RESOLVED = "case.record_resolved"
 RECORD_FILED = "case.record_filed"
 RECORD_CLOSED = "case.record_closed"
+SEND_EMAIL = "case.send_email"
+CHECK_THREAD = "case.check_thread"
 
 # Error type for ApplicationErrors caused by bad user input (never retried).
 INVALID_USER_INPUT = "InvalidUserInput"
@@ -50,12 +52,18 @@ class TimeScaleInput(_Model):
 
     demo_mode: bool = False
     demo_day_seconds: int = Field(default=60, gt=0)
+    # GmailChannel reply watcher: seconds between thread checks, and how many checks one
+    # workflow run makes before it continues as new (keeps the history short).
+    gmail_poll_seconds: int = Field(default=1800, gt=0)
+    max_polls_per_run: int = Field(default=200, gt=0)
 
 
 class CaseInput(_Model):
     case_id: uuid.UUID
     upload_id: uuid.UUID
     time_scale: TimeScaleInput = TimeScaleInput()
+    # Set only by continue-as-new while waiting for the bank: where to pick up.
+    resume: ResumeAtBank | None = None
 
 
 # --- signals / queries ------------------------------------------------------------------------
@@ -137,6 +145,9 @@ class CaseState(_Model):
     awaiting_filing: bool = False  # waiting for `mark_filed`
     filing_deadline_passed: bool = False  # reminder: the 90-day filing window has ended
     can_close: bool = False  # filed: waiting for `close`
+    # GmailChannel
+    watching_thread: bool = False  # the reply watcher checks the email's Gmail thread
+    last_thread_check: datetime | None = None
 
 
 # --- activities -------------------------------------------------------------------------------
@@ -272,6 +283,24 @@ class RecordClosedInput(_Model):
     request: CloseRequest
 
 
+class SendEmailInput(_Model):
+    case_id: uuid.UUID
+    email_id: uuid.UUID
+    # The user asked to send again after an unconfirmed attempt (they checked Gmail's Sent).
+    force: bool = False
+
+
+class CheckThreadInput(_Model):
+    case_id: uuid.UUID
+    email_id: uuid.UUID
+
+
+class ThreadSummary(_Model):
+    connected: bool  # False: Gmail was disconnected or its access revoked; stop watching
+    new_reply_ids: list[uuid.UUID] = Field(default_factory=list)
+    messages: int = 0
+
+
 class MarkAbandonedInput(_Model):
     case_id: uuid.UUID
     reason: str
@@ -283,4 +312,22 @@ class CaseOutcome(_Model):
     reason: str | None = None
 
 
+class ResumeAtBank(_Model):
+    """Everything the bank wait needs to carry across continue-as-new."""
+
+    email_id: uuid.UUID
+    deadline: datetime | None  # when the bank's window ends (None: no timer)
+    next_poll: datetime | None  # when to check the thread next (None: not watching)
+    judged: bool
+    skipped: bool  # demo days already added for the window
+    wait_days: int  # the window's length in days (for the demo calendar)
+    drafts_used: int
+    demo_offset_days: int
+    eligible_from: date | None
+    filing_deadline: date | None
+    last_reply: ReplySummary | None
+    can_escalate: bool
+
+
 CaseState.model_rebuild()
+CaseInput.model_rebuild()

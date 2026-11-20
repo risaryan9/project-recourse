@@ -142,8 +142,16 @@ export function describeEvent(e: TimelineEntry): string {
       return "The email could not be prepared yet.";
     case "email.marked_sent":
       return "You sent the letter to the bank.";
+    case "email.fallback_manual":
+      return "Gmail wasn't available, so the letter is ready for you to send yourself.";
+    case "gmail.messages.send":
+      return d.status === 200 ? "Gmail: the letter was sent from your account." : "Gmail: sending did not succeed.";
+    case "gmail.threads.get":
+      return "Gmail: checked this email's thread for a reply.";
+    case "gmail.oauth.refresh":
+      return d.ok ? "Gmail: access renewed for one check." : "Gmail: access was refused (disconnected or revoked).";
     case "email.sent":
-      return "The letter was sent to the bank.";
+      return d.sandbox ? "The letter was sent from your Gmail (to the sandbox inbox)." : "The letter was sent from your Gmail.";
     case "bank.wait_started":
       return "The bank's reply window started.";
     case "bank.wait_expired":
@@ -151,7 +159,7 @@ export function describeEvent(e: TimelineEntry): string {
     case "bank.replied":
       return "The deadlines were updated after the bank's reply.";
     case "reply.received":
-      return "A reply from the bank was added.";
+      return d.source === "GMAIL" ? "A new message arrived in the email's Gmail thread." : "A reply from the bank was added.";
     case "reply.judged":
       return "The bank's reply was checked against the rules.";
     case "reply.suspicious":

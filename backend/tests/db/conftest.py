@@ -50,7 +50,7 @@ async def sessions(db_url: str) -> AsyncIterator[async_sessionmaker[AsyncSession
     """A session factory on the test branch; every table is emptied first."""
     sync = create_engine(db_url)
     with sync.begin() as conn:
-        conn.execute(text("TRUNCATE cases CASCADE"))
+        conn.execute(text("TRUNCATE cases, gmail_connections CASCADE"))
     sync.dispose()
 
     engine = make_engine(db_url)

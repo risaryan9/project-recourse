@@ -4,12 +4,16 @@ import { useState } from "react";
 
 import { fieldClass, FormError, Notice, PrimaryButton, QuietButton, TextButton } from "@/components/app/ui";
 import { api, type CaseView, type Draft } from "@/lib/api";
+import { useConfig, useGmail } from "@/lib/hooks";
 
 const NAME_PLACEHOLDER = "[Your full name]";
 
 /** Read, edit and approve a drafted letter (to the bank, or to the RBI Ombudsman). */
 export function LetterReview({ c, draft, onDone }: { c: CaseView; draft: Draft; onDone: () => void }) {
   const ombudsman = draft.kind === "OMBUDSMAN_COMPLAINT";
+  const { status: gmail } = useGmail();
+  const config = useConfig();
+  const viaGmail = !ombudsman && gmail?.connected === true;
   const [name, setName] = useState("");
   const [subject, setSubject] = useState(draft.subject ?? "");
   const [body, setBody] = useState(draft.body ?? "");
@@ -61,7 +65,11 @@ export function LetterReview({ c, draft, onDone }: { c: CaseView; draft: Draft; 
         <p className="mt-1.5 text-text-2">
           Every amount, date and rule in it was checked against what the rules say you&apos;re owed.
           Read it, change anything you like, and sign it with your name.
-          {ombudsman ? " You'll file it yourself; nothing is sent." : " Nothing is sent until you approve it."}
+          {ombudsman
+            ? " You'll file it yourself; nothing is sent."
+            : viaGmail
+              ? ` Approving sends it from your Gmail (${gmail?.email})${config?.email_sandbox ? " to the sandbox inbox, not the real bank" : ""}.`
+              : " Nothing is sent until you approve it."}
         </p>
       </div>
 
@@ -141,7 +149,7 @@ export function LetterReview({ c, draft, onDone }: { c: CaseView; draft: Draft; 
       ) : (
         <div className="flex flex-wrap items-center gap-x-6 gap-y-3">
           <PrimaryButton busy={busy === "approve"} onClick={approve}>
-            {ombudsman ? "Approve complaint" : "Approve letter"}
+            {ombudsman ? "Approve complaint" : viaGmail ? "Approve and send" : "Approve letter"}
           </PrimaryButton>
           <TextButton onClick={() => setRejecting(true)}>Ask for a new draft</TextButton>
         </div>

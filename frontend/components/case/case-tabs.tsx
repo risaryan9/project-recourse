@@ -11,11 +11,27 @@ import { cn } from "@/lib/utils";
 
 const ACTOR: Record<string, string> = { USER: "You", SYSTEM: "Recourse", AGENT: "Recourse", BANK: "Bank" };
 
+/** Repeated Gmail thread checks (and their token renewals) become one line with a count. */
+function grouped(events: CaseView["timeline"]) {
+  const out: { e: CaseView["timeline"][number]; count: number }[] = [];
+  for (const e of events) {
+    const routine = e.event_type === "gmail.threads.get" || (e.event_type === "gmail.oauth.refresh" && e.details.ok);
+    const last = out[out.length - 1];
+    if (routine && last && last.e.event_type === "gmail.threads.get") {
+      if (e.event_type === "gmail.threads.get") last.count += 1;
+      continue;
+    }
+    if (e.event_type === "gmail.oauth.refresh" && e.details.ok) continue;
+    out.push({ e, count: 1 });
+  }
+  return out;
+}
+
 function Timeline({ c }: { c: CaseView }) {
-  const events = [...c.timeline].reverse();
+  const events = grouped([...c.timeline].reverse());
   return (
     <ol className="divide-y divide-line">
-      {events.map((e, i) => (
+      {events.map(({ e, count }, i) => (
         <li key={i} className="grid grid-cols-[6.5rem_1fr] gap-4 py-3 sm:grid-cols-[8rem_1fr]">
           <time className="figures text-sm text-text-3" dateTime={e.occurred_at}>
             {formatDateTime(e.occurred_at)}
@@ -23,6 +39,7 @@ function Timeline({ c }: { c: CaseView }) {
           <div className="min-w-0">
             <p className={cn("text-[0.95rem]", e.event_type === "reply.suspicious" ? "text-amber" : "text-text")}>
               {describeEvent(e)}
+              {count > 1 ? ` (${count} checks)` : ""}
             </p>
             <p className="text-sm text-text-3">{ACTOR[e.actor] ?? e.actor}</p>
           </div>
@@ -56,7 +73,13 @@ function Emails({ c }: { c: CaseView }) {
           <div className="flex flex-wrap items-baseline justify-between gap-3">
             <h3 className="font-[560] text-text">Your letter to the bank</h3>
             <span className="text-sm text-text-3">
-              {e.status === "SENT" ? `Sent ${formatDateTime(e.sent_at)}` : e.status === "PREPARED" ? "Ready to send" : "Not ready"}
+              {e.status === "SENT"
+                ? `Sent ${e.channel === "GMAIL" ? "from your Gmail " : ""}${formatDateTime(e.sent_at)}`
+                : e.status === "PREPARED"
+                  ? "Ready to send"
+                  : e.status === "SENDING"
+                    ? "Sending"
+                    : "Not ready"}
               {e.sandbox ? ", sandbox" : ""}
             </span>
           </div>

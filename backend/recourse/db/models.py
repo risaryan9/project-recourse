@@ -284,6 +284,7 @@ class DraftRecord(_Timestamps, Base):
 class OutboundStatus(StrEnum):
     BLOCKED = "BLOCKED"  # the send policy refused (reasons in `blocked_reasons`)
     PREPARED = "PREPARED"  # ready; for ManualChannel, waiting for the user to send it
+    SENDING = "SENDING"  # GmailChannel: handed to Gmail, not yet confirmed (never auto-resent)
     SENT = "SENT"
 
 
@@ -344,6 +345,8 @@ class BankReply(_Timestamps, Base):
     suspicious: Mapped[bool | None] = mapped_column(Boolean)
     # The reply counts as unsatisfactory for RB-IOS 10(1)(f): by the verdict, or the user's call.
     unsatisfactory: Mapped[bool] = mapped_column(Boolean, default=False)
+    # GmailChannel: the Gmail message ID, so each message in the thread is processed once.
+    gmail_message_id: Mapped[str | None] = mapped_column(String(64), unique=True)
 
 
 class GmailConnection(_Timestamps, Base):

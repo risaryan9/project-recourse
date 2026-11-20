@@ -134,6 +134,9 @@ class ReplyInput(BaseModel):
     text: str = Field(min_length=1, max_length=50_000)  # PII-redacted
     sender: str | None = None  # email address, if known
     bank_domains: list[str] = Field(default_factory=list)
+    # Exact addresses that may write as the bank (the sandbox's "Sandbox Bank"). When set, only
+    # these match; domains are not consulted.
+    trusted_senders: list[str] = Field(default_factory=list)
     entitlement: Entitlement
     disputed_amount_inr: Decimal | None = None  # the transaction amount (user-confirmed)
 
@@ -204,7 +207,14 @@ PHISHING_WARNING = (
 )
 
 
-def check_sender(sender: str | None, bank_domains: list[str]) -> SenderCheck:
+def check_sender(
+    sender: str | None, bank_domains: list[str], trusted_senders: list[str] | None = None
+) -> SenderCheck:
+    if trusted_senders:
+        if not sender:
+            return SenderCheck.UNKNOWN
+        ok = sender.strip().lower() in {t.lower() for t in trusted_senders}
+        return SenderCheck.MATCH if ok else SenderCheck.MISMATCH
     if not sender or not bank_domains:
         return SenderCheck.UNKNOWN
     _, _, host = sender.strip().rpartition("@")
@@ -269,7 +279,7 @@ def build_reply_judge_graph(llm: LLMClient) -> ReplyJudgeGraph:
         inp = state["inp"]
         phishing = scan(inp.text, inp.bank_domains)
         injection = find_injection(inp.text)
-        sender = check_sender(inp.sender, inp.bank_domains)
+        sender = check_sender(inp.sender, inp.bank_domains, inp.trusted_senders)
         warnings: list[str] = []
         if phishing.suspicious:
             warnings.append(PHISHING_WARNING)

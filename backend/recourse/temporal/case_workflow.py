@@ -42,7 +42,7 @@ Determinism rules: no I/O, clock or randomness here. Time comes from `workflow.n
 from __future__ import annotations
 
 import uuid
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 
 from temporalio import workflow
 from temporalio.common import RetryPolicy
@@ -54,11 +54,13 @@ with workflow.unsafe.imports_passed_through():
     from recourse.agents.reply_judge_graph import NextAction
     from recourse.cases.drafts import MAX_DRAFTS_PER_CASE
     from recourse.db.models import Actor, CaseStatus, OutboundStatus
+    from recourse.email.channel import ChannelKind
     from recourse.evidence.models import IST
     from recourse.temporal.case_types import (
         APPROVE_DRAFT,
         ASSESS,
         ASSESS_ESCALATION,
+        CHECK_THREAD,
         CONFIRM,
         DRAFT,
         INVALID_USER_INPUT,
@@ -71,6 +73,7 @@ with workflow.unsafe.imports_passed_through():
         RECORD_SENT,
         REJECT_DRAFT,
         RUN_INTAKE,
+        SEND_EMAIL,
         AbandonRequest,
         AssessInput,
         AssessSummary,
@@ -78,6 +81,7 @@ with workflow.unsafe.imports_passed_through():
         CaseInput,
         CaseOutcome,
         CaseState,
+        CheckThreadInput,
         CloseRequest,
         Confirmation,
         ConfirmInput,
@@ -100,8 +104,11 @@ with workflow.unsafe.imports_passed_through():
         RecordResolvedInput,
         RecordSentInput,
         ReplySummary,
+        ResumeAtBank,
         RunIntakeInput,
+        SendEmailInput,
         SendSummary,
+        ThreadSummary,
     )
     from recourse.temporal.timeutil import TimeScale, days
 
@@ -112,6 +119,14 @@ LLM_RETRY = RetryPolicy(
     backoff_coefficient=2.0,
     maximum_interval=timedelta(minutes=2),
     maximum_attempts=5,
+    non_retryable_error_types=[INVALID_USER_INPUT],
+)
+# Gmail steps (network): one send attempt is never retried blindly (see send_email).
+GMAIL_TIMEOUT = timedelta(seconds=90)
+GMAIL_RETRY = RetryPolicy(
+    initial_interval=timedelta(seconds=5),
+    maximum_interval=timedelta(minutes=1),
+    maximum_attempts=3,
     non_retryable_error_types=[INVALID_USER_INPUT],
 )
 # Database / rule-engine steps.
@@ -181,6 +196,9 @@ class CaseWorkflow:
         self._can_close = False
         self._close: CloseRequest | None = None
         self._demo_offset_days = 0  # see `_today`
+        # GmailChannel reply watcher
+        self._watching = False
+        self._last_thread_check: datetime | None = None
 
     # --- signals & queries ----------------------------------------------------------------------
 
@@ -270,12 +288,16 @@ class CaseWorkflow:
             awaiting_filing=self._awaiting_filing,
             filing_deadline_passed=self._filing_deadline_passed,
             can_close=self._can_close,
+            watching_thread=self._watching,
+            last_thread_check=self._last_thread_check,
         )
 
     # --- main flow --------------------------------------------------------------------------------
 
     @workflow.run
     async def run(self, inp: CaseInput) -> CaseOutcome:
+        if inp.resume is not None:  # continued as new while waiting for the bank
+            return await self._resume_at_bank(inp, inp.resume)
         # 1. Intake
         try:
             intake: IntakeSummary = await workflow.execute_activity(
@@ -336,17 +358,8 @@ class CaseWorkflow:
                 # 6. Wait for the bank's reply, within the window the rules give it.
                 if workflow.patched("bank-wait-v1"):
                     result = await self._wait_for_bank(inp)
-                    if result == "abandoned":
-                        assert self._abandon is not None
-                        return await self._end(inp, self._abandon.reason, Actor.USER)
-                    if result == "resolved":
-                        return CaseOutcome(status=CaseStatus.RESOLVED)
-                    # 7. Escalate to the RBI Ombudsman: draft, approve, the user files.
-                    if workflow.patched("escalation-v1"):
-                        ended = await self._go_to_ombudsman(inp)
-                        if ended is None:
-                            assert self._abandon is not None
-                            return await self._end(inp, self._abandon.reason, Actor.USER)
+                    ended = await self._after_bank(inp, result)
+                    if ended is not None:
                         return ended
 
         # Cases that predate a step keep waiting here until the user ends them.
@@ -416,15 +429,30 @@ class CaseWorkflow:
         """Prepare the approved draft for sending; for ManualChannel wait until the user says
         it was sent. False = abandoned."""
         assert self._approved_draft_id is not None
+        retried = False
         while True:
             summary = await self._prepare_send(inp, self._approved_draft_id)
+            if (
+                summary is not None
+                and summary.channel is ChannelKind.GMAIL
+                and summary.status in (OutboundStatus.PREPARED, OutboundStatus.SENDING)
+                and workflow.patched("gmail-v1")
+            ):
+                # GmailChannel: send now (the approval was the user's go-ahead for this email).
+                self._email_id = summary.email_id
+                summary = await self._send_gmail(inp, summary.email_id, force=retried)
             if summary is not None:
                 self._email_id = summary.email_id
                 if summary.status is OutboundStatus.SENT:
+                    self._watching = summary.channel is ChannelKind.GMAIL
                     return True
-                if summary.status is OutboundStatus.PREPARED:
+                if (
+                    summary.status is OutboundStatus.PREPARED
+                    and summary.channel is ChannelKind.MANUAL
+                ):
                     break
-                self._last_error = " ".join(summary.blocked_reasons)
+                if summary.status is OutboundStatus.BLOCKED:
+                    self._last_error = " ".join(summary.blocked_reasons)
             # Blocked (or failed): wait until the user fixed the cause and asks to retry.
             self._can_retry_send = True
             await workflow.wait_condition(lambda: self._retry_send or self._abandoned)
@@ -432,6 +460,7 @@ class CaseWorkflow:
             if self._abandoned:
                 return False
             self._last_error = None
+            retried = True
 
         self._marks.clear()  # a mark sent before the email existed means nothing
         self._awaiting_manual_send = True
@@ -457,6 +486,22 @@ class CaseWorkflow:
             self._awaiting_manual_send = False
             self._last_error = None
             return True
+
+    async def _send_gmail(
+        self, inp: CaseInput, email_id: uuid.UUID, *, force: bool
+    ) -> SendSummary | None:
+        try:
+            summary: SendSummary = await workflow.execute_activity(
+                SEND_EMAIL,
+                SendEmailInput(case_id=inp.case_id, email_id=email_id, force=force),
+                result_type=SendSummary,
+                start_to_close_timeout=GMAIL_TIMEOUT,
+                retry_policy=DB_RETRY,
+            )
+        except ActivityError as err:
+            self._last_error = _error_message(err)
+            return None
+        return summary
 
     async def _prepare_send(self, inp: CaseInput, draft_id: uuid.UUID) -> SendSummary | None:
         try:
@@ -516,42 +561,54 @@ class CaseWorkflow:
 
     # --- the bank's reply window -----------------------------------------------------------------
 
-    async def _wait_for_bank(self, inp: CaseInput) -> str:
-        """AWAITING_BANK until the Ombudsman waiting period ends, handling the bank's replies.
-
-        Returns "abandoned", "resolved" or "escalate".
+    async def _wait_for_bank(self, inp: CaseInput, resume: ResumeAtBank | None = None) -> str:
+        """AWAITING_BANK until the Ombudsman waiting period ends, handling the bank's replies:
+        pasted ones (signals), and, with GmailChannel, new messages in the email's thread,
+        checked every `gmail_poll_seconds`. Returns "abandoned", "resolved" or "escalate".
         """
-        summary = await self._assess_escalation(inp, "bank.wait_started", CaseStatus.AWAITING_BANK)
-        self._status = CaseStatus.AWAITING_BANK
+        poll = timedelta(seconds=inp.time_scale.gmail_poll_seconds)
+        if resume is None:
+            summary = await self._assess_escalation(
+                inp, "bank.wait_started", CaseStatus.AWAITING_BANK
+            )
+            # Without a window (activity error) there is no timer: replies are still handled.
+            wait_days = summary.wait_days if summary is not None else 0
+            deadline = (
+                workflow.now() + days(wait_days, _scale(inp)) if summary is not None else None
+            )
+            judged = skipped = False
+            next_poll = workflow.now() + poll if self._watching else None
+        else:
+            wait_days, deadline, judged = resume.wait_days, resume.deadline, resume.judged
+            skipped, next_poll = resume.skipped, resume.next_poll
+        self._status = CaseStatus.JUDGED if judged else CaseStatus.AWAITING_BANK
         self._awaiting_bank = True
-        # Without a window (activity error) there is no timer: replies are still handled.
-        deadline = (
-            workflow.now() + days(summary.wait_days, _scale(inp)) if summary is not None else None
-        )
-        judged = False  # JUDGED: the user decides, the timer is paused
-        skipped = False
+        polls = 0
 
         def woken() -> bool:
             return bool(self._replies or self._resolved) or self._escalate or self._abandoned
 
         while True:
-            timeout = None if judged or deadline is None else deadline - workflow.now()
-            if timeout is not None and timeout <= timedelta(0):
-                self._bank_wait_expired = True
-            else:
+            now = workflow.now()
+            waits = [t - now for t in (None if judged else deadline, next_poll) if t is not None]
+            timeout = min(waits) if waits else None
+            if timeout is None or timeout > timedelta(0):
                 try:
                     await workflow.wait_condition(woken, timeout=timeout)
                 except TimeoutError:
-                    self._bank_wait_expired = True
-            if self._bank_wait_expired and summary is not None and not skipped:
+                    pass
+            now = workflow.now()
+            if not judged and deadline is not None and now >= deadline:
+                self._bank_wait_expired = True
+            if self._bank_wait_expired and not skipped:
                 skipped = True  # count the skipped demo days once
-                self._demo_days_passed(inp, summary.wait_days)
+                self._demo_days_passed(inp, wait_days)
 
             if self._abandoned:
                 return "abandoned"
             if self._resolved:
                 if await self._record_resolved(inp, self._resolved.pop(0)):
-                    self._awaiting_bank = self._can_escalate = False
+                    self._awaiting_bank = self._can_escalate = self._watching = False
                     self._status = CaseStatus.RESOLVED
                     return "resolved"
                 continue
@@ -559,29 +616,118 @@ class CaseWorkflow:
                 self._escalate = False
                 await self._assess_escalation(inp, "case.escalation_chosen", None)
                 break
+            if next_poll is not None and now >= next_poll and not self._replies:
+                # GmailChannel: read the thread (in an activity); new messages become replies.
+                checked = await self._check_thread(inp)
+                polls += 1
+                if checked is not None and not checked.connected:
+                    next_poll, self._watching = None, False  # paste replies from now on
+                else:
+                    if checked is not None:
+                        self._replies.extend(BankReplied(reply_id=r) for r in checked.new_reply_ids)
+                    next_poll = workflow.now() + poll
+                if (
+                    not woken()
+                    and not self._bank_wait_expired
+                    and (
+                        polls >= inp.time_scale.max_polls_per_run
+                        or workflow.info().is_continue_as_new_suggested()
+                    )
+                ):
+                    # Keep the history short: carry the wait over into a fresh run.
+                    assert self._email_id is not None
+                    workflow.continue_as_new(
+                        CaseInput(
+                            case_id=inp.case_id,
+                            upload_id=inp.upload_id,
+                            time_scale=inp.time_scale,
+                            resume=ResumeAtBank(
+                                email_id=self._email_id,
+                                deadline=deadline,
+                                next_poll=next_poll,
+                                judged=judged,
+                                skipped=skipped,
+                                wait_days=wait_days,
+                                drafts_used=self._drafts_used,
+                                demo_offset_days=self._demo_offset_days,
+                                eligible_from=self._eligible_from,
+                                filing_deadline=self._filing_deadline,
+                                last_reply=self._last_reply,
+                                can_escalate=self._can_escalate,
+                            ),
+                        )
+                    )
+                if self._replies:
+                    continue
+            if self._replies:
+                reply = await self._judge(inp, self._replies.pop(0))
+                if reply is None:
+                    continue
+                self._last_reply = reply
+                if not reply.suspicious:
+                    await self._assess_escalation(inp, "bank.replied", None)
+                action = reply.next_action
+                if action is NextAction.ESCALATE:
+                    self._status = CaseStatus.JUDGED
+                    break
+                if action in (NextAction.PROPOSE_RESOLVED, NextAction.ASK_USER):
+                    self._status = CaseStatus.JUDGED
+                    self._can_escalate = judged = True
+                # WARN / KEEP_WAITING / USER_ACTION: keep waiting with the timer.
+                continue
             if self._bank_wait_expired:
                 await self._assess_escalation(inp, "bank.wait_expired", None)
                 break
-            if not self._replies:
-                continue
 
-            reply = await self._judge(inp, self._replies.pop(0))
-            if reply is None:
-                continue
-            self._last_reply = reply
-            if not reply.suspicious:
-                await self._assess_escalation(inp, "bank.replied", None)
-            action = reply.next_action
-            if action is NextAction.ESCALATE:
-                self._status = CaseStatus.JUDGED
-                break
-            if action in (NextAction.PROPOSE_RESOLVED, NextAction.ASK_USER):
-                self._status = CaseStatus.JUDGED
-                self._can_escalate = judged = True
-            # WARN / KEEP_WAITING / USER_ACTION: keep waiting with the timer.
-
-        self._awaiting_bank = self._can_escalate = False
+        self._awaiting_bank = self._can_escalate = self._watching = False
         return "escalate"
+
+    async def _check_thread(self, inp: CaseInput) -> ThreadSummary | None:
+        assert self._email_id is not None
+        try:
+            summary: ThreadSummary = await workflow.execute_activity(
+                CHECK_THREAD,
+                CheckThreadInput(case_id=inp.case_id, email_id=self._email_id),
+                result_type=ThreadSummary,
+                start_to_close_timeout=GMAIL_TIMEOUT,
+                retry_policy=GMAIL_RETRY,
+            )
+        except ActivityError:
+            return None  # Gmail had a bad moment; the next check tries again
+        self._last_thread_check = workflow.now()
+        return summary
+
+    async def _after_bank(self, inp: CaseInput, result: str) -> CaseOutcome | None:
+        """What follows the bank wait. None = the case predates escalation (keep waiting)."""
+        if result == "abandoned":
+            assert self._abandon is not None
+            return await self._end(inp, self._abandon.reason, Actor.USER)
+        if result == "resolved":
+            return CaseOutcome(status=CaseStatus.RESOLVED)
+        # 7. Escalate to the RBI Ombudsman: draft, approve, the user files.
+        if workflow.patched("escalation-v1"):
+            ended = await self._go_to_ombudsman(inp)
+            if ended is None:
+                assert self._abandon is not None
+                return await self._end(inp, self._abandon.reason, Actor.USER)
+            return ended
+        return None
+
+    async def _resume_at_bank(self, inp: CaseInput, r: ResumeAtBank) -> CaseOutcome:
+        """A run continued as new while waiting for the bank: restore and carry on."""
+        self._email_id = r.email_id
+        self._drafts_used = r.drafts_used
+        self._demo_offset_days = r.demo_offset_days
+        self._eligible_from, self._filing_deadline = r.eligible_from, r.filing_deadline
+        self._last_reply, self._can_escalate = r.last_reply, r.can_escalate
+        self._watching = r.next_poll is not None
+        result = await self._wait_for_bank(inp, r)
+        ended = await self._after_bank(inp, result)
+        if ended is not None:
+            return ended
+        await workflow.wait_condition(lambda: self._abandoned)
+        assert self._abandon is not None
+        return await self._end(inp, self._abandon.reason, Actor.USER)
 
     # --- escalation to the RBI Ombudsman ----------------------------------------------------------
 

@@ -31,6 +31,7 @@ from recourse.temporal.case_types import (
     APPROVE_DRAFT,
     ASSESS,
     ASSESS_ESCALATION,
+    CHECK_THREAD,
     CONFIRM,
     DRAFT,
     INVALID_USER_INPUT,
@@ -43,6 +44,7 @@ from recourse.temporal.case_types import (
     RECORD_SENT,
     REJECT_DRAFT,
     RUN_INTAKE,
+    SEND_EMAIL,
     AbandonRequest,
     AssessInput,
     AssessSummary,
@@ -50,6 +52,7 @@ from recourse.temporal.case_types import (
     CaseInput,
     CaseOutcome,
     CaseState,
+    CheckThreadInput,
     CloseOutcome,
     CloseRequest,
     Confirmation,
@@ -74,7 +77,9 @@ from recourse.temporal.case_types import (
     RecordSentInput,
     ReplySummary,
     RunIntakeInput,
+    SendEmailInput,
     SendSummary,
+    ThreadSummary,
     TimeScaleInput,
 )
 from recourse.temporal.case_workflow import CaseWorkflow
@@ -106,6 +111,8 @@ class FakeActivities:
     judge: list[Any] = field(default_factory=list)
     resolved: list[Any] = field(default_factory=lambda: [None])
     filed: list[Any] = field(default_factory=lambda: [None])
+    send: list[Any] = field(default_factory=list)
+    thread: list[Any] = field(default_factory=list)  # empty -> connected, no new messages
     closed: list[Any] = field(default_factory=lambda: [None])
     calls: list[tuple[str, Any]] = field(default_factory=list)
 
@@ -171,6 +178,19 @@ class FakeActivities:
         async def record_resolved(inp: RecordResolvedInput) -> None:
             self._next(RECORD_RESOLVED, self.resolved, inp)
 
+        @activity.defn(name=SEND_EMAIL)
+        async def send_email(inp: SendEmailInput) -> SendSummary:
+            result: SendSummary = self._next(SEND_EMAIL, self.send, inp)
+            return result
+
+        @activity.defn(name=CHECK_THREAD)
+        async def check_thread(inp: CheckThreadInput) -> ThreadSummary:
+            if not self.thread:
+                self.calls.append((CHECK_THREAD, inp))
+                return ThreadSummary(connected=True)
+            result: ThreadSummary = self._next(CHECK_THREAD, self.thread, inp)
+            return result
+
         @activity.defn(name=RECORD_FILED)
         async def record_filed(inp: RecordFiledInput) -> None:
             self._next(RECORD_FILED, self.filed, inp)
@@ -197,6 +217,8 @@ class FakeActivities:
             record_resolved,
             record_filed,
             record_closed,
+            send_email,
+            check_thread,
             mark_abandoned,
         ]
 
@@ -1018,3 +1040,159 @@ async def test_filing_deadline_reminder(env: WorkflowEnvironment) -> None:
         await handle.signal(CaseWorkflow.abandon, AbandonRequest())
         outcome: CaseOutcome = await handle.result()
     assert outcome.status is CaseStatus.ABANDONED
+
+
+# =================================================================================================
+# GmailChannel: send on approval, then watch the thread
+# =================================================================================================
+
+
+def gmail(
+    status: OutboundStatus = OutboundStatus.PREPARED, email_id: uuid.UUID | None = None
+) -> SendSummary:
+    return SendSummary(
+        email_id=email_id or uuid.uuid4(),
+        channel=ChannelKind.GMAIL,
+        status=status,
+        sandbox=True,
+    )
+
+
+def gmail_input(polls_per_run: int = 200) -> CaseInput:
+    return CaseInput(
+        case_id=uuid.uuid4(),
+        upload_id=uuid.uuid4(),
+        time_scale=TimeScaleInput(gmail_poll_seconds=60, max_polls_per_run=polls_per_run),
+    )
+
+
+async def gmail_sent(
+    env: WorkflowEnvironment, fakes: FakeActivities, inp: CaseInput
+) -> WorkflowHandle[Any, Any]:
+    handle = await to_approval(env, fakes, inp)
+    state = await wait_for(handle, lambda s: s.draft_id is not None)
+    assert state.draft_id is not None
+    await handle.signal(CaseWorkflow.approve_draft, DraftDecision(draft_id=state.draft_id))
+    await wait_for(handle, lambda s: s.status is CaseStatus.AWAITING_BANK)
+    return handle
+
+
+async def test_gmail_sends_on_approval_and_watches_the_thread(env: WorkflowEnvironment) -> None:
+    email = uuid.uuid4()
+    ack = verdict(NextAction.KEEP_WAITING, ReplyLabel.ACKNOWLEDGEMENT)
+    reply_id = uuid.uuid4()
+    fakes = FakeActivities(
+        prepare=[gmail(email_id=email)],
+        send=[gmail(OutboundStatus.SENT, email)],
+        thread=[
+            ThreadSummary(connected=True),
+            ThreadSummary(connected=True, new_reply_ids=[reply_id], messages=2),
+        ],
+        judge=[ack],
+    )
+    async with worker(env, fakes):
+        handle = await gmail_sent(env, fakes, gmail_input())
+        state: CaseState = await handle.query(CaseWorkflow.get_state)
+        assert state.watching_thread and not state.awaiting_manual_send
+        await env.sleep(timedelta(seconds=125))  # two checks
+        state = await wait_for(handle, lambda s: s.last_reply is not None)
+        assert state.last_reply == ack and state.status is CaseStatus.AWAITING_BANK
+        assert state.last_thread_check is not None
+        await handle.signal(CaseWorkflow.abandon, AbandonRequest())
+        await handle.result()
+        history = await handle.fetch_history()
+
+    assert RECORD_SENT not in fakes.names()  # nobody had to say "I've sent it"
+    send_arg: SendEmailInput = next(a for n, a in fakes.calls if n == SEND_EMAIL)
+    assert send_arg.email_id == email and not send_arg.force
+    judged: JudgeReplyInput = next(a for n, a in fakes.calls if n == JUDGE_REPLY)
+    assert judged.reply_id == reply_id
+    await Replayer(
+        workflows=[CaseWorkflow], data_converter=pydantic_data_converter
+    ).replay_workflow(history)
+
+
+async def test_watcher_continues_as_new_and_keeps_its_state(env: WorkflowEnvironment) -> None:
+    email = uuid.uuid4()
+    fakes = FakeActivities(
+        prepare=[gmail(email_id=email)], send=[gmail(OutboundStatus.SENT, email)]
+    )
+    inp = gmail_input(polls_per_run=3)
+    async with worker(env, fakes):
+        handle = await gmail_sent(env, fakes, inp)
+        first_run = (await handle.describe()).run_id
+        await env.sleep(timedelta(seconds=200))  # 3 checks, then continue-as-new
+        latest = env.client.get_workflow_handle(handle.id, result_type=CaseOutcome)
+        state: CaseState = await wait_for(latest, lambda s: s.watching_thread)
+        assert (await latest.describe()).run_id != first_run
+        assert state.status is CaseStatus.AWAITING_BANK
+        assert state.escalation_eligible_from == date(2026, 12, 20)
+        await latest.signal(CaseWorkflow.abandon, AbandonRequest(reason="stop"))
+        outcome: CaseOutcome = await latest.result()
+    assert outcome.reason == "stop"
+    # The bank window is not restarted by the new run.
+    assert [e.event for n, e in fakes.calls if n == ASSESS_ESCALATION] == ["bank.wait_started"]
+    assert fakes.names().count(CHECK_THREAD) >= 3
+
+
+async def test_gmail_unusable_falls_back_to_manual(env: WorkflowEnvironment) -> None:
+    email = uuid.uuid4()
+    fakes = FakeActivities(
+        prepare=[gmail(email_id=email)],
+        send=[
+            SendSummary(
+                email_id=email,
+                channel=ChannelKind.MANUAL,
+                status=OutboundStatus.PREPARED,
+                sandbox=True,
+            )
+        ],
+    )
+    async with worker(env, fakes):
+        handle = await to_approved(env, fakes)
+        state = await wait_for(handle, lambda s: s.awaiting_manual_send)
+        assert not state.watching_thread
+        await handle.signal(CaseWorkflow.mark_sent, MarkSent(sent_at=SENT_AT))
+        state = await wait_for(handle, lambda s: s.status is CaseStatus.AWAITING_BANK)
+        assert not state.watching_thread
+        await handle.signal(CaseWorkflow.abandon, AbandonRequest())
+        await handle.result()
+
+
+async def test_unconfirmed_gmail_send_waits_for_the_user(env: WorkflowEnvironment) -> None:
+    email = uuid.uuid4()
+    fakes = FakeActivities(
+        prepare=[gmail(email_id=email), gmail(OutboundStatus.SENDING, email)],
+        send=[
+            bad_input("Gmail did not confirm the letter was sent. Check your Gmail Sent folder."),
+            gmail(OutboundStatus.SENT, email),
+        ],
+    )
+    async with worker(env, fakes):
+        handle = await to_approved(env, fakes)
+        state = await wait_for(handle, lambda s: s.can_retry_send)
+        assert "Sent folder" in (state.last_error or "")
+        await handle.signal(CaseWorkflow.retry_send)
+        await wait_for(handle, lambda s: s.status is CaseStatus.AWAITING_BANK)
+        await handle.signal(CaseWorkflow.abandon, AbandonRequest())
+        await handle.result()
+    sends: list[SendEmailInput] = [a for n, a in fakes.calls if n == SEND_EMAIL]
+    assert [x.force for x in sends] == [False, True]  # resent only after the user's go-ahead
+
+
+async def test_disconnected_gmail_stops_the_watcher(env: WorkflowEnvironment) -> None:
+    email = uuid.uuid4()
+    fakes = FakeActivities(
+        prepare=[gmail(email_id=email)],
+        send=[gmail(OutboundStatus.SENT, email)],
+        thread=[ThreadSummary(connected=False)],
+    )
+    async with worker(env, fakes):
+        handle = await gmail_sent(env, fakes, gmail_input())
+        await env.sleep(timedelta(seconds=65))
+        state = await wait_for(handle, lambda s: not s.watching_thread)
+        assert state.status is CaseStatus.AWAITING_BANK  # pasting replies still works
+        await env.sleep(timedelta(seconds=300))
+        await handle.signal(CaseWorkflow.abandon, AbandonRequest())
+        await handle.result()
+    assert fakes.names().count(CHECK_THREAD) == 1

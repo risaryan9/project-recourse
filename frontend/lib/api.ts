@@ -151,7 +151,7 @@ export type Bank = {
 export type Email = {
   id: string;
   channel: "MANUAL" | "GMAIL";
-  status: "BLOCKED" | "PREPARED" | "SENT";
+  status: "BLOCKED" | "PREPARED" | "SENDING" | "SENT";
   sandbox: boolean;
   bank: Bank | null;
   to: string | null;
@@ -160,6 +160,7 @@ export type Email = {
   mailto: string | null;
   blocked_reasons: string[];
   sent_at: string | null;
+  thread_id: string | null;
 };
 
 export type ReplySummary = {
@@ -222,6 +223,8 @@ export type CaseView = {
   can_close: boolean;
   ombudsman_filed_at: string | null;
   ombudsman_ref: string | null;
+  watching_thread: boolean;
+  last_thread_check: string | null;
   timeline: TimelineEntry[];
 };
 

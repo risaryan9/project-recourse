@@ -726,3 +726,49 @@ bank's reply (CLAUDE.md §3). It needs a long-lived Google grant with the minimu
 - Without Google credentials or an encryption key the server says Gmail isn't set up, and
   ManualChannel keeps working.
 - Losing `TOKEN_ENCRYPTION_KEY` makes stored tokens unreadable; users connect again.
+
+## ADR-020: GmailChannel sending and the reply watcher (phases 2-4)
+
+### Context
+With Gmail connected (ADR-019), an approved letter should go out from the user's own Gmail and
+the bank's reply should be picked up and judged without the user pasting it, while keeping the
+approval gate, thread-only access and a full audit trail (CLAUDE.md §3, §5).
+
+### Decision
+- **Approval is the send.** `prepare_send` picks GmailChannel when the case's owner has a
+  Gmail connection (else ManualChannel); the workflow then runs `send_email` for that exact
+  approved email. Sandbox rules are unchanged (`SANDBOX_RECIPIENT`; real banks need verified
+  contacts and rules).
+- **Never send twice by accident.** `send_email`: PREPARED → SENDING (committed) → Gmail →
+  SENT with the message and thread IDs. A 4xx puts it back to PREPARED; a 5xx, a timeout or a
+  crash leaves SENDING, and nothing resends it until the user has checked their Sent folder and
+  asks (`retry_send` → `force`). Gmail unusable (no connection, revoked access) → the same email
+  falls back to ManualChannel (`email.fallback_manual`).
+- **Thread-only access, proven.** `GmailApi` is the only code that calls Gmail; it allows
+  exactly `POST messages/send` and `GET threads/{id}` (an ID pattern, no path tricks) and raises
+  on anything else before a request leaves. `tests/unit/test_gmail_access.py` fails on any other
+  endpoint, on a wider public surface, or on any other module talking to Google. No bank-scoped
+  search is built (phase 5 left out by choice).
+- **Every Google call is audited** (`gmail.oauth.refresh`, `gmail.messages.send`,
+  `gmail.threads.get`, with status codes and IDs, never content); the timeline groups the
+  routine checks into one line.
+- **The watcher lives in the workflow; Gmail calls live in activities.** While waiting for the
+  bank, the workflow wakes at the earlier of the bank deadline and the next check
+  (`gmail_poll_seconds`: `GMAIL_POLL_MINUTES`, or `DEMO_GMAIL_POLL_SECONDS` in demo mode,
+  captured in the workflow input). `check_thread` stores each new message once
+  (`bank_replies.gmail_message_id`, migration 0010), skipping the letter itself and anything from
+  the connected account; it keeps only what the sender wrote (the quoted letter is cut), redacts
+  it, and hands the reply IDs to the existing judging path. A disconnected or revoked Gmail stops
+  the watcher; pasting replies keeps working.
+- **Sandbox Bank.** In the sandbox, only the exact `SANDBOX_RECIPIENT` address counts as the bank
+  (`trusted_senders`); any other sender is a mismatch and is flagged before any AI call.
+- **Continue-as-new.** After `max_polls_per_run` checks (or when Temporal suggests it) the wait
+  continues in a fresh run carrying `ResumeAtBank` (deadline, next check, judged state, draft
+  count, demo calendar, last verdict), so long waits keep a short history.
+- New code paths behind `workflow.patched("gmail-v1")`.
+
+### Consequences
+- A reply the bank sends as a brand-new email (outside the thread) is not seen; the user can
+  paste it. Phase 5 (bank-scoped search with a confirmation) would cover it.
+- Testing-mode Google apps issue refresh tokens that expire after 7 days; the watcher then
+  stops and the user reconnects.

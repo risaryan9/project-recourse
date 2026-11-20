@@ -16,7 +16,7 @@ import {
 import { LetterReview } from "@/components/case/letter-review";
 import { ReviewFacts } from "@/components/case/review-facts";
 import { api, type Bank, type CaseView, type Filing, type ReplySummary } from "@/lib/api";
-import { daysFromToday, formatDate, inr } from "@/lib/format";
+import { daysFromToday, formatDate, formatDateTime, inr } from "@/lib/format";
 import { ENUMS } from "@/lib/labels";
 
 type Props = { c: CaseView; refresh: () => void };
@@ -100,6 +100,31 @@ function SendYourself({ c, refresh }: Props) {
             Open in my email app
           </a>
         ) : null}
+      </div>
+    </div>
+  );
+}
+
+function GmailRetry({ c, refresh }: Props) {
+  const { busy, error, run } = useAction(refresh);
+  const unsure = c.email?.status === "SENDING";
+  return (
+    <div className="flex flex-col gap-6">
+      <Heading title={unsure ? "Check your Gmail before sending again" : "Gmail didn't send the letter"}>
+        {c.last_error}
+      </Heading>
+      {unsure ? (
+        <Notice>
+          Open your Gmail <span className="text-text">Sent</span> folder. If the letter is there,
+          don&apos;t send it again: paste the bank&apos;s reply here when it comes. If it isn&apos;t
+          there, send it again.
+        </Notice>
+      ) : null}
+      <FormError message={error} />
+      <div>
+        <PrimaryButton busy={busy === "retry"} onClick={() => run("retry", () => api.retrySend(c.id))}>
+          Send it again
+        </PrimaryButton>
       </div>
     </div>
   );
@@ -259,6 +284,13 @@ function WaitingForBank({ c, refresh }: Props) {
             }. When it replies, paste the reply here and Recourse checks it against the rules.`
           : "When your bank replies, paste the reply here and Recourse checks it against the rules."}
       </Heading>
+      {c.watching_thread ? (
+        <p className="text-sm text-text-2">
+          Recourse is watching this email&apos;s thread in your Gmail for the bank&apos;s reply
+          {c.last_thread_check ? ` (last checked ${formatDateTime(c.last_thread_check)})` : ""}. Replies
+          that arrive there are checked automatically.
+        </p>
+      ) : null}
       {c.bank_complaint_ref ? (
         <p className="text-sm text-text-3">
           Bank&apos;s complaint number: <span className="text-text-2">{c.bank_complaint_ref}</span>
@@ -540,6 +572,10 @@ function Body({ c, refresh }: Props) {
     return <LetterReview key={draft.id} c={c} draft={draft} onDone={refresh} />;
   }
   if (c.can_retry_send && c.email?.status === "BLOCKED") return <BlockedSend c={c} refresh={refresh} />;
+  if (c.can_retry_send && c.email?.channel === "GMAIL") return <GmailRetry c={c} refresh={refresh} />;
+  if (c.email?.channel === "GMAIL" && c.status === "AWAITING_APPROVAL" && c.email.status !== "SENT") {
+    return <Working>Sending the letter from your Gmail.</Working>;
+  }
   if (c.email?.status === "PREPARED" && c.status === "AWAITING_APPROVAL") return <SendYourself c={c} refresh={refresh} />;
   if (c.awaiting_filing) return <FilingPackage c={c} refresh={refresh} />;
   if (c.can_close) return <CloseForm c={c} refresh={refresh} />;

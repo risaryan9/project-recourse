@@ -192,6 +192,7 @@ class EmailView(BaseModel):
     mailto: str | None  # ManualChannel, when PREPARED
     blocked_reasons: list[str]
     sent_at: datetime | None
+    thread_id: str | None  # GmailChannel
 
 
 class CaseView(BaseModel):
@@ -226,6 +227,9 @@ class CaseView(BaseModel):
     can_close: bool  # filed: report how it ended
     ombudsman_filed_at: datetime | None
     ombudsman_ref: str | None
+    # GmailChannel: Recourse is checking the email's Gmail thread for the bank's reply.
+    watching_thread: bool
+    last_thread_check: datetime | None
     timeline: list[TimelineEntry]
 
 
@@ -264,7 +268,11 @@ async def create_case(
         case_id=case.id,
         upload_id=case.upload_id,
         time_scale=TimeScaleInput(
-            demo_mode=settings.demo_mode, demo_day_seconds=settings.demo_day_seconds
+            demo_mode=settings.demo_mode,
+            demo_day_seconds=settings.demo_day_seconds,
+            gmail_poll_seconds=settings.demo_gmail_poll_seconds
+            if settings.demo_mode
+            else settings.gmail_poll_minutes * 60,
         ),
     )
     try:
@@ -439,6 +447,8 @@ async def get_case(case_id: uuid.UUID, session: Session, runner: Runner) -> Case
         can_close=live.can_close if live else False,
         ombudsman_filed_at=case.ombudsman_filed_at,
         ombudsman_ref=case.ombudsman_ref,
+        watching_thread=live.watching_thread if live else False,
+        last_thread_check=live.last_thread_check if live else None,
         timeline=[
             TimelineEntry(
                 occurred_at=e.occurred_at,
@@ -971,6 +981,7 @@ def _email_view(e: OutboundEmail) -> EmailView:
         else None,
         blocked_reasons=e.blocked_reasons,
         sent_at=e.sent_at,
+        thread_id=e.thread_id,
     )
 
 

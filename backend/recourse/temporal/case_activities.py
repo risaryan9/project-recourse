@@ -17,6 +17,7 @@ import uuid
 from datetime import date, timedelta
 from typing import Any
 
+import httpx
 from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.orm import selectinload
@@ -56,8 +57,10 @@ from recourse.db.models import (
     DraftRecordStatus,
     EntitlementRecord,
     EvidenceRecord,
+    GmailConnection,
     OutboundEmail,
     OutboundStatus,
+    ReplySource,
     ReplyStatus,
     Upload,
 )
@@ -68,16 +71,21 @@ from recourse.email.channel import (
     resolve_recipient,
 )
 from recourse.email.contacts import BankContact, BankContacts, load_bank_contacts
+from recourse.email.crypto import TokenCipher, TokenCipherError
+from recourse.email.gmail import GmailApi, GmailChannel, GmailHttpError
 from recourse.email.manual import ManualChannel
+from recourse.email.mime import reply_text
+from recourse.email.oauth import GoogleOAuth, OAuthError
 from recourse.evidence.models import IST
 from recourse.evidence.validators import EvidenceCheck
 from recourse.llm.base import Attachment, LLMClient, LLMError
 from recourse.rules.models import Entitlement, EscalationAssessment
-from recourse.security.pii import RedactionKind
+from recourse.security.pii import RedactionKind, redact_text
 from recourse.temporal.case_types import (
     APPROVE_DRAFT,
     ASSESS,
     ASSESS_ESCALATION,
+    CHECK_THREAD,
     CONFIRM,
     DRAFT,
     INVALID_USER_INPUT,
@@ -90,8 +98,10 @@ from recourse.temporal.case_types import (
     RECORD_SENT,
     REJECT_DRAFT,
     RUN_INTAKE,
+    SEND_EMAIL,
     AssessInput,
     AssessSummary,
+    CheckThreadInput,
     ConfirmInput,
     ConfirmOutcome,
     DraftDecisionInput,
@@ -109,7 +119,9 @@ from recourse.temporal.case_types import (
     RecordSentInput,
     ReplySummary,
     RunIntakeInput,
+    SendEmailInput,
     SendSummary,
+    ThreadSummary,
 )
 
 LLM_FAILED = "LLMFailed"
@@ -132,6 +144,7 @@ class CaseActivities:
         settings: Settings | None = None,
         contacts: BankContacts | None = None,
         channels: dict[ChannelKind, EmailChannel] | None = None,
+        http: httpx.AsyncClient | None = None,
     ) -> None:
         self._sessions = sessions
         self._llm = llm
@@ -140,6 +153,8 @@ class CaseActivities:
         self._channels: dict[ChannelKind, EmailChannel] = channels or {
             ChannelKind.MANUAL: ManualChannel()
         }
+        # One HTTP client for Google (OAuth + Gmail); tests pass a mocked one.
+        self._http = http
 
     def all(self) -> list[Any]:
         return [
@@ -151,6 +166,8 @@ class CaseActivities:
             self.reject_draft,
             self.prepare_send,
             self.record_sent,
+            self.send_email,
+            self.check_thread,
             self.assess_escalation,
             self.judge_reply,
             self.record_resolved,
@@ -553,7 +570,13 @@ class CaseActivities:
                 contact=contact,
                 rules_verified=draft.rules_verified,
             )
-            channel = self._channels[ChannelKind.MANUAL]  # GmailChannel joins here (ADR-012)
+            # GmailChannel if this browser connected Gmail (and the server can use it); otherwise
+            # ManualChannel. Gmail itself is called by `send_email`, outside this transaction.
+            use_gmail = (
+                self._gmail_ready()
+                and await s.get(GmailConnection, case.owner_id or "") is not None
+            )
+            channel = self._channels[ChannelKind.MANUAL]
             if row is None:
                 row = OutboundEmail(case_id=case.id, draft_id=draft.id)
                 s.add(row)
@@ -585,6 +608,11 @@ class CaseActivities:
                 return _send_summary(row)
 
             assert recipient.address is not None
+            if use_gmail:
+                row.channel = ChannelKind.GMAIL.value
+                info["channel"] = row.channel
+                record_event(s, case.id, Actor.SYSTEM, "email.prepared", info)
+                return _send_summary(row)
             outcome = await channel.send(
                 OutgoingEmail(
                     to=recipient.address,
@@ -753,10 +781,16 @@ class CaseActivities:
             except AssessmentError:
                 entitlement = Entitlement.model_validate(ent_row.data)
             contact = self._bank_for(case.bank_id, evidence.payer_bank.value)
+            sent = await s.scalar(
+                select(OutboundEmail).where(
+                    OutboundEmail.case_id == case.id, OutboundEmail.status == OutboundStatus.SENT
+                )
+            )
+            sandbox_reply = sent is not None and sent.sandbox
             judge_input = ReplyInput(
                 text=reply.body,
                 sender=reply.sender,
-                bank_domains=list(contact.sender_domains) if contact else [],
+                **self._sender_policy(sandbox_reply, contact),
                 entitlement=entitlement,
                 disputed_amount_inr=evidence.amount_inr.value,
             )
@@ -900,6 +934,239 @@ class CaseActivities:
                     "amount_received_inr": str(amount) if amount is not None else None,
                 },
             )
+
+    # --- GmailChannel -----------------------------------------------------------------------
+
+    def _gmail_ready(self) -> bool:
+        st = self._settings
+        return bool(
+            st.google_client_id
+            and st.google_client_secret
+            and st.google_redirect_uri
+            and st.token_encryption_key
+        )
+
+    async def _gmail_channel(
+        self, connection: GmailConnection, calls: list[tuple[str, dict[str, Any]]]
+    ) -> GmailChannel:
+        """A GmailChannel for this connection. Every Google call is appended to `calls`, which
+        the caller writes to the case's audit trail."""
+        oauth = GoogleOAuth(self._settings, client=self._http)
+        refresh_token = TokenCipher.from_settings(self._settings).decrypt(
+            connection.refresh_token_enc
+        )
+        cached: list[str] = []
+
+        async def access_token() -> str:
+            if not cached:
+                try:
+                    token, _ = await oauth.refresh(refresh_token)
+                except OAuthError:
+                    calls.append(("oauth.refresh", {"ok": False}))
+                    raise
+                calls.append(("oauth.refresh", {"ok": True}))
+                cached.append(token)
+            return cached[0]
+
+        api = GmailApi(
+            access_token,
+            client=self._http,
+            on_call=lambda endpoint, info: calls.append((endpoint, info)),
+        )
+        return GmailChannel(api, sender=connection.email)
+
+    @staticmethod
+    def _audit_gmail(
+        s: AsyncSession, case_id: uuid.UUID, calls: list[tuple[str, dict[str, Any]]]
+    ) -> None:
+        for endpoint, info in calls:
+            record_event(s, case_id, Actor.SYSTEM, f"gmail.{endpoint}", info)
+
+    @activity.defn(name=SEND_EMAIL)
+    async def send_email(self, inp: SendEmailInput) -> SendSummary:
+        """Send an approved, PREPARED email through the user's Gmail.
+
+        PREPARED -> SENDING (committed) -> Gmail -> SENT with its message and thread IDs. If a
+        run dies after Gmail accepted the email but before SENT was saved, the row stays
+        SENDING; a retry then refuses to send again unless the user checked and asked
+        (`force`). Gmail unusable (not connected, access revoked) -> ManualChannel instead.
+        """
+        async with self._sessions.begin() as s:
+            case = await _case_for_update(s, inp.case_id)
+            row = await s.get(OutboundEmail, inp.email_id, with_for_update=True)
+            if row is None or row.case_id != case.id:
+                raise ApplicationError(f"email {inp.email_id} not found", non_retryable=True)
+            if row.status is OutboundStatus.SENT:
+                return _send_summary(row)
+            if row.channel != ChannelKind.GMAIL.value:
+                raise invalid("This email is not sent through Gmail.")
+            if row.status is OutboundStatus.SENDING and not inp.force:
+                raise invalid(
+                    "Gmail did not confirm the last attempt. Check your Gmail Sent folder; if "
+                    "the letter isn't there, send it again."
+                )
+            if row.status not in (OutboundStatus.PREPARED, OutboundStatus.SENDING):
+                raise invalid("This email cannot be sent yet.")
+            assert row.recipient is not None
+            connection = await s.get(GmailConnection, case.owner_id or "")
+            if connection is None or not self._gmail_ready():
+                return await self._fall_back_to_manual(s, case, row, "gmail_not_connected")
+            row.status = OutboundStatus.SENDING
+            email = OutgoingEmail(
+                to=row.recipient, subject=row.subject, body=row.body, sandbox=row.sandbox
+            )
+            info: dict[str, Any] = {
+                "email_id": str(row.id),
+                "channel": row.channel,
+                "sandbox": row.sandbox,
+            }
+
+        calls: list[tuple[str, dict[str, Any]]] = []
+        try:
+            channel = await self._gmail_channel(connection, calls)
+            outcome = await channel.send(email)
+        except (OAuthError, TokenCipherError):
+            async with self._sessions.begin() as s:
+                case = await _case_for_update(s, inp.case_id)
+                row = await s.get(OutboundEmail, inp.email_id, with_for_update=True)
+                assert row is not None
+                self._audit_gmail(s, case.id, calls)
+                return await self._fall_back_to_manual(s, case, row, "gmail_access_lost")
+        except GmailHttpError as e:
+            async with self._sessions.begin() as s:
+                row = await s.get(OutboundEmail, inp.email_id, with_for_update=True)
+                assert row is not None
+                self._audit_gmail(s, inp.case_id, calls)
+                if e.certainly_not_sent:
+                    row.status = OutboundStatus.PREPARED
+            if e.certainly_not_sent:
+                raise invalid(f"Gmail refused to send the letter (HTTP {e.status}).") from e
+            raise invalid(
+                "Gmail did not confirm the letter was sent. Check your Gmail Sent folder; if it "
+                "isn't there, send it again."
+            ) from e
+        except httpx.HTTPError as e:
+            async with self._sessions.begin() as s:
+                self._audit_gmail(s, inp.case_id, calls)
+            raise invalid(
+                "Gmail could not be reached, so it's not certain the letter was sent. Check your "
+                "Gmail Sent folder; if it isn't there, send it again."
+            ) from e
+
+        async with self._sessions.begin() as s:
+            case = await _case_for_update(s, inp.case_id)
+            row = await s.get(OutboundEmail, inp.email_id, with_for_update=True)
+            assert row is not None
+            self._audit_gmail(s, case.id, calls)
+            row.status = OutboundStatus.SENT
+            row.sent_at = activity.info().current_attempt_scheduled_time
+            row.message_id, row.thread_id = outcome.message_id, outcome.thread_id
+            case.status = CaseStatus.SENT_TO_BANK
+            record_event(
+                s,
+                case.id,
+                Actor.SYSTEM,
+                "email.sent",
+                info | {"message_id": row.message_id, "thread_id": row.thread_id},
+            )
+            return _send_summary(row)
+
+    async def _fall_back_to_manual(
+        self, s: AsyncSession, case: Case, row: OutboundEmail, reason: str
+    ) -> SendSummary:
+        """Gmail can't be used: the same email is handed to the user (ManualChannel)."""
+        row.channel = ChannelKind.MANUAL.value
+        row.status = OutboundStatus.PREPARED
+        record_event(
+            s,
+            case.id,
+            Actor.SYSTEM,
+            "email.fallback_manual",
+            {"email_id": str(row.id), "reason": reason},
+        )
+        return _send_summary(row)
+
+    @activity.defn(name=CHECK_THREAD)
+    async def check_thread(self, inp: CheckThreadInput) -> ThreadSummary:
+        """Read the email's Gmail thread (threads.get only) and store new messages from others.
+
+        Each Gmail message is processed once (`bank_replies.gmail_message_id`). The letter
+        itself and anything sent from the connected account are skipped. A stored reply keeps
+        only what its sender wrote (the quoted letter is cut), PII-redacted, like a pasted one.
+        """
+        async with self._sessions() as s:
+            case = await s.get(Case, inp.case_id)
+            row = await s.get(OutboundEmail, inp.email_id)
+            if case is None or row is None or row.case_id != case.id:
+                raise ApplicationError("case or email not found", non_retryable=True)
+            if row.thread_id is None or row.status is not OutboundStatus.SENT:
+                return ThreadSummary(connected=False)
+            connection = await s.get(GmailConnection, case.owner_id or "")
+            if connection is None or not self._gmail_ready():
+                return ThreadSummary(connected=False)
+            seen = set(
+                await s.scalars(
+                    select(BankReply.gmail_message_id).where(
+                        BankReply.case_id == case.id, BankReply.gmail_message_id.is_not(None)
+                    )
+                )
+            )
+            own = connection.email.lower()
+            thread_id, sent_id = row.thread_id, row.message_id
+
+        calls: list[tuple[str, dict[str, Any]]] = []
+        try:
+            channel = await self._gmail_channel(connection, calls)
+            messages = await channel.get_thread(thread_id)
+        except (OAuthError, TokenCipherError):
+            async with self._sessions.begin() as s:
+                self._audit_gmail(s, inp.case_id, calls)
+            return ThreadSummary(connected=False)
+        except (GmailHttpError, httpx.HTTPError):
+            async with self._sessions.begin() as s:
+                self._audit_gmail(s, inp.case_id, calls)
+            raise  # transient: Temporal retries the check
+
+        new_ids: list[uuid.UUID] = []
+        async with self._sessions.begin() as s:
+            self._audit_gmail(s, inp.case_id, calls)
+            for m in messages:
+                if m.id == sent_id or m.id in seen or m.sender == own:
+                    continue
+                text, kinds = redact_text(reply_text(m.text))
+                if not text:
+                    continue
+                reply = BankReply(
+                    case_id=inp.case_id,
+                    source=ReplySource.GMAIL,
+                    received_at=m.received_at,
+                    sender=m.sender or None,
+                    body=text,
+                    redactions=sorted(k.value for k in kinds),
+                    status=ReplyStatus.PENDING,
+                    gmail_message_id=m.id,
+                )
+                s.add(reply)
+                await s.flush()
+                new_ids.append(reply.id)
+                record_event(
+                    s,
+                    inp.case_id,
+                    Actor.BANK,
+                    "reply.received",
+                    {"reply_id": str(reply.id), "source": "GMAIL", "redactions": reply.redactions},
+                )
+        return ThreadSummary(connected=True, new_reply_ids=new_ids, messages=len(messages))
+
+    def _sender_policy(self, sandbox: bool, contact: BankContact | None) -> dict[str, Any]:
+        """Who may write as "the bank". In the sandbox the "Sandbox Bank" is exactly the
+        SANDBOX_RECIPIENT address; otherwise the bank's known sender domains."""
+        if sandbox and self._settings.sandbox_recipient:
+            return {
+                "bank_domains": [],
+                "trusted_senders": [self._settings.sandbox_recipient.lower()],
+            }
+        return {"bank_domains": list(contact.sender_domains) if contact else []}
 
     def _bank_for(self, bank_id: str | None, extracted_name: str | None) -> BankContact | None:
         if bank_id is not None:
