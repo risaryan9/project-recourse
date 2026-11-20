@@ -719,6 +719,16 @@ async def test_demo_mode_shrinks_the_bank_wait(env: WorkflowEnvironment) -> None
         await wait_for(handle, lambda s: s.bank_wait_expired)
         await handle.signal(CaseWorkflow.abandon, AbandonRequest())
         await handle.result()
+        history = await handle.fetch_history()
+
+    # The case's calendar moved on by the 30 skipped days, though only minutes passed, so the
+    # rule engine sees the waiting period as over (regression: it looped forever).
+    started, expired = [a for n, a in fakes.calls if n == ASSESS_ESCALATION][:2]
+    assert expired.event == "bank.wait_expired"
+    assert (expired.as_of - started.as_of).days == 30
+    await Replayer(
+        workflows=[CaseWorkflow], data_converter=pydantic_data_converter
+    ).replay_workflow(history)
 
 
 async def test_window_already_over_expires_at_once(env: WorkflowEnvironment) -> None:

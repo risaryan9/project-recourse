@@ -180,6 +180,7 @@ class CaseWorkflow:
         self._filing_deadline_passed = False
         self._can_close = False
         self._close: CloseRequest | None = None
+        self._demo_offset_days = 0  # see `_today`
 
     # --- signals & queries ----------------------------------------------------------------------
 
@@ -308,7 +309,7 @@ class CaseWorkflow:
             try:
                 assessed: AssessSummary = await workflow.execute_activity(
                     ASSESS,
-                    AssessInput(case_id=inp.case_id, as_of=workflow.now().astimezone(IST).date()),
+                    AssessInput(case_id=inp.case_id, as_of=self._today()),
                     result_type=AssessSummary,
                     start_to_close_timeout=DB_TIMEOUT,
                     retry_policy=DB_RETRY,
@@ -478,7 +479,7 @@ class CaseWorkflow:
                 DraftInput(
                     case_id=inp.case_id,
                     seq=seq,
-                    letter_date=workflow.now().astimezone(IST).date(),
+                    letter_date=self._today(),
                     kind=kind,
                 ),
                 result_type=DraftSummary,
@@ -528,6 +529,7 @@ class CaseWorkflow:
             workflow.now() + days(summary.wait_days, _scale(inp)) if summary is not None else None
         )
         judged = False  # JUDGED: the user decides, the timer is paused
+        skipped = False
 
         def woken() -> bool:
             return bool(self._replies or self._resolved) or self._escalate or self._abandoned
@@ -541,6 +543,9 @@ class CaseWorkflow:
                     await workflow.wait_condition(woken, timeout=timeout)
                 except TimeoutError:
                     self._bank_wait_expired = True
+            if self._bank_wait_expired and summary is not None and not skipped:
+                skipped = True  # count the skipped demo days once
+                self._demo_days_passed(inp, summary.wait_days)
 
             if self._abandoned:
                 return "abandoned"
@@ -640,7 +645,7 @@ class CaseWorkflow:
                         lambda: self._abandoned, timeout=days(summary.wait_days, _scale(inp))
                     )
                 except TimeoutError:
-                    pass
+                    self._demo_days_passed(inp, summary.wait_days)
                 if self._abandoned:
                     return None
                 continue
@@ -657,10 +662,9 @@ class CaseWorkflow:
         """Wait for `mark_filed`; remind when the filing deadline passes. False = abandoned."""
         assert self._escalation_draft_id is not None
         self._awaiting_filing = True
-        deadline = None
+        deadline, left = None, 0
         if summary.filing_deadline is not None:
-            today = workflow.now().astimezone(IST).date()
-            left = (summary.filing_deadline - today).days + 1  # through the last day
+            left = (summary.filing_deadline - self._today()).days + 1  # through the last day
             deadline = workflow.now() + days(max(0, left), _scale(inp))
         while True:
             timeout = None
@@ -675,6 +679,7 @@ class CaseWorkflow:
                 )
             except TimeoutError:
                 self._filing_deadline_passed = True
+                self._demo_days_passed(inp, max(0, left))
                 continue
             if self._abandoned:
                 return False
@@ -735,7 +740,7 @@ class CaseWorkflow:
                 ASSESS_ESCALATION,
                 EscalationInput(
                     case_id=inp.case_id,
-                    as_of=workflow.now().astimezone(IST).date(),
+                    as_of=self._today(),
                     event=event,
                     new_status=new_status,
                 ),
@@ -751,6 +756,22 @@ class CaseWorkflow:
         self._eligible_from = summary.eligible_from
         self._filing_deadline = summary.filing_deadline
         return summary
+
+    # --- the case's calendar -------------------------------------------------------------------
+
+    def _today(self) -> date:
+        """The case's calendar date (IST): real today, plus the days that demo timers skipped.
+
+        In DEMO_MODE a timer of n "days" lasts n * DEMO_DAY_SECONDS, but the calendar would not
+        move, so the rule engine would still see the waiting period as unfinished. Each completed
+        demo timer therefore moves the case's calendar on by its days. Outside demo mode the
+        offset stays 0. Replay-safe: the offset is built only from recorded timers.
+        """
+        return workflow.now().astimezone(IST).date() + timedelta(days=self._demo_offset_days)
+
+    def _demo_days_passed(self, inp: CaseInput, n: int) -> None:
+        if inp.time_scale.demo_mode:
+            self._demo_offset_days += n
 
     # --- helpers --------------------------------------------------------------------------------
 
