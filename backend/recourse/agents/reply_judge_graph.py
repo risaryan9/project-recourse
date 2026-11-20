@@ -67,6 +67,13 @@ class NextAction(StrEnum):
     ASK_USER = "ASK_USER"  # the user decides: escalate or accept and close
 
 
+class OwedBasis(StrEnum):
+    RULE_ENGINE = "RULE_ENGINE"  # the Entitlement's money lines
+    # Fraud with the fault not yet established: the rules fix no amount, so the reply is
+    # compared with the disputed transaction amount (the customer's claim, not a rule figure).
+    DISPUTED_AMOUNT = "DISPUTED_AMOUNT"
+
+
 class ReplyClassification(BaseModel):
     """What the model returns. Labels and figures only, no free text."""
 
@@ -109,7 +116,8 @@ class ReplyVerdict(BaseModel):
     amount_reversed_inr: Decimal | None = None
     compensation_paid_inr: Decimal | None = None
     reasons_given: bool = False
-    owed_inr: Decimal  # rule engine: everything owed for this case
+    owed_inr: Decimal  # what the reply is checked against (see `owed_basis`)
+    owed_basis: OwedBasis = OwedBasis.RULE_ENGINE
     paid_inr: Decimal  # what the bank says it paid (reversal + compensation)
     shortfall_inr: Decimal  # owed - paid, never below 0
     models_used: list[str] = Field(default_factory=list)
@@ -127,6 +135,15 @@ class ReplyInput(BaseModel):
     sender: str | None = None  # email address, if known
     bank_domains: list[str] = Field(default_factory=list)
     entitlement: Entitlement
+    disputed_amount_inr: Decimal | None = None  # the transaction amount (user-confirmed)
+
+    @property
+    def owed(self) -> tuple[Decimal, OwedBasis]:
+        """What a reply is checked against, and where that figure comes from."""
+        ent = self.entitlement
+        if ent.case_type == "fraud" and not ent.money and self.disputed_amount_inr is not None:
+            return self.disputed_amount_inr, OwedBasis.DISPUTED_AMOUNT
+        return ent.total_owed_inr, OwedBasis.RULE_ENGINE
 
 
 # =================================================================================================
@@ -198,7 +215,7 @@ def check_sender(sender: str | None, bank_domains: list[str]) -> SenderCheck:
 
 def _verdict(state: ReplyState, label: ReplyLabel, c: ReplyClassification | None) -> ReplyVerdict:
     inp = state["inp"]
-    owed = inp.entitlement.total_owed_inr
+    owed, basis = inp.owed
     reversed_ = c.amount_reversed_inr if c else None
     compensation = c.compensation_paid_inr if c else None
     paid = (reversed_ or Decimal("0")) + (compensation or Decimal("0"))
@@ -213,7 +230,14 @@ def _verdict(state: ReplyState, label: ReplyLabel, c: ReplyClassification | None
         action = NextAction.USER_ACTION
     elif label in (ReplyLabel.RESOLVED, ReplyLabel.PARTIAL):
         # Compliance is decided here, from the rule engine's figures, never by the model.
-        action = NextAction.PROPOSE_RESOLVED if shortfall == 0 else NextAction.ESCALATE
+        if shortfall == 0:
+            action = NextAction.PROPOSE_RESOLVED
+        elif basis is OwedBasis.DISPUTED_AMOUNT:
+            # Short of the disputed amount, but the rules fix no figure while the fault is
+            # open (the customer may bear part of the loss): flag it, the customer decides.
+            action = NextAction.ASK_USER
+        else:
+            action = NextAction.ESCALATE
     elif label is ReplyLabel.REJECTED_NO_REASONS:
         # An unexplained rejection is an unsatisfactory reply (RB-IOS 10(1)(f)); ADR-014.
         action = NextAction.ESCALATE
@@ -233,6 +257,7 @@ def _verdict(state: ReplyState, label: ReplyLabel, c: ReplyClassification | None
         compensation_paid_inr=compensation,
         reasons_given=c.reasons_given if c else False,
         owed_inr=owed,
+        owed_basis=basis,
         paid_inr=paid,
         shortfall_inr=shortfall,
         models_used=state.get("models_used", []),

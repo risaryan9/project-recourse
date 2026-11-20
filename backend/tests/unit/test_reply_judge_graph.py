@@ -13,6 +13,7 @@ import pytest
 from recourse.agents.reply_judge_graph import (
     CLASSIFY_PURPOSE,
     NextAction,
+    OwedBasis,
     ReplyInput,
     ReplyLabel,
     SenderCheck,
@@ -24,7 +25,7 @@ from recourse.llm.fake import FakeLLM
 from recourse.llm.prompting import UNTRUSTED_TAG
 from recourse.security.injection import find_injection
 from recourse.security.phishing import PhishingSignal, scan
-from tests.unit.test_draft_graph import failed_case
+from tests.unit.test_draft_graph import failed_case, fraud_case
 
 BANK_DOMAINS = ["examplebank.bank.in", "examplebank.com"]
 _, ENTITLEMENT = failed_case()  # owed: refund 2450 + compensation 300 = 2750
@@ -195,3 +196,34 @@ def test_injection_detection() -> None:
 def test_sender_check(sender: str | None, check: SenderCheck) -> None:
     assert check_sender(sender, BANK_DOMAINS) is check
     assert check_sender(sender, []) is SenderCheck.UNKNOWN
+
+
+# --- fraud with the fault not yet established (no amount fixed by the rules) ------------------
+
+
+def fraud_input(text: str) -> ReplyInput:
+    _, fraud = fraud_case()
+    assert fraud.case_type == "fraud" and not fraud.money  # fault UNKNOWN: no fixed amount
+    return ReplyInput(
+        text=text, bank_domains=BANK_DOMAINS, entitlement=fraud, disputed_amount_inr=Decimal("2450")
+    )
+
+
+async def test_fraud_full_refund_is_checked_against_the_disputed_amount() -> None:
+    fake = llm(label="RESOLVED", amount_reversed_inr="2450")
+    v = await judge_reply(fake, fraud_input("Rs 2450 credited to your account."))
+    assert v.owed_basis is OwedBasis.DISPUTED_AMOUNT and v.owed_inr == Decimal("2450")
+    assert v.next_action is NextAction.PROPOSE_RESOLVED
+
+
+async def test_fraud_partial_refund_is_flagged_for_the_customer() -> None:
+    fake = llm(label="RESOLVED", amount_reversed_inr="1000")
+    v = await judge_reply(fake, fraud_input("Rs 1000 credited as full and final settlement."))
+    assert v.shortfall_inr == Decimal("1450")
+    # Flagged, but the customer decides: the rules fix no figure while the fault is open.
+    assert v.next_action is NextAction.ASK_USER
+
+
+async def test_failed_transactions_still_use_the_rule_engine_figure() -> None:
+    v = await judge_reply(llm(label="RESOLVED", amount_reversed_inr="2450"), inp(PAID))
+    assert v.owed_basis is OwedBasis.RULE_ENGINE and v.next_action is NextAction.ESCALATE
