@@ -197,6 +197,9 @@ class Evidence(BaseModel):
     account_debited: Extracted[bool] = Field(default_factory=_empty)  # was the customer debited?
     amount_inr: Extracted[Money] = Field(default_factory=_empty)
     txn_timestamp: Extracted[IstDateTime] = Field(default_factory=_empty)
+    # False when the evidence showed only the date: `txn_timestamp` is then midnight IST, and
+    # that time must never be shown or used as if it were known.
+    txn_time_known: bool = True
     is_domestic: Extracted[bool] = Field(default_factory=_empty)
 
     # --- References ------------------------------------------------------------------------------
@@ -289,6 +292,8 @@ class Evidence(BaseModel):
         """Return a copy where the user has typed or confirmed `name`. Re-runs every hard check."""
         self.fact(name)  # raises KeyError for unknown names
         data = self.model_dump()
+        if name == "txn_timestamp":
+            data["txn_time_known"] = has_time(value)
         data[name] = {
             "value": value,
             "confidence": 1.0,
@@ -296,6 +301,16 @@ class Evidence(BaseModel):
             "origin": Origin.USER,
         }
         return Evidence.model_validate(data)
+
+
+def has_time(value: Any) -> bool:
+    """True if a date-time value states a time of day ("2026-11-14T18:05", a datetime), False
+    for a bare date ("2026-11-14", a date)."""
+    if isinstance(value, datetime):
+        return True
+    if isinstance(value, str):
+        return "T" in value or ":" in value
+    return False
 
 
 FactName = Literal[

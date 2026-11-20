@@ -21,7 +21,7 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
-from recourse.evidence.models import CaseType, Evidence, SourceKind, TxnStatus
+from recourse.evidence.models import CaseType, Evidence, SourceKind, TxnStatus, has_time
 from recourse.rules.models import Channel, FailedScenario
 from recourse.security.pii import RedactionKind, redact_text
 
@@ -185,6 +185,9 @@ def to_evidence(
             "source_text": source,
         }
 
+    # A bare date ("2026-11-14") becomes midnight; record that the time is not known.
+    time_known = has_time(extraction.txn_timestamp.value) or extraction.txn_timestamp.value is None
+
     dropped: list[str] = []
     for _ in range(len(facts) + 1):
         try:
@@ -194,6 +197,7 @@ def to_evidence(
                     "extracted_by": extracted_by,
                     "notes": _with_drop_notes(notes, dropped),
                     "redactions": sorted(set(input_redactions)),
+                    "txn_time_known": time_known,
                     **facts,
                 }
             )

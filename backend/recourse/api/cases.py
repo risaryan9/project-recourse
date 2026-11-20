@@ -144,6 +144,7 @@ class EvidenceView(BaseModel):
     needs_confirmation: list[str]
     redactions: list[str]
     notes: list[str]
+    txn_time_known: bool  # False: only the date was shown (do not display a time)
 
 
 class TimelineEntry(BaseModel):
@@ -990,6 +991,7 @@ def _evidence_view(record: EvidenceRecord) -> EvidenceView:
         needs_confirmation=check.needs_user_confirmation,
         redactions=[r.value for r in ev.redactions],
         notes=ev.notes,
+        txn_time_known=ev.txn_time_known,
     )
 
 

@@ -406,6 +406,7 @@ class CaseActivities:
                 "attempts": result.attempts,
                 "rules_verified": result.rules_verified,
                 "kind": result.kind.value,
+                "verify_rejections": result.rejected_attempts,
                 "with_feedback": feedback is not None,
                 "models": result.models_used,
             }
@@ -757,6 +758,7 @@ class CaseActivities:
                 sender=reply.sender,
                 bank_domains=list(contact.sender_domains) if contact else [],
                 entitlement=entitlement,
+                disputed_amount_inr=evidence.amount_inr.value,
             )
 
         try:
@@ -794,6 +796,7 @@ class CaseActivities:
                 "injection_found": verdict.injection_found,
                 "sender_check": verdict.sender_check.value,
                 "owed_inr": str(verdict.owed_inr),
+                "owed_basis": verdict.owed_basis.value,
                 "paid_inr": str(verdict.paid_inr),
                 "shortfall_inr": str(verdict.shortfall_inr),
                 "models": verdict.models_used,

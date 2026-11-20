@@ -606,3 +606,34 @@ human always files on cms.rbi.org.in; Recourse drafts and tracks.
 - Status stays `ESCALATION_DRAFT_READY` from drafting until filing (the state query's
   `awaiting_filing` tells the UI to show "file it yourself"), mirroring ADR-012.
 - Fraud cases escalate the same way; their bank timeline (90 or 45/60 days) sets the window.
+
+## ADR-016: Fixes from the first live end-to-end run
+
+### Context
+The first run on real APIs (demo mode, three synthetic cases) worked end to end but showed
+problems the fake-LLM tests could not.
+
+### Decision
+- **Demo calendar.** Each completed demo timer moves the case's calendar on by its days
+  (`CaseWorkflow._today`), so the rule engine sees the waiting period as over. Without it the
+  escalation check looped forever in demo mode.
+- **No invented times.** A bare date in the evidence ("2026-11-16") is still stored as
+  midnight IST (only the date is used by the rules), but `Evidence.txn_time_known` is False and
+  letters get no `txn.datetime` slot. A user correction with a time makes it known.
+- **Sentence-aware rendering.** `render` capitalises a value that starts a sentence, and a
+  clause slot (`txn.problem`, `bank.response`) left at the end of a line gets its full stop.
+  `verify` cannot catch these: it checks values, not grammar. "ATM" reads as "ATM cash
+  withdrawal".
+- **Verify's rejections are kept.** Every rejected attempt's errors go into the
+  `draft.ready` / `draft.failed` audit event (`verify_rejections`). In the run, 4 of 5 drafts
+  needed a second attempt; evals and cost tracking need to know why.
+- **Fraud with an undetermined fault.** The rules fix no amount, so the reply check compares
+  the bank's payment with the disputed transaction amount (`owed_basis: DISPUTED_AMOUNT`). A
+  full refund proposes closing; a shortfall is flagged as `ASK_USER`, not escalated
+  automatically, because the customer may bear part of the loss until the fault is
+  established.
+
+### Consequences
+- Old evidence rows have no `txn_time_known` and default to True (their times were shown
+  before too).
+- `DISPUTED_AMOUNT` is the customer's claim, not a rule figure; the UI must label it so.

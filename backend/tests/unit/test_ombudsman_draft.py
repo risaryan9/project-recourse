@@ -15,13 +15,16 @@ from recourse.agents.draft_graph import (
 )
 from recourse.agents.draft_slots import (
     BANK_RESPONSE_TEXT,
+    CHANNEL_NAMES,
     BankResponse,
     EscalationContext,
     SlotError,
+    build_slots,
+    render,
 )
 from recourse.cases.escalation import escalation_for
 from recourse.llm.fake import FakeLLM
-from recourse.rules.models import BankType
+from recourse.rules.models import BankType, Channel
 from tests.unit.test_draft_graph import TAG, failed_case
 
 LETTER_DATE = date(2026, 12, 19)
@@ -109,3 +112,29 @@ async def test_ombudsman_complaint_needs_the_context() -> None:
             letter_date=LETTER_DATE,
             kind=DraftKind.OMBUDSMAN_COMPLAINT,
         )
+
+
+# --- rendering: the sentence flaws found in the first live run --------------------------------
+
+
+def test_render_capitalises_and_closes_clause_slots() -> None:
+    table = build_slots(
+        ENTITLEMENT, EVIDENCE, case_tag=TAG, letter_date=LETTER_DATE, escalation=context()
+    )
+    text = render(
+        "The transaction reference is {{txn.utr}}. {{txn.problem}}\n\n"
+        "I complained on {{bank.complaint_date}}. However, {{bank.response}}\n\n"
+        "{{bank.response}}, so I write to you.",
+        table,
+    )
+    assert "631845207719. My account was debited but the beneficiary was not credited.\n" in text
+    assert "However, the bank did not resolve my complaint" in text  # not capitalised mid-sentence
+    assert "within the time allowed.\n" in text  # the missing full stop is added
+    assert text.endswith(
+        "The bank did not resolve my complaint or send a substantive reply "
+        "within the time allowed, so I write to you."
+    )
+
+
+def test_atm_channel_reads_as_a_noun() -> None:
+    assert CHANNEL_NAMES[Channel.ATM] == "ATM cash withdrawal"

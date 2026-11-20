@@ -47,7 +47,7 @@ SLOT_LIKE_RE = re.compile(r"\{\{|\}\}|\{[a-z_]+\.[a-z0-9_.]+\}")
 CUSTOMER_NAME_PLACEHOLDER = "[Your full name]"
 
 CHANNEL_NAMES: dict[Channel, str] = {
-    Channel.ATM: "ATM",
+    Channel.ATM: "ATM cash withdrawal",
     Channel.CARD_TO_CARD: "card-to-card transfer",
     Channel.CARD_POS: "card payment at a point of sale",
     Channel.CARD_NOT_PRESENT: "online card payment",
@@ -113,6 +113,9 @@ class Slot:
     description: str  # for the LLM; never contains evidence text
     value: str  # inserted only by `render`
     required: bool = False  # verify fails if the letter does not use it
+    # A lowercase clause ("my account was debited but ..."): `render` capitalises it at the
+    # start of a sentence and ends the sentence if the letter left it open.
+    clause: bool = False
 
 
 @dataclass(frozen=True)
@@ -204,8 +207,10 @@ def build_slots(
 
     slots: dict[str, Slot] = {}
 
-    def add(name: str, description: str, value: str, *, required: bool = False) -> None:
-        slots[name] = Slot(name, description, value, required)
+    def add(
+        name: str, description: str, value: str, *, required: bool = False, clause: bool = False
+    ) -> None:
+        slots[name] = Slot(name, description, value, required, clause)
 
     # --- Case and customer -----------------------------------------------------------------------
     add(
@@ -238,11 +243,12 @@ def build_slots(
             format_date(ev.txn_timestamp.value.astimezone(IST).date()),
             required=True,
         )
-        add(
-            "txn.datetime",
-            "Date and time of the transaction.",
-            format_datetime(ev.txn_timestamp.value),
-        )
+        if ev.txn_time_known:  # never show an invented midnight
+            add(
+                "txn.datetime",
+                "Date and time of the transaction.",
+                format_datetime(ev.txn_timestamp.value),
+            )
     if ev.channel.value is not None:
         add(
             "txn.channel",
@@ -372,8 +378,10 @@ def build_slots(
         if ev.scenario.value is not None:
             add(
                 "txn.problem",
-                "What went wrong, in the customer's words (first person).",
+                "What went wrong, as a first-person clause (e.g. 'my account was debited but "
+                "...'); end the sentence with a full stop after it.",
                 SCENARIO_NAMES[ev.scenario.value],
+                clause=True,
             )
     elif isinstance(det, FraudDetails):
         reply_cite = cite_of(det.regulatory_reply_citation)
@@ -411,10 +419,11 @@ def build_slots(
             )
         add(
             "bank.response",
-            "What the bank did about the complaint, as a first-person clause (e.g. used after "
-            "'However, ').",
+            "What the bank did about the complaint, as a clause (e.g. used after 'However, '); "
+            "end the sentence with a full stop after it.",
             BANK_RESPONSE_TEXT[escalation.bank_response],
             required=True,
+            clause=True,
         )
         if escalation.last_reply_on is not None:
             add(
@@ -449,12 +458,12 @@ def render(template: str, table: SlotTable) -> str:
     """Replace every placeholder with its value. Unknown names raise `KeyError` (verify first).
 
     A citation names its document in full the first time that document appears, and in short
-    form (paragraph + reference number) after that.
+    form (paragraph + reference number) after that. A value that starts a sentence gets a
+    capital letter, and a clause slot left at the end of a line gets its full stop.
     """
     named_docs: set[str] = set()
 
-    def value(m: re.Match[str]) -> str:
-        name = m.group(1)
+    def text_for(name: str) -> str:
         citation = table.citation_slots.get(name)
         if citation is None:
             return table.slots[name].value
@@ -463,7 +472,21 @@ def render(template: str, table: SlotTable) -> str:
         named_docs.add(citation.doc_id)
         return table.slots[name].value
 
+    def value(m: re.Match[str]) -> str:
+        name = m.group(1)
+        text = text_for(name)
+        if _SENTENCE_START_RE.search(m.string[: m.start()]) and text[:1].islower():
+            text = text[0].upper() + text[1:]
+        after = m.string[m.end() :]
+        if table.slots[name].clause and (not after or after[0] == "\n"):
+            text += "."
+        return text
+
     return SLOT_RE.sub(value, template)
+
+
+# Text before a placeholder that puts it at the start of a sentence (or of a line).
+_SENTENCE_START_RE = re.compile(r"(?:\A|[.!?]\s+|\n\s*)\Z")
 
 
 def strip_slots(template: str) -> str:

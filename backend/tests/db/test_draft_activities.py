@@ -17,7 +17,7 @@ from temporalio.exceptions import ApplicationError
 from recourse.agents.draft_graph import DRAFT_PURPOSE, MAX_ATTEMPTS, DraftStatus
 from recourse.agents.draft_slots import CUSTOMER_NAME_PLACEHOLDER
 from recourse.cases.review import Confirmation
-from recourse.db.models import Case, CaseStatus, DraftRecord, DraftRecordStatus
+from recourse.db.models import AuditEvent, Case, CaseStatus, DraftRecord, DraftRecordStatus
 from recourse.llm.fake import FakeLLM
 from recourse.temporal.case_activities import CaseActivities
 from recourse.temporal.case_types import (
@@ -173,3 +173,21 @@ async def test_reject_then_redraft_uses_the_reason(
     async with sessions() as s:
         rows = (await s.scalars(select(DraftRecord).order_by(DraftRecord.seq))).all()
         assert [r.status for r in rows] == [DraftRecordStatus.REJECTED, DraftRecordStatus.PENDING]
+
+
+async def test_verify_rejections_are_kept_in_the_audit_event(
+    sessions: async_sessionmaker[AsyncSession],
+) -> None:
+    case_id = await assessed_case(sessions)
+    acts, _ = drafter(sessions, BAD_TEMPLATE, GOOD_FAILED.model_dump())
+    summary = await run(acts.draft, DraftInput(case_id=case_id, seq=1, letter_date=LETTER_DATE))
+    assert summary.status is DraftStatus.DRAFTED
+    async with sessions() as s:
+        details = await s.scalar(
+            select(AuditEvent.details).where(
+                AuditEvent.case_id == case_id, AuditEvent.event_type == "draft.ready"
+            )
+        )
+    assert details is not None and details["attempts"] == 2
+    [rejected] = details["verify_rejections"]
+    assert any("digit" in e for e in rejected)

@@ -251,6 +251,9 @@ async def test_revises_with_the_error_list_then_accepts() -> None:
     second = fake.calls_for(DRAFT_PURPOSE)[1].prompt.user_text
     assert "rejected by the automatic checker" in second
     assert "digit" in second and "money.total" in second
+    # The rejected first attempt's reasons are kept, though the draft passed in the end.
+    [rejected] = result.rejected_attempts
+    assert any("digit" in e for e in rejected)
 
 
 async def test_fails_closed_after_max_attempts() -> None:
@@ -263,6 +266,7 @@ async def test_fails_closed_after_max_attempts() -> None:
     assert result.attempts == MAX_ATTEMPTS
     assert result.subject is None and result.body is None and result.template is None
     assert any("money.bonus" in e for e in result.errors)
+    assert len(result.rejected_attempts) == MAX_ATTEMPTS
     assert fake.unused == {}
 
 

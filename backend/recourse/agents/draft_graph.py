@@ -90,6 +90,9 @@ class DraftResult(BaseModel):
     disclaimer: str = DISCLAIMER
     # Set when FAILED: the last attempt's verify errors.
     errors: list[str] = Field(default_factory=list)
+    # Verify's errors for every rejected attempt, in order (also when the draft passed later):
+    # how often and why the model needed another try.
+    rejected_attempts: list[list[str]] = Field(default_factory=list)
     models_used: list[str] = Field(default_factory=list)
 
 
@@ -266,6 +269,7 @@ class DraftState(TypedDict, total=False):
     attempts: int
     template: DraftTemplate
     errors: list[str]
+    rejected: list[list[str]]
     models_used: list[str]
     result: DraftResult
 
@@ -295,7 +299,9 @@ def build_draft_graph(llm: LLMClient) -> DraftGraph:
 
     def check(state: DraftState) -> dict[str, Any]:
         t = state["template"]
-        return {"errors": verify(t.subject, t.body, state["table"]).errors}
+        errors = verify(t.subject, t.body, state["table"]).errors
+        rejected = state.get("rejected", [])
+        return {"errors": errors, "rejected": [*rejected, errors] if errors else rejected}
 
     def route(state: DraftState) -> str:
         if not state["errors"]:
@@ -315,6 +321,7 @@ def build_draft_graph(llm: LLMClient) -> DraftGraph:
             slots_used=used,
             user_fill=[n for n in used if n == "customer.name"],
             rules_verified=state["entitlement"].all_verified,
+            rejected_attempts=state.get("rejected", []),
             models_used=state["models_used"],
         )
         return {"result": result}
@@ -326,6 +333,7 @@ def build_draft_graph(llm: LLMClient) -> DraftGraph:
             attempts=state["attempts"],
             rules_verified=state["entitlement"].all_verified,
             errors=state["errors"],
+            rejected_attempts=state.get("rejected", []),
             models_used=state["models_used"],
         )
         return {"result": result}
