@@ -663,3 +663,34 @@ ownership anyone who can reach the API could list or open every case.
   accounts. Connecting Gmail can later attach to the same owner ID.
 - The token is a bearer secret: anyone with the cookie has the cases. It never appears in logs
   or in the database.
+
+## ADR-018: The app frontend, and when the owner token is issued
+
+### Context
+The app (cases list, new case, case page, settings) talks to the API from the browser. The
+first browser run showed a race: on a first visit, several requests left without a cookie, each
+minted its own owner token, and a late response could replace the token a case had just been
+created with. That browser then got 404 for its own case.
+
+### Decision
+- **Only creating a case issues a token** (`get_owner`). Every other route reads it
+  (`current_owner`): no cookie means no cases (`GET /cases` → `[]`, `DELETE /cases` → 0) and
+  404 for any case. A single user action cannot race itself, and an existing token is never
+  replaced.
+- `GET /config` exposes only the flags the UI needs to label itself honestly (sandbox, demo
+  mode, day length). `DELETE /cases` terminates the browser's workflows, then deletes its cases
+  (cascading to evidence, drafts, emails, replies, audit events). Temporal keeps its own
+  history until its retention period ends.
+- **The case page shows one next step.** A "Next action" panel picks a single action from the
+  case's live state (workflow query + database), so the user never has to know the state
+  machine. It polls every 2.5 s while the case can still change, pauses in a hidden tab and
+  stops once the case has ended.
+- Plain language everywhere: statuses, timeline events, facts and enums are mapped to everyday
+  words in `frontend/lib/labels.ts`; internal names never reach the screen.
+- `/cases/[id]` reads `params` inside `<Suspense>`, and the nav (which reads the path) is in a
+  Suspense boundary too, as Next.js 16 with `cacheComponents` requires.
+
+### Consequences
+- Clearing cookies still loses access to one's cases (ADR-017).
+- The review form re-sends every field it asks the user to check, because the backend clears a
+  low-confidence flag only when the value comes back as a correction.

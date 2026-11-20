@@ -63,8 +63,11 @@ See [docs/architecture.md](docs/architecture.md) and [docs/decisions.md](docs/de
 
 ### Configuration
 ```bash
-cp .env.example .env   # fill in API keys when needed; the skeleton runs without them
+cp .env.example .env
 ```
+Fill in `ANTHROPIC_API_KEY` (and `OPENAI_API_KEY` for the fallback), `DATABASE_URL`, and
+`SANDBOX_RECIPIENT` (a test inbox of your own). With the sandbox on (the default), every letter
+is addressed to that inbox; without it, the send step stays blocked.
 
 ### Start the services (separate terminals)
 ```bash
@@ -79,6 +82,12 @@ uv run fastapi dev recourse/api/main.py          # API at http://localhost:8000
 # 3. Frontend (http://localhost:3000)
 cd frontend && npm install && npm run dev
 ```
+
+Open http://localhost:3000 and choose **Start a case**: paste a bank SMS (synthetic data only)
+or upload a screenshot. The case page shows one next step at a time: check the facts, approve
+the letter, send it yourself and mark it sent, paste the bank's reply, and, if needed, file the
+complaint with the RBI Ombudsman yourself. `/status` shows whether the API and Temporal are up.
+Cases belong to the browser that created them (an anonymous cookie; no account).
 
 Smoke-test the workflow (it then shows up in the Temporal UI):
 ```bash
@@ -114,6 +123,7 @@ neon checkout dev
 ```bash
 cd backend
 uv run pytest -q          # unit + workflow tests; no network or API keys needed
+uv run pytest -q -m db    # database and API tests on the Neon test branch (TEST_DATABASE_URL)
 uv run ruff check . && uv run mypy recourse tests
 
 cd frontend && npm run lint && npm run build
