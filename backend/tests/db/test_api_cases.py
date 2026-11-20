@@ -8,7 +8,7 @@ from __future__ import annotations
 import uuid
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import date, datetime
 from typing import Any
 
 import httpx
@@ -18,26 +18,32 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from temporalio.testing import ActivityEnvironment
 
 from recourse.agents.draft_graph import DRAFT_PURPOSE
+from recourse.agents.reply_judge_graph import NextAction, ReplyLabel
 from recourse.api.deps import get_runner, get_session_factory
 from recourse.api.main import create_app
 from recourse.config import Settings
-from recourse.db.models import Case, CaseStatus, DraftRecord, Upload, UploadFile
+from recourse.db.models import BankReply, Case, CaseStatus, DraftRecord, Upload, UploadFile
 from recourse.evidence.models import IST
 from recourse.llm.fake import FakeLLM
 from recourse.temporal.case_activities import CaseActivities
 from recourse.temporal.case_types import (
     AbandonRequest,
     AssessInput,
+    BankReplied,
     CaseInput,
     CaseState,
     Confirmation,
     ConfirmInput,
     DraftDecisionInput,
     DraftInput,
+    EscalationInput,
+    MarkResolved,
     MarkSent,
     PrepareSendInput,
+    ReplySummary,
     RunIntakeInput,
 )
+from tests.db.test_bank_wait_activities import sent_case
 from tests.db.test_case_activities import NONE, sms_llm
 from tests.unit.test_draft_graph import GOOD_FAILED
 
@@ -60,6 +66,11 @@ class FakeRunner:
     fail_start: bool = False
     last_error: str | None = None
     can_redraft: bool = False
+    replies: list[BankReplied] = field(default_factory=list)
+    resolved: list[MarkResolved] = field(default_factory=list)
+    escalations: list[uuid.UUID] = field(default_factory=list)
+    can_escalate: bool = False
+    last_reply: ReplySummary | None = None
 
     async def start(self, inp: CaseInput) -> None:
         if self.fail_start:
@@ -87,12 +98,23 @@ class FakeRunner:
     async def retry_send(self, case_id: uuid.UUID) -> None:
         self.retries.append(case_id)
 
+    async def bank_replied(self, case_id: uuid.UUID, reply: BankReplied) -> None:
+        self.replies.append(reply)
+
+    async def mark_resolved(self, case_id: uuid.UUID, mark: MarkResolved) -> None:
+        self.resolved.append(mark)
+
+    async def escalate(self, case_id: uuid.UUID) -> None:
+        self.escalations.append(case_id)
+
     async def state(self, case_id: uuid.UUID) -> CaseState | None:
         return CaseState(
             status=CaseStatus.EXTRACTED,
             last_error=self.last_error,
             can_redraft=self.can_redraft,
             can_retry_send=self.can_retry_send,
+            can_escalate=self.can_escalate,
+            last_reply=self.last_reply,
         )
 
 
@@ -406,3 +428,62 @@ async def test_manual_send_through_the_api(
     assert (await client.post(f"/cases/{case_id}/email/retry")).status_code == 409
     runner.can_retry_send = True
     assert (await client.post(f"/cases/{case_id}/email/retry")).status_code == 202
+
+
+async def test_bank_reply_resolve_and_escalate_through_the_api(
+    api: tuple[httpx.AsyncClient, FakeRunner], sessions: async_sessionmaker[AsyncSession]
+) -> None:
+    client, runner = api
+    case_id = await sent_case(sessions)
+    reply = {"text": "Complaint registered. OTP 482913 was used. Ref CMP48213."}
+    # Not waiting for the bank yet (SENT_TO_BANK until the workflow starts the timer).
+    assert (await client.post(f"/cases/{case_id}/bank-reply", json=reply)).status_code == 409
+
+    acts = CaseActivities(sessions, FakeLLM({}))
+    await ActivityEnvironment().run(
+        acts.assess_escalation,
+        EscalationInput(
+            case_id=case_id,
+            as_of=date(2026, 11, 17),
+            event="bank.wait_started",
+            new_status=CaseStatus.AWAITING_BANK,
+        ),
+    )
+    view = (await client.get(f"/cases/{case_id}")).json()
+    assert view["status"] == "AWAITING_BANK"
+    assert view["bank_complained_on"] == "2026-11-17"
+    assert view["escalation"]["eligible_from"] == "2026-12-18"
+
+    early = reply | {"received_at": "2026-11-01T10:00:00+05:30"}
+    assert (await client.post(f"/cases/{case_id}/bank-reply", json=early)).status_code == 422
+    bad_sender = reply | {"sender": "not-an-address"}
+    assert (await client.post(f"/cases/{case_id}/bank-reply", json=bad_sender)).status_code == 422
+
+    r = await client.post(f"/cases/{case_id}/bank-reply", json=reply)
+    assert r.status_code == 202, r.text
+    assert r.json()["redactions"] == ["SECRET_CODE"]
+    [signal] = runner.replies
+    assert str(signal.reply_id) == r.json()["id"]
+    [stored] = (await client.get(f"/cases/{case_id}/replies")).json()
+    assert "482913" not in stored["text"] and stored["status"] == "PENDING"
+
+    # Escalating needs the workflow to be asking.
+    assert (await client.post(f"/cases/{case_id}/escalate")).status_code == 409
+    runner.can_escalate = True
+    runner.last_reply = ReplySummary(
+        reply_id=signal.reply_id,
+        label=ReplyLabel.REJECTED_WITH_REASONS,
+        next_action=NextAction.ASK_USER,
+        suspicious=False,
+    )
+    assert (await client.post(f"/cases/{case_id}/escalate")).status_code == 202
+    assert runner.escalations == [case_id]
+    async with sessions() as s:
+        row = await s.get(BankReply, signal.reply_id)
+        assert row is not None and row.unsatisfactory
+
+    bad = {"amount_received_inr": "-1"}
+    assert (await client.post(f"/cases/{case_id}/resolved", json=bad)).status_code == 422
+    ok = {"amount_received_inr": "2750.00"}
+    assert (await client.post(f"/cases/{case_id}/resolved", json=ok)).status_code == 202
+    assert [m.amount_received_inr for m in runner.resolved] == [2750]

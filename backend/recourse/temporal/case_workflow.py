@@ -23,8 +23,14 @@
         ▼
     assess_escalation (rule engine) → AWAITING_BANK: timer until the Ombudsman waiting period
         │                              ends (30 days, or the bank's longer timeline for fraud)
-        ▼ timer fires
-    bank_wait_expired → wait (escalation is the next step)
+        │  bank_replied → judge_reply (ReplyJudgeGraph) → next action:
+        │     WARN / KEEP_WAITING / USER_ACTION → keep waiting (the timer keeps running)
+        │     PROPOSE_RESOLVED / ASK_USER → JUDGED: the user decides (`mark_resolved`,
+        │                                   `escalate` or `abandon`); no timer
+        │     ESCALATE → escalation
+        │  mark_resolved (any time) → record_resolved → RESOLVED (the workflow ends)
+        ▼ timer fires (bank_wait_expired) or escalation chosen
+    escalation → wait (the Ombudsman draft is the next step)
 
 An `abandon` signal ends the case from any waiting point. Every status change is written to the
 database by the activity that causes it (with an audit event), so the API reads the database
@@ -45,6 +51,7 @@ from temporalio.exceptions import ActivityError, ApplicationError
 with workflow.unsafe.imports_passed_through():
     from recourse.agents.draft_graph import DraftStatus
     from recourse.agents.intake_graph import IntakeStatus
+    from recourse.agents.reply_judge_graph import NextAction
     from recourse.cases.drafts import MAX_DRAFTS_PER_CASE
     from recourse.db.models import Actor, CaseStatus, OutboundStatus
     from recourse.evidence.models import IST
@@ -55,14 +62,17 @@ with workflow.unsafe.imports_passed_through():
         CONFIRM,
         DRAFT,
         INVALID_USER_INPUT,
+        JUDGE_REPLY,
         MARK_ABANDONED,
         PREPARE_SEND,
+        RECORD_RESOLVED,
         RECORD_SENT,
         REJECT_DRAFT,
         RUN_INTAKE,
         AbandonRequest,
         AssessInput,
         AssessSummary,
+        BankReplied,
         CaseInput,
         CaseOutcome,
         CaseState,
@@ -76,10 +86,14 @@ with workflow.unsafe.imports_passed_through():
         EscalationInput,
         EscalationSummary,
         IntakeSummary,
+        JudgeReplyInput,
         MarkAbandonedInput,
+        MarkResolved,
         MarkSent,
         PrepareSendInput,
+        RecordResolvedInput,
         RecordSentInput,
+        ReplySummary,
         RunIntakeInput,
         SendSummary,
     )
@@ -143,6 +157,12 @@ class CaseWorkflow:
         self._eligible_from: date | None = None
         self._filing_deadline: date | None = None
         self._bank_wait_expired = False
+        self._replies: list[BankReplied] = []
+        self._last_reply: ReplySummary | None = None
+        self._resolved: list[MarkResolved] = []
+        self._escalate = False
+        self._can_escalate = False
+        self._awaiting_bank = False  # bank_replied / mark_resolved are accepted
 
     # --- signals & queries ----------------------------------------------------------------------
 
@@ -172,6 +192,21 @@ class CaseWorkflow:
         if self._can_retry_send:
             self._retry_send = True
 
+    @workflow.signal(name="bank_replied")
+    def bank_replied(self, reply: BankReplied) -> None:
+        if self._awaiting_bank:
+            self._replies.append(reply)
+
+    @workflow.signal(name="mark_resolved")
+    def mark_resolved(self, mark: MarkResolved) -> None:
+        if self._awaiting_bank:
+            self._resolved.append(mark)
+
+    @workflow.signal(name="escalate")
+    def escalate(self) -> None:
+        if self._can_escalate:
+            self._escalate = True
+
     @workflow.signal(name="abandon")
     def abandon(self, request: AbandonRequest) -> None:
         if self._abandon is None:
@@ -194,6 +229,8 @@ class CaseWorkflow:
             escalation_eligible_from=self._eligible_from,
             filing_deadline=self._filing_deadline,
             bank_wait_expired=self._bank_wait_expired,
+            last_reply=self._last_reply,
+            can_escalate=self._can_escalate,
         )
 
     # --- main flow --------------------------------------------------------------------------------
@@ -258,9 +295,13 @@ class CaseWorkflow:
                     return await self._end(inp, self._abandon.reason, Actor.USER)
                 self._status = CaseStatus.SENT_TO_BANK
                 # 6. Wait for the bank's reply, within the window the rules give it.
-                if workflow.patched("bank-wait-v1") and not await self._wait_for_bank(inp):
-                    assert self._abandon is not None
-                    return await self._end(inp, self._abandon.reason, Actor.USER)
+                if workflow.patched("bank-wait-v1"):
+                    result = await self._wait_for_bank(inp)
+                    if result == "abandoned":
+                        assert self._abandon is not None
+                        return await self._end(inp, self._abandon.reason, Actor.USER)
+                    if result == "resolved":
+                        return CaseOutcome(status=CaseStatus.RESOLVED)
 
         # 7. Next milestone (escalation) plugs in here. Until then: wait.
         await workflow.wait_condition(lambda: self._abandoned)
@@ -412,29 +453,96 @@ class CaseWorkflow:
 
     # --- the bank's reply window -----------------------------------------------------------------
 
-    async def _wait_for_bank(self, inp: CaseInput) -> bool:
-        """AWAITING_BANK until the Ombudsman waiting period ends. False = abandoned."""
+    async def _wait_for_bank(self, inp: CaseInput) -> str:
+        """AWAITING_BANK until the Ombudsman waiting period ends, handling the bank's replies.
+
+        Returns "abandoned", "resolved" or "escalate".
+        """
         summary = await self._assess_escalation(inp, "bank.wait_started", CaseStatus.AWAITING_BANK)
         self._status = CaseStatus.AWAITING_BANK
-        if summary is None:
-            # Could not work out the window: say so and keep the case open.
-            await workflow.wait_condition(lambda: self._abandoned)
-            return False
+        self._awaiting_bank = True
+        # Without a window (activity error) there is no timer: replies are still handled.
+        deadline = (
+            workflow.now() + days(summary.wait_days, _scale(inp)) if summary is not None else None
+        )
+        judged = False  # JUDGED: the user decides, the timer is paused
 
-        deadline = workflow.now() + days(summary.wait_days, _scale(inp))
-        while not self._abandoned:
-            remaining = deadline - workflow.now()
-            if remaining <= timedelta(0):
-                break
-            try:
-                await workflow.wait_condition(lambda: self._abandoned, timeout=remaining)
-            except TimeoutError:
-                break
-        if self._abandoned:
-            return False
+        def woken() -> bool:
+            return bool(self._replies or self._resolved) or self._escalate or self._abandoned
 
-        self._bank_wait_expired = True
-        await self._assess_escalation(inp, "bank.wait_expired", None)
+        while True:
+            timeout = None if judged or deadline is None else deadline - workflow.now()
+            if timeout is not None and timeout <= timedelta(0):
+                self._bank_wait_expired = True
+            else:
+                try:
+                    await workflow.wait_condition(woken, timeout=timeout)
+                except TimeoutError:
+                    self._bank_wait_expired = True
+
+            if self._abandoned:
+                return "abandoned"
+            if self._resolved:
+                if await self._record_resolved(inp, self._resolved.pop(0)):
+                    self._awaiting_bank = self._can_escalate = False
+                    self._status = CaseStatus.RESOLVED
+                    return "resolved"
+                continue
+            if self._escalate:
+                self._escalate = False
+                await self._assess_escalation(inp, "case.escalation_chosen", None)
+                break
+            if self._bank_wait_expired:
+                await self._assess_escalation(inp, "bank.wait_expired", None)
+                break
+            if not self._replies:
+                continue
+
+            reply = await self._judge(inp, self._replies.pop(0))
+            if reply is None:
+                continue
+            self._last_reply = reply
+            if not reply.suspicious:
+                await self._assess_escalation(inp, "bank.replied", None)
+            action = reply.next_action
+            if action is NextAction.ESCALATE:
+                self._status = CaseStatus.JUDGED
+                break
+            if action in (NextAction.PROPOSE_RESOLVED, NextAction.ASK_USER):
+                self._status = CaseStatus.JUDGED
+                self._can_escalate = judged = True
+            # WARN / KEEP_WAITING / USER_ACTION: keep waiting with the timer.
+
+        self._awaiting_bank = self._can_escalate = False
+        return "escalate"
+
+    async def _judge(self, inp: CaseInput, reply: BankReplied) -> ReplySummary | None:
+        try:
+            summary: ReplySummary = await workflow.execute_activity(
+                JUDGE_REPLY,
+                JudgeReplyInput(case_id=inp.case_id, reply_id=reply.reply_id),
+                result_type=ReplySummary,
+                start_to_close_timeout=LLM_TIMEOUT,
+                retry_policy=LLM_RETRY,
+            )
+        except ActivityError as err:
+            self._last_error = f"The bank's reply could not be checked: {_error_message(err)}"
+            return None
+        self._last_error = None
+        return summary
+
+    async def _record_resolved(self, inp: CaseInput, mark: MarkResolved) -> bool:
+        try:
+            await workflow.execute_activity(
+                RECORD_RESOLVED,
+                RecordResolvedInput(case_id=inp.case_id, mark=mark, now=workflow.now()),
+                start_to_close_timeout=DB_TIMEOUT,
+                retry_policy=DB_RETRY,
+            )
+        except ActivityError as err:
+            self._last_error = _error_message(err)
+            return False
+        self._last_error = None
         return True
 
     async def _assess_escalation(

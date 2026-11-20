@@ -32,6 +32,7 @@ PREPARE_SEND = "case.prepare_send"
 RECORD_SENT = "case.record_sent"
 ASSESS_ESCALATION = "case.assess_escalation"
 JUDGE_REPLY = "case.judge_reply"
+RECORD_RESOLVED = "case.record_resolved"
 
 # Error type for ApplicationErrors caused by bad user input (never retried).
 INVALID_USER_INPUT = "InvalidUserInput"
@@ -75,6 +76,18 @@ class MarkSent(_Model):
     sent_at: datetime
 
 
+class BankReplied(_Model):
+    """Payload of `bank_replied`. Only the ID: the reply text is stored by the API."""
+
+    reply_id: uuid.UUID
+
+
+class MarkResolved(_Model):
+    """Payload of `mark_resolved`: the user says they received their money."""
+
+    amount_received_inr: Decimal = Field(ge=0, max_digits=14, decimal_places=2)
+
+
 class CaseState(_Model):
     status: CaseStatus
     needs_confirmation: list[str] = Field(default_factory=list)
@@ -91,6 +104,8 @@ class CaseState(_Model):
     escalation_eligible_from: date | None = None  # the timer ends at the start of this day
     filing_deadline: date | None = None  # last day to complain to the RBI Ombudsman
     bank_wait_expired: bool = False  # the bank did not reply within its window
+    last_reply: ReplySummary | None = None  # the verdict on the latest bank reply
+    can_escalate: bool = False  # the user may choose to escalate (`escalate` signal)
 
 
 # --- activities -------------------------------------------------------------------------------
@@ -207,6 +222,12 @@ class ReplySummary(_Model):
     complaint_number: str | None = None
 
 
+class RecordResolvedInput(_Model):
+    case_id: uuid.UUID
+    mark: MarkResolved
+    now: datetime
+
+
 class MarkAbandonedInput(_Model):
     case_id: uuid.UUID
     reason: str
@@ -216,3 +237,6 @@ class MarkAbandonedInput(_Model):
 class CaseOutcome(_Model):
     status: CaseStatus
     reason: str | None = None
+
+
+CaseState.model_rebuild()

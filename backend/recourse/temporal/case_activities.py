@@ -73,6 +73,7 @@ from recourse.temporal.case_types import (
     JUDGE_REPLY,
     MARK_ABANDONED,
     PREPARE_SEND,
+    RECORD_RESOLVED,
     RECORD_SENT,
     REJECT_DRAFT,
     RUN_INTAKE,
@@ -89,6 +90,7 @@ from recourse.temporal.case_types import (
     JudgeReplyInput,
     MarkAbandonedInput,
     PrepareSendInput,
+    RecordResolvedInput,
     RecordSentInput,
     ReplySummary,
     RunIntakeInput,
@@ -136,6 +138,7 @@ class CaseActivities:
             self.record_sent,
             self.assess_escalation,
             self.judge_reply,
+            self.record_resolved,
             self.mark_abandoned,
         ]
 
@@ -728,6 +731,35 @@ class CaseActivities:
             else:
                 record_event(s, case.id, Actor.AGENT, "reply.judged", info)
             return _reply_summary(reply)
+
+    @activity.defn(name=RECORD_RESOLVED)
+    async def record_resolved(self, inp: RecordResolvedInput) -> None:
+        """The user says they received their money: the case is RESOLVED.
+
+        Records what was received next to what the rule engine says was owed. The raw upload
+        is deleted (the extracted, redacted evidence stays). Idempotent.
+        """
+        async with self._sessions.begin() as s:
+            case = await _case_for_update(s, inp.case_id)
+            if case.status is CaseStatus.RESOLVED:
+                return
+            if case.status not in (CaseStatus.AWAITING_BANK, CaseStatus.JUDGED):
+                raise invalid(f"A case that is {case.status.value} cannot be marked resolved.")
+            ent_row = await s.scalar(
+                select(EntitlementRecord).where(EntitlementRecord.case_id == case.id)
+            )
+            await s.execute(delete(Upload).where(Upload.case_id == case.id))
+            case.status = CaseStatus.RESOLVED
+            record_event(
+                s,
+                case.id,
+                Actor.USER,
+                "case.resolved",
+                {
+                    "amount_received_inr": str(inp.mark.amount_received_inr),
+                    "owed_inr_at_assessment": str(ent_row.total_owed_inr) if ent_row else None,
+                },
+            )
 
     def _bank_for(self, bank_id: str | None, extracted_name: str | None) -> BankContact | None:
         if bank_id is not None:

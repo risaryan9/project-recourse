@@ -21,8 +21,10 @@ from recourse.temporal.case_activities import CaseActivities
 from recourse.temporal.case_types import (
     EscalationInput,
     JudgeReplyInput,
+    MarkResolved,
     MarkSent,
     PrepareSendInput,
+    RecordResolvedInput,
     RecordSentInput,
 )
 from tests.db.test_case_activities import NOW, events, run
@@ -223,3 +225,28 @@ async def test_phishing_reply_is_flagged_without_the_llm(
         EscalationInput(case_id=case_id, as_of=TODAY, event="bank.replied"),
     )
     assert esc.eligible_from == date(2026, 12, 18)
+
+
+async def test_record_resolved(sessions: async_sessionmaker[AsyncSession]) -> None:
+    case_id = await sent_case(sessions)
+    acts = sender(sessions, SANDBOX)
+    mark = RecordResolvedInput(
+        case_id=case_id, mark=MarkResolved(amount_received_inr=Decimal("2750")), now=NOW
+    )
+    with pytest.raises(ApplicationError, match="cannot be marked resolved"):
+        await run(acts.record_resolved, mark)  # still SENT_TO_BANK: the timer has not started
+    await run(
+        acts.assess_escalation,
+        EscalationInput(
+            case_id=case_id,
+            as_of=TODAY,
+            event="bank.wait_started",
+            new_status=CaseStatus.AWAITING_BANK,
+        ),
+    )
+    await run(acts.record_resolved, mark)
+    await run(acts.record_resolved, mark)  # idempotent
+    async with sessions() as s:
+        case = await s.get(Case, case_id)
+        assert case is not None and case.status is CaseStatus.RESOLVED
+        assert (await events(s, case_id)).count("case.resolved") == 1

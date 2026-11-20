@@ -21,6 +21,7 @@ from temporalio.worker import Replayer, Worker
 
 from recourse.agents.draft_graph import DraftStatus
 from recourse.agents.intake_graph import IntakeStatus
+from recourse.agents.reply_judge_graph import NextAction, ReplyLabel
 from recourse.cases.assessment import CaseDetails
 from recourse.cases.drafts import MAX_DRAFTS_PER_CASE
 from recourse.db.models import Actor, CaseStatus, OutboundStatus
@@ -33,14 +34,17 @@ from recourse.temporal.case_types import (
     CONFIRM,
     DRAFT,
     INVALID_USER_INPUT,
+    JUDGE_REPLY,
     MARK_ABANDONED,
     PREPARE_SEND,
+    RECORD_RESOLVED,
     RECORD_SENT,
     REJECT_DRAFT,
     RUN_INTAKE,
     AbandonRequest,
     AssessInput,
     AssessSummary,
+    BankReplied,
     CaseInput,
     CaseOutcome,
     CaseState,
@@ -54,10 +58,14 @@ from recourse.temporal.case_types import (
     EscalationInput,
     EscalationSummary,
     IntakeSummary,
+    JudgeReplyInput,
     MarkAbandonedInput,
+    MarkResolved,
     MarkSent,
     PrepareSendInput,
+    RecordResolvedInput,
     RecordSentInput,
+    ReplySummary,
     RunIntakeInput,
     SendSummary,
     TimeScaleInput,
@@ -88,6 +96,8 @@ class FakeActivities:
     prepare: list[Any] = field(default_factory=lambda: [prepared()])
     record: list[Any] = field(default_factory=lambda: [None])
     escalation: list[Any] = field(default_factory=list)  # empty → `waiting()`
+    judge: list[Any] = field(default_factory=list)
+    resolved: list[Any] = field(default_factory=lambda: [None])
     calls: list[tuple[str, Any]] = field(default_factory=list)
 
     def _next(self, name: str, script: list[Any], arg: Any) -> Any:
@@ -143,6 +153,15 @@ class FakeActivities:
             result: EscalationSummary = self._next(ASSESS_ESCALATION, self.escalation, inp)
             return result
 
+        @activity.defn(name=JUDGE_REPLY)
+        async def judge_reply(inp: JudgeReplyInput) -> ReplySummary:
+            result: ReplySummary = self._next(JUDGE_REPLY, self.judge, inp)
+            return result
+
+        @activity.defn(name=RECORD_RESOLVED)
+        async def record_resolved(inp: RecordResolvedInput) -> None:
+            self._next(RECORD_RESOLVED, self.resolved, inp)
+
         @activity.defn(name=MARK_ABANDONED)
         async def mark_abandoned(inp: MarkAbandonedInput) -> None:
             self.calls.append((MARK_ABANDONED, inp))
@@ -157,6 +176,8 @@ class FakeActivities:
             prepare_send,
             record_sent,
             assess_escalation,
+            judge_reply,
+            record_resolved,
             mark_abandoned,
         ]
 
@@ -713,3 +734,149 @@ async def test_escalation_error_keeps_the_case_open(env: WorkflowEnvironment) ->
         assert not state.bank_wait_expired
         await handle.signal(CaseWorkflow.abandon, AbandonRequest())
         await handle.result()
+
+
+# =================================================================================================
+# Bank replies
+# =================================================================================================
+
+
+def verdict(action: NextAction, label: ReplyLabel = ReplyLabel.UNCLEAR) -> ReplySummary:
+    return ReplySummary(
+        reply_id=uuid.uuid4(),
+        label=label,
+        next_action=action,
+        suspicious=action is NextAction.WARN,
+        warnings=["This looks like a scam."] if action is NextAction.WARN else [],
+    )
+
+
+def events(fakes: FakeActivities) -> list[str]:
+    return [a.event for n, a in fakes.calls if n == ASSESS_ESCALATION]
+
+
+async def reply(handle: WorkflowHandle[Any, Any]) -> None:
+    await handle.signal(CaseWorkflow.bank_replied, BankReplied(reply_id=uuid.uuid4()))
+
+
+async def test_acknowledgement_keeps_the_timer_running(env: WorkflowEnvironment) -> None:
+    ack = verdict(NextAction.KEEP_WAITING, ReplyLabel.ACKNOWLEDGEMENT)
+    fakes = FakeActivities(judge=[ack])
+    async with worker(env, fakes):
+        handle = await to_awaiting_bank(env, fakes)
+        await env.sleep(timedelta(days=10))
+        await reply(handle)
+        state = await wait_for(handle, lambda s: s.last_reply is not None)
+        assert state.last_reply == ack and state.status is CaseStatus.AWAITING_BANK
+        await env.sleep(timedelta(days=21))  # 31 days after sending
+        await wait_for(handle, lambda s: s.bank_wait_expired)
+        await handle.signal(CaseWorkflow.abandon, AbandonRequest())
+        await handle.result()
+        history = await handle.fetch_history()
+    assert events(fakes) == ["bank.wait_started", "bank.replied", "bank.wait_expired"]
+    await Replayer(
+        workflows=[CaseWorkflow], data_converter=pydantic_data_converter
+    ).replay_workflow(history)
+
+
+async def test_phishing_reply_only_warns_then_user_resolves(env: WorkflowEnvironment) -> None:
+    fakes = FakeActivities(judge=[verdict(NextAction.WARN)])
+    async with worker(env, fakes):
+        handle = await to_awaiting_bank(env, fakes)
+        await reply(handle)
+        state = await wait_for(handle, lambda s: s.last_reply is not None)
+        assert state.last_reply is not None and state.last_reply.warnings
+        assert state.status is CaseStatus.AWAITING_BANK and not state.can_escalate
+
+        await handle.signal(CaseWorkflow.mark_resolved, MarkResolved(amount_received_inr=2750))
+        outcome: CaseOutcome = await handle.result()
+    assert outcome.status is CaseStatus.RESOLVED
+    # A suspicious reply is not a bank communication: no re-assessment for it.
+    assert events(fakes) == ["bank.wait_started"]
+    resolved: RecordResolvedInput = next(a for n, a in fakes.calls if n == RECORD_RESOLVED)
+    assert resolved.mark.amount_received_inr == 2750
+    assert MARK_ABANDONED not in fakes.names()
+
+
+async def test_non_compliant_reply_escalates(env: WorkflowEnvironment) -> None:
+    fakes = FakeActivities(judge=[verdict(NextAction.ESCALATE, ReplyLabel.PARTIAL)])
+    async with worker(env, fakes):
+        handle = await to_awaiting_bank(env, fakes)
+        await reply(handle)
+        state = await wait_for(handle, lambda s: s.status is CaseStatus.JUDGED)
+        assert not state.can_escalate  # already escalating, no question for the user
+        await handle.signal(CaseWorkflow.abandon, AbandonRequest())
+        await handle.result()
+    assert events(fakes) == ["bank.wait_started", "bank.replied"]
+
+
+async def test_rejection_with_reasons_waits_for_the_user(env: WorkflowEnvironment) -> None:
+    fakes = FakeActivities(judge=[verdict(NextAction.ASK_USER, ReplyLabel.REJECTED_WITH_REASONS)])
+    async with worker(env, fakes):
+        handle = await to_awaiting_bank(env, fakes)
+        await reply(handle)
+        state = await wait_for(handle, lambda s: s.can_escalate)
+        assert state.status is CaseStatus.JUDGED
+        await env.sleep(timedelta(days=60))  # the timer is paused while the user decides
+        state = await handle.query(CaseWorkflow.get_state)
+        assert not state.bank_wait_expired and state.can_escalate
+
+        await handle.signal(CaseWorkflow.escalate)
+        await wait_for(handle, lambda s: not s.can_escalate)
+        await handle.signal(CaseWorkflow.abandon, AbandonRequest())
+        await handle.result()
+    assert events(fakes) == ["bank.wait_started", "bank.replied", "case.escalation_chosen"]
+
+
+async def test_escalate_without_a_question_is_ignored(env: WorkflowEnvironment) -> None:
+    fakes = FakeActivities()
+    async with worker(env, fakes):
+        handle = await to_awaiting_bank(env, fakes)
+        await handle.signal(CaseWorkflow.escalate)
+        await env.sleep(timedelta(days=5))
+        state: CaseState = await handle.query(CaseWorkflow.get_state)
+        assert state.status is CaseStatus.AWAITING_BANK
+        await handle.signal(CaseWorkflow.abandon, AbandonRequest())
+        await handle.result()
+    assert events(fakes) == ["bank.wait_started"]
+
+
+async def test_reply_before_sending_is_ignored(env: WorkflowEnvironment) -> None:
+    fakes = FakeActivities()
+    async with worker(env, fakes):
+        handle = await to_approval(env, fakes)
+        await wait_for(handle, lambda s: s.status is CaseStatus.AWAITING_APPROVAL)
+        await reply(handle)
+        await handle.signal(CaseWorkflow.mark_resolved, MarkResolved(amount_received_inr=1))
+        await handle.signal(CaseWorkflow.abandon, AbandonRequest())
+        await handle.result()
+    assert JUDGE_REPLY not in fakes.names() and RECORD_RESOLVED not in fakes.names()
+
+
+async def test_judging_error_keeps_waiting(env: WorkflowEnvironment) -> None:
+    ack = verdict(NextAction.KEEP_WAITING, ReplyLabel.ACKNOWLEDGEMENT)
+    fakes = FakeActivities(
+        judge=[ApplicationError("model refused", type="LLMFailed", non_retryable=True), ack]
+    )
+    async with worker(env, fakes):
+        handle = await to_awaiting_bank(env, fakes)
+        await reply(handle)
+        state = await wait_for(handle, lambda s: s.last_error is not None)
+        assert "could not be checked" in (state.last_error or "")
+        await reply(handle)
+        state = await wait_for(handle, lambda s: s.last_reply is not None)
+        assert state.last_error is None
+        await handle.signal(CaseWorkflow.abandon, AbandonRequest())
+        await handle.result()
+
+
+async def test_refused_resolution_keeps_waiting(env: WorkflowEnvironment) -> None:
+    fakes = FakeActivities(resolved=[bad_input("not now"), None])
+    async with worker(env, fakes):
+        handle = await to_awaiting_bank(env, fakes)
+        await handle.signal(CaseWorkflow.mark_resolved, MarkResolved(amount_received_inr=10))
+        state = await wait_for(handle, lambda s: s.last_error == "not now")
+        assert state.status is CaseStatus.AWAITING_BANK
+        await handle.signal(CaseWorkflow.mark_resolved, MarkResolved(amount_received_inr=10))
+        outcome: CaseOutcome = await handle.result()
+    assert outcome.status is CaseStatus.RESOLVED

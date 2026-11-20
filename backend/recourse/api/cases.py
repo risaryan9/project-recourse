@@ -27,10 +27,11 @@ from __future__ import annotations
 
 import uuid
 from datetime import date, datetime, timedelta
+from decimal import Decimal
 from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, status
-from pydantic import BaseModel, ValidationError
+from pydantic import BaseModel, Field, ValidationError
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -55,6 +56,7 @@ from recourse.db.case_tag import new_case_tag
 from recourse.db.models import (
     Actor,
     AuditEvent,
+    BankReply,
     Case,
     CaseStatus,
     DraftRecord,
@@ -63,6 +65,8 @@ from recourse.db.models import (
     EvidenceRecord,
     OutboundEmail,
     OutboundStatus,
+    ReplySource,
+    ReplyStatus,
     Upload,
 )
 from recourse.db.models import (
@@ -78,9 +82,12 @@ from recourse.security.pii import redact_text
 from recourse.temporal.case_runner import CaseRunner
 from recourse.temporal.case_types import (
     AbandonRequest,
+    BankReplied,
     CaseInput,
     Confirmation,
+    MarkResolved,
     MarkSent,
+    ReplySummary,
     TimeScaleInput,
 )
 
@@ -90,6 +97,18 @@ banks_router = APIRouter(prefix="/banks", tags=["banks"])
 MAX_FILES = 5
 MAX_REQUEST_BYTES = 20 * 1024 * 1024
 ENDED = {CaseStatus.ABANDONED, CaseStatus.CLOSED, CaseStatus.RESOLVED}
+# The complaint has reached the bank (the bank can no longer change).
+SENT_OR_LATER = {
+    CaseStatus.SENT_TO_BANK,
+    CaseStatus.AWAITING_BANK,
+    CaseStatus.BANK_REPLIED,
+    CaseStatus.JUDGED,
+    CaseStatus.ESCALATION_DRAFT_READY,
+    CaseStatus.FILED_WITH_OMBUDSMAN,
+}
+# The case accepts bank replies and "I got my money".
+WAITING_ON_BANK = {CaseStatus.AWAITING_BANK, CaseStatus.JUDGED}
+MAX_REPLY_CHARS = 20_000
 
 Session = Annotated[AsyncSession, Depends(get_session)]
 Runner = Annotated[CaseRunner, Depends(get_runner)]
@@ -189,6 +208,9 @@ class CaseView(BaseModel):
     bank_complained_on: date | None
     escalation: dict[str, Any] | None
     bank_wait_expired: bool  # the bank did not reply within its window
+    bank_complaint_ref: str | None  # the bank's complaint number, once a reply states it
+    last_reply: ReplySummary | None  # verdict on the latest bank reply (warnings included)
+    can_escalate: bool  # show "Escalate to the RBI Ombudsman" / "Accept and close"
     timeline: list[TimelineEntry]
 
 
@@ -281,6 +303,9 @@ async def get_case(case_id: uuid.UUID, session: Session, runner: Runner) -> Case
         bank_complained_on=case.bank_complained_on,
         escalation=case.escalation,
         bank_wait_expired=live.bank_wait_expired if live else False,
+        bank_complaint_ref=case.bank_complaint_ref,
+        last_reply=live.last_reply if live else None,
+        can_escalate=live.can_escalate if live else False,
         timeline=[
             TimelineEntry(
                 occurred_at=e.occurred_at,
@@ -406,6 +431,34 @@ class SentReport(BaseModel):
     sent_at: datetime | None = None  # default: now
 
 
+class ReplyIn(BaseModel):
+    text: str = Field(min_length=1, max_length=MAX_REPLY_CHARS)
+    received_at: datetime | None = None  # default: now
+    sender: str | None = Field(default=None, max_length=320)  # the From address, if known
+
+
+class ReplyCreated(BaseModel):
+    id: uuid.UUID
+    redactions: list[str]  # kinds of sensitive data removed before storing
+
+
+class ReplyView(BaseModel):
+    id: uuid.UUID
+    source: ReplySource
+    received_at: datetime
+    sender: str | None
+    text: str  # redacted
+    status: ReplyStatus
+    label: str | None
+    next_action: str | None
+    suspicious: bool | None
+    verdict: dict[str, Any] | None
+
+
+class ResolvedReport(BaseModel):
+    amount_received_inr: Decimal = Field(ge=0, max_digits=14, decimal_places=2)
+
+
 @router.put("/{case_id}/bank")
 async def choose_bank(
     case_id: uuid.UUID,
@@ -419,7 +472,7 @@ async def choose_bank(
         case = await s.get(Case, case_id, with_for_update=True)
         if case is None:
             raise HTTPException(404, "case not found")
-        if case.status in ENDED or case.status is CaseStatus.SENT_TO_BANK:
+        if case.status in ENDED or case.status in SENT_OR_LATER:
             raise HTTPException(409, f"case is {case.status.value}; the bank can no longer change")
         case.bank_id = contact.id
         record_event(s, case.id, Actor.USER, "case.bank_selected", {"bank_id": contact.id})
@@ -463,6 +516,117 @@ async def retry_send(case_id: uuid.UUID, session: Session, runner: Runner) -> di
         raise HTTPException(409, "the case is not waiting to retry sending")
     await runner.retry_send(case_id)
     return {"status": "retrying"}
+
+
+@router.post("/{case_id}/bank-reply", status_code=status.HTTP_202_ACCEPTED)
+async def add_bank_reply(
+    case_id: uuid.UUID,
+    reply: ReplyIn,
+    runner: Runner,
+    sessions: Annotated[async_sessionmaker[AsyncSession], Depends(get_session_factory)],
+) -> ReplyCreated:
+    """The user pastes or forwards the bank's reply. Stored redacted; judged by the workflow."""
+    now = datetime.now(IST)
+    received_at = reply.received_at or now
+    if received_at.tzinfo is None:
+        raise HTTPException(422, "received_at needs a time zone")
+    if received_at > now + timedelta(minutes=10):
+        raise HTTPException(422, "received_at is in the future")
+    if reply.sender is not None and "@" not in reply.sender:
+        raise HTTPException(422, "sender must be an email address")
+    text, kinds = redact_text(reply.text.strip())
+    if not text:
+        raise HTTPException(422, "the reply is empty")
+    async with sessions.begin() as s:
+        case = await s.get(Case, case_id, with_for_update=True)
+        if case is None:
+            raise HTTPException(404, "case not found")
+        if case.status not in WAITING_ON_BANK:
+            raise HTTPException(409, f"case is {case.status.value}, not waiting for the bank")
+        email = await _latest_email(s, case_id)
+        if email is not None and email.sent_at is not None and received_at < email.sent_at:
+            raise HTTPException(422, "received_at is before the complaint was sent")
+        row = BankReply(
+            case_id=case.id,
+            source=ReplySource.PASTE,
+            received_at=received_at,
+            sender=reply.sender.strip().lower() if reply.sender else None,
+            body=text,
+            redactions=sorted(k.value for k in kinds),
+            status=ReplyStatus.PENDING,
+        )
+        s.add(row)
+        await s.flush()
+        record_event(
+            s,
+            case.id,
+            Actor.BANK,
+            "reply.received",
+            {"reply_id": str(row.id), "source": row.source.value, "redactions": row.redactions},
+        )
+        reply_id, redactions = row.id, row.redactions
+    await runner.bank_replied(case_id, BankReplied(reply_id=reply_id))
+    return ReplyCreated(id=reply_id, redactions=redactions)
+
+
+@router.get("/{case_id}/replies")
+async def list_replies(case_id: uuid.UUID, session: Session) -> list[ReplyView]:
+    await _get_case(session, case_id)
+    rows = await session.scalars(
+        select(BankReply).where(BankReply.case_id == case_id).order_by(BankReply.received_at)
+    )
+    return [
+        ReplyView(
+            id=r.id,
+            source=r.source,
+            received_at=r.received_at,
+            sender=r.sender,
+            text=r.body,
+            status=r.status,
+            label=r.label,
+            next_action=r.next_action,
+            suspicious=r.suspicious,
+            verdict=r.verdict,
+        )
+        for r in rows
+    ]
+
+
+@router.post("/{case_id}/resolved", status_code=status.HTTP_202_ACCEPTED)
+async def mark_resolved(
+    case_id: uuid.UUID, report: ResolvedReport, session: Session, runner: Runner
+) -> dict[str, str]:
+    """The user received their money: close the case as RESOLVED."""
+    case = await _get_case(session, case_id)
+    if case.status not in WAITING_ON_BANK:
+        raise HTTPException(409, f"case is {case.status.value}, not waiting for the bank")
+    await runner.mark_resolved(
+        case_id, MarkResolved(amount_received_inr=report.amount_received_inr)
+    )
+    return {"status": "resolving"}
+
+
+@router.post("/{case_id}/escalate", status_code=status.HTTP_202_ACCEPTED)
+async def escalate(
+    case_id: uuid.UUID,
+    runner: Runner,
+    sessions: Annotated[async_sessionmaker[AsyncSession], Depends(get_session_factory)],
+) -> dict[str, str]:
+    """The user finds the bank's reply unsatisfactory (RB-IOS 10(1)(f)) and escalates."""
+    live = await runner.state(case_id)
+    if live is None or not live.can_escalate or live.last_reply is None:
+        raise HTTPException(409, "the case is not waiting for this decision")
+    async with sessions.begin() as s:
+        reply = await s.get(BankReply, live.last_reply.reply_id, with_for_update=True)
+        if reply is None or reply.case_id != case_id:
+            raise HTTPException(404, "reply not found")
+        if not reply.unsatisfactory:
+            reply.unsatisfactory = True
+            record_event(
+                s, case_id, Actor.USER, "reply.marked_unsatisfactory", {"reply_id": str(reply.id)}
+            )
+    await runner.escalate(case_id)
+    return {"status": "escalating"}
 
 
 @banks_router.get("")

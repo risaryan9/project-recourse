@@ -17,10 +17,12 @@ from temporalio.service import RPCError
 from recourse.config import Settings
 from recourse.temporal.case_types import (
     AbandonRequest,
+    BankReplied,
     CaseInput,
     CaseState,
     Confirmation,
     DraftDecision,
+    MarkResolved,
     MarkSent,
 )
 from recourse.temporal.case_workflow import CaseWorkflow
@@ -48,6 +50,9 @@ class CaseRunner(Protocol):
     async def redraft(self, case_id: uuid.UUID) -> None: ...
     async def mark_sent(self, case_id: uuid.UUID, mark: MarkSent) -> None: ...
     async def retry_send(self, case_id: uuid.UUID) -> None: ...
+    async def bank_replied(self, case_id: uuid.UUID, reply: BankReplied) -> None: ...
+    async def mark_resolved(self, case_id: uuid.UUID, mark: MarkResolved) -> None: ...
+    async def escalate(self, case_id: uuid.UUID) -> None: ...
     async def state(self, case_id: uuid.UUID) -> CaseState | None: ...
 
 
@@ -88,6 +93,15 @@ class TemporalCaseRunner:
 
     async def retry_send(self, case_id: uuid.UUID) -> None:
         await self._handle(case_id).signal(CaseWorkflow.retry_send)
+
+    async def bank_replied(self, case_id: uuid.UUID, reply: BankReplied) -> None:
+        await self._handle(case_id).signal(CaseWorkflow.bank_replied, reply)
+
+    async def mark_resolved(self, case_id: uuid.UUID, mark: MarkResolved) -> None:
+        await self._handle(case_id).signal(CaseWorkflow.mark_resolved, mark)
+
+    async def escalate(self, case_id: uuid.UUID) -> None:
+        await self._handle(case_id).signal(CaseWorkflow.escalate)
 
     async def state(self, case_id: uuid.UUID) -> CaseState | None:
         """The live workflow state, or None if the workflow cannot be reached right now."""
