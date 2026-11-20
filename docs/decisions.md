@@ -437,3 +437,53 @@ their name, but the amounts and dates must stay the rule engine's (ADR-010).
   as of the assessment date. The send step should reassess when the delay matters.
 - Signals are fire-and-forget: the API's own check gives fast feedback, and the activity's refusal
   appears as `last_error`. Temporal Updates could make this synchronous later.
+
+## ADR-012: EmailChannel, the send policy and ManualChannel
+
+### Context
+An approved complaint must reach the bank without the agent ever sending something the user did
+not approve, or sending to the wrong address (CLAUDE.md §3 "Email channel", §5). ManualChannel
+must always work; GmailChannel comes later on the same path.
+
+### Decision
+- **One interface, one policy.** `EmailChannel.send(OutgoingEmail) -> SendOutcome` in
+  `recourse/email/channel.py`. Every channel uses the same policy first, `resolve_recipient`:
+  - sandbox on (the default): the recipient is always `SANDBOX_RECIPIENT`; no address set
+    means the send is blocked;
+  - sandbox off: the bank's grievance address from the contacts file, only if that entry is
+    `verified`, has an email, **and** every cited rule is verified (ADR-010). Otherwise the send
+    is blocked with the reasons and the user gets no address.
+- **ManualChannel never sends.** It returns a `mailto:` link (RFC 6068 encoding, CRLF line ends).
+  The email row is `PREPARED`; the user sends it from their own mail app and confirms with the
+  **`mark_sent(channel, sent_at)`** signal. The `record_sent` activity then refuses a time more
+  than 10 minutes in the future or before the approval, sets `SENT`, and moves the case to
+  `SENT_TO_BANK`. A channel that sends by itself (Gmail) returns `sent=True` and skips
+  `mark_sent`.
+- **`outbound_emails` table** (migration 0004), one row per approved draft (unique `draft_id`):
+  channel, status `BLOCKED | PREPARED | SENT`, sandbox flag, bank, recipient, the approved text,
+  blocked reasons, `sent_at`, Gmail `message_id` / `thread_id`. `prepare_send` is idempotent. A
+  BLOCKED row is evaluated again on retry, so it changes if the user chose their bank since.
+  The workflow then waits for a new **`retry_send`** signal.
+- **Bank choice.** `cases.bank_id` is set when the user picks a bank (`PUT /cases/{id}/bank`).
+  Otherwise the extracted bank name is matched against the contacts file's aliases (whole
+  words, longest alias; two banks matching about equally well = no match).
+- **Contacts file** (`recourse/email/bank_contacts.yaml`): 10 banks, researched from official
+  pages only (each entry lists its `source_urls`), all `verified: false`. Values not found on
+  an official page are `null` with a note; none are filled in from memory. Banks have moved to
+  `.bank.in` domains, which are used as the official hosts. No bank states its sending domains,
+  so `sender_domains` are the domains of its official contact addresses
+  (`sender_domains_basis: contact_emails`). The sender-domain check must treat them as a
+  heuristic.
+- Case status stays `AWAITING_APPROVAL` while the email is PREPARED (the email row tells the UI
+  to show "send it yourself"), as in ADR-011.
+- New code path behind `workflow.patched("sending-v1")`.
+
+### Consequences
+- With the defaults (sandbox on), a demo never needs verified contacts. Turning sandbox off
+  sends nothing until a maintainer has verified the bank's entry and the cited rules.
+- SBI, ICICI, Axis, Kotak and Canara have no complaint email on file yet. In real mode their
+  cases are blocked, with the bank's online complaint form shown where one is known.
+- `prepare_send` calls the channel inside its database transaction. That is fine for
+  ManualChannel. GmailChannel must make its send idempotent (e.g. check the thread for the
+  case tag before resending), because an activity retry after a successful send would otherwise
+  send twice.

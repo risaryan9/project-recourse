@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import re
 import uuid
+from datetime import timedelta
 from typing import Any
 
 from sqlalchemy import delete, select
@@ -29,6 +30,7 @@ from recourse.agents.intake_graph import IntakeInput, IntakeStatus, run_intake
 from recourse.cases.assessment import AssessmentError, CaseDetails, assess, missing_details
 from recourse.cases.drafts import InvalidEdit, latest_draft, recheck_final, slot_table_for
 from recourse.cases.review import InvalidAnswer, review
+from recourse.config import Settings, get_settings
 from recourse.db.audit import record_event
 from recourse.db.models import (
     Actor,
@@ -39,8 +41,18 @@ from recourse.db.models import (
     DraftRecordStatus,
     EntitlementRecord,
     EvidenceRecord,
+    OutboundEmail,
+    OutboundStatus,
     Upload,
 )
+from recourse.email.channel import (
+    ChannelKind,
+    EmailChannel,
+    OutgoingEmail,
+    resolve_recipient,
+)
+from recourse.email.contacts import BankContact, BankContacts, load_bank_contacts
+from recourse.email.manual import ManualChannel
 from recourse.evidence.validators import EvidenceCheck
 from recourse.llm.base import Attachment, LLMClient, LLMError
 from recourse.rules.models import Entitlement
@@ -52,6 +64,8 @@ from recourse.temporal.case_types import (
     DRAFT,
     INVALID_USER_INPUT,
     MARK_ABANDONED,
+    PREPARE_SEND,
+    RECORD_SENT,
     REJECT_DRAFT,
     RUN_INTAKE,
     AssessInput,
@@ -63,7 +77,10 @@ from recourse.temporal.case_types import (
     DraftSummary,
     IntakeSummary,
     MarkAbandonedInput,
+    PrepareSendInput,
+    RecordSentInput,
     RunIntakeInput,
+    SendSummary,
 )
 
 LLM_FAILED = "LLMFailed"
@@ -73,10 +90,27 @@ def invalid(message: str) -> ApplicationError:
     return ApplicationError(message, type=INVALID_USER_INPUT, non_retryable=True)
 
 
+# How far a user-reported send time may lie outside [approval, now] (clock skew, slow clicks).
+SENT_AT_TOLERANCE = timedelta(minutes=10)
+
+
 class CaseActivities:
-    def __init__(self, sessions: async_sessionmaker[AsyncSession], llm: LLMClient) -> None:
+    def __init__(
+        self,
+        sessions: async_sessionmaker[AsyncSession],
+        llm: LLMClient,
+        *,
+        settings: Settings | None = None,
+        contacts: BankContacts | None = None,
+        channels: dict[ChannelKind, EmailChannel] | None = None,
+    ) -> None:
         self._sessions = sessions
         self._llm = llm
+        self._settings = settings or get_settings()
+        self._contacts = contacts or load_bank_contacts()
+        self._channels: dict[ChannelKind, EmailChannel] = channels or {
+            ChannelKind.MANUAL: ManualChannel()
+        }
 
     def all(self) -> list[Any]:
         return [
@@ -86,6 +120,8 @@ class CaseActivities:
             self.draft,
             self.approve_draft,
             self.reject_draft,
+            self.prepare_send,
+            self.record_sent,
             self.mark_abandoned,
         ]
 
@@ -397,6 +433,130 @@ class CaseActivities:
                 },
             )
 
+    # --- sending ----------------------------------------------------------------------------------
+
+    @activity.defn(name=PREPARE_SEND)
+    async def prepare_send(self, inp: PrepareSendInput) -> SendSummary:
+        """Apply the send policy to the approved draft and hand it to the channel.
+
+        ManualChannel sends nothing: the email is PREPARED and the user sends it. Idempotent: a
+        PREPARED or SENT email is returned as it is; a BLOCKED one is evaluated again (the user
+        may have chosen their bank since).
+        """
+        async with self._sessions.begin() as s:
+            case = await _case_for_update(s, inp.case_id)
+            draft = await s.get(DraftRecord, inp.draft_id, with_for_update=True)
+            if draft is None or draft.case_id != case.id:
+                raise ApplicationError(f"draft {inp.draft_id} not found", non_retryable=True)
+            if draft.status is not DraftRecordStatus.APPROVED:
+                raise invalid("Only an approved draft can be sent.")
+            assert draft.final_subject is not None and draft.final_body is not None
+            row = await s.scalar(select(OutboundEmail).where(OutboundEmail.draft_id == draft.id))
+            if row is not None and row.status is not OutboundStatus.BLOCKED:
+                return _send_summary(row)
+
+            evidence = (await _latest_evidence(s, case.id)).to_evidence()
+            contact = self._bank_for(case.bank_id, evidence.payer_bank.value)
+            recipient = resolve_recipient(
+                sandbox=self._settings.email_sandbox,
+                sandbox_recipient=self._settings.sandbox_recipient,
+                contact=contact,
+                rules_verified=draft.rules_verified,
+            )
+            channel = self._channels[ChannelKind.MANUAL]  # GmailChannel joins here (ADR-012)
+            if row is None:
+                row = OutboundEmail(case_id=case.id, draft_id=draft.id)
+                s.add(row)
+            row.channel = channel.kind.value
+            row.sandbox = recipient.sandbox
+            row.bank_id = contact.id if contact else None
+            row.recipient = recipient.address
+            row.subject = draft.final_subject
+            row.body = draft.final_body
+            row.blocked_reasons = recipient.blocked_reasons
+            row.status = OutboundStatus.BLOCKED if recipient.blocked else OutboundStatus.PREPARED
+            await s.flush()
+
+            info: dict[str, Any] = {
+                "email_id": str(row.id),
+                "draft_id": str(draft.id),
+                "channel": row.channel,
+                "sandbox": row.sandbox,
+                "bank_id": row.bank_id,
+            }
+            if recipient.blocked:
+                record_event(
+                    s,
+                    case.id,
+                    Actor.SYSTEM,
+                    "email.blocked",
+                    info | {"reasons": row.blocked_reasons},
+                )
+                return _send_summary(row)
+
+            assert recipient.address is not None
+            outcome = await channel.send(
+                OutgoingEmail(
+                    to=recipient.address,
+                    subject=row.subject,
+                    body=row.body,
+                    sandbox=recipient.sandbox,
+                )
+            )
+            if outcome.sent:  # a channel that sends by itself (Gmail)
+                row.status = OutboundStatus.SENT
+                row.sent_at = activity.info().current_attempt_scheduled_time
+                row.message_id, row.thread_id = outcome.message_id, outcome.thread_id
+                case.status = CaseStatus.SENT_TO_BANK
+                record_event(s, case.id, Actor.SYSTEM, "email.sent", info)
+            else:
+                record_event(s, case.id, Actor.SYSTEM, "email.prepared", info)
+            return _send_summary(row)
+
+    @activity.defn(name=RECORD_SENT)
+    async def record_sent(self, inp: RecordSentInput) -> None:
+        """The user says they sent the email themselves (ManualChannel)."""
+        async with self._sessions.begin() as s:
+            case = await _case_for_update(s, inp.case_id)
+            row = await s.get(OutboundEmail, inp.email_id, with_for_update=True)
+            if row is None or row.case_id != case.id:
+                raise ApplicationError(f"email {inp.email_id} not found", non_retryable=True)
+            if row.status is OutboundStatus.SENT:
+                return
+            if row.status is not OutboundStatus.PREPARED:
+                raise invalid("This email cannot be sent yet.")
+            if inp.mark.channel.value != row.channel:
+                raise invalid("This email is not sent through that channel.")
+            draft = await s.get(DraftRecord, row.draft_id)
+            assert draft is not None and draft.approved_at is not None
+            sent_at = inp.mark.sent_at
+            if sent_at.tzinfo is None:
+                raise invalid("The send time needs a time zone.")
+            if sent_at > inp.now + SENT_AT_TOLERANCE:
+                raise invalid("The send time is in the future.")
+            if sent_at < draft.approved_at - SENT_AT_TOLERANCE:
+                raise invalid("The send time is before the letter was approved.")
+            row.status = OutboundStatus.SENT
+            row.sent_at = sent_at
+            case.status = CaseStatus.SENT_TO_BANK
+            record_event(
+                s,
+                case.id,
+                Actor.USER,
+                "email.marked_sent",
+                {
+                    "email_id": str(row.id),
+                    "channel": row.channel,
+                    "sandbox": row.sandbox,
+                    "sent_at": sent_at.isoformat(),
+                },
+            )
+
+    def _bank_for(self, bank_id: str | None, extracted_name: str | None) -> BankContact | None:
+        if bank_id is not None:
+            return self._contacts.get(bank_id)
+        return self._contacts.match(extracted_name)
+
     # --- end -------------------------------------------------------------------------------------
 
     @activity.defn(name=MARK_ABANDONED)
@@ -437,6 +597,16 @@ async def _current_draft_for_update(
     draft = await s.get(DraftRecord, draft_id, with_for_update=True, populate_existing=True)
     assert draft is not None
     return draft
+
+
+def _send_summary(row: OutboundEmail) -> SendSummary:
+    return SendSummary(
+        email_id=row.id,
+        channel=ChannelKind(row.channel),
+        status=row.status,
+        sandbox=row.sandbox,
+        blocked_reasons=row.blocked_reasons,
+    )
 
 
 def _draft_summary(row: DraftRecord) -> DraftSummary:

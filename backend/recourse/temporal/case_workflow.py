@@ -15,7 +15,10 @@
     AWAITING_APPROVAL ──reject_draft──→ draft again (at most MAX_DRAFTS_PER_CASE drafts)
         │ approve_draft
         ▼
-    draft APPROVED → wait (sending is the next milestone)
+    prepare_send (send policy + channel) ──(blocked)──→ wait for `retry_send`
+        │ ManualChannel: PREPARED, the user sends it themselves
+        ▼
+    wait for `mark_sent` → record_sent → SENT_TO_BANK → wait (bank timers are the next milestone)
 
 An `abandon` signal ends the case from any waiting point. Every status change is written to the
 database by the activity that causes it (with an audit event), so the API reads the database
@@ -37,7 +40,7 @@ with workflow.unsafe.imports_passed_through():
     from recourse.agents.draft_graph import DraftStatus
     from recourse.agents.intake_graph import IntakeStatus
     from recourse.cases.drafts import MAX_DRAFTS_PER_CASE
-    from recourse.db.models import Actor, CaseStatus
+    from recourse.db.models import Actor, CaseStatus, OutboundStatus
     from recourse.evidence.models import IST
     from recourse.temporal.case_types import (
         APPROVE_DRAFT,
@@ -46,6 +49,8 @@ with workflow.unsafe.imports_passed_through():
         DRAFT,
         INVALID_USER_INPUT,
         MARK_ABANDONED,
+        PREPARE_SEND,
+        RECORD_SENT,
         REJECT_DRAFT,
         RUN_INTAKE,
         AbandonRequest,
@@ -63,7 +68,11 @@ with workflow.unsafe.imports_passed_through():
         DraftSummary,
         IntakeSummary,
         MarkAbandonedInput,
+        MarkSent,
+        PrepareSendInput,
+        RecordSentInput,
         RunIntakeInput,
+        SendSummary,
     )
 
 # LLM steps: the LLM client retries quickly itself; Temporal retries over minutes.
@@ -108,6 +117,12 @@ class CaseWorkflow:
         self._draft_id: uuid.UUID | None = None
         self._approved_draft_id: uuid.UUID | None = None
         self._drafts_used = 0
+        # Sending
+        self._email_id: uuid.UUID | None = None
+        self._marks: list[MarkSent] = []
+        self._awaiting_manual_send = False
+        self._retry_send = False
+        self._can_retry_send = False
 
     # --- signals & queries ----------------------------------------------------------------------
 
@@ -128,6 +143,15 @@ class CaseWorkflow:
         if self._can_redraft:
             self._redraft = True
 
+    @workflow.signal(name="mark_sent")
+    def mark_sent(self, mark: MarkSent) -> None:
+        self._marks.append(mark)
+
+    @workflow.signal(name="retry_send")
+    def retry_send(self) -> None:
+        if self._can_retry_send:
+            self._retry_send = True
+
     @workflow.signal(name="abandon")
     def abandon(self, request: AbandonRequest) -> None:
         if self._abandon is None:
@@ -144,6 +168,9 @@ class CaseWorkflow:
             approved_draft_id=self._approved_draft_id,
             drafts_used=self._drafts_used,
             can_redraft=self._can_redraft,
+            email_id=self._email_id,
+            awaiting_manual_send=self._awaiting_manual_send,
+            can_retry_send=self._can_retry_send,
         )
 
     # --- main flow --------------------------------------------------------------------------------
@@ -201,8 +228,14 @@ class CaseWorkflow:
             if not await self._draft_until_approved(inp):
                 assert self._abandon is not None
                 return await self._end(inp, self._abandon.reason, Actor.USER)
+            # 5. Send the approved letter (or hand it to the user to send).
+            if workflow.patched("sending-v1"):
+                if not await self._send_approved(inp):
+                    assert self._abandon is not None
+                    return await self._end(inp, self._abandon.reason, Actor.USER)
+                self._status = CaseStatus.SENT_TO_BANK
 
-        # 5. Next milestone (sending) plugs in here. Until then: wait until abandoned.
+        # 6. Next milestone (bank response timers) plugs in here. Until then: wait.
         await workflow.wait_condition(lambda: self._abandoned)
         assert self._abandon is not None
         return await self._end(inp, self._abandon.reason, Actor.USER)
@@ -246,6 +279,68 @@ class CaseWorkflow:
             # rejected → draft again
             self._status = CaseStatus.ASSESSED
             self._draft_id = None
+
+    # --- sending ----------------------------------------------------------------------------------
+
+    async def _send_approved(self, inp: CaseInput) -> bool:
+        """Prepare the approved draft for sending; for ManualChannel wait until the user says
+        it was sent. False = abandoned."""
+        assert self._approved_draft_id is not None
+        while True:
+            summary = await self._prepare_send(inp, self._approved_draft_id)
+            if summary is not None:
+                self._email_id = summary.email_id
+                if summary.status is OutboundStatus.SENT:
+                    return True
+                if summary.status is OutboundStatus.PREPARED:
+                    break
+                self._last_error = " ".join(summary.blocked_reasons)
+            # Blocked (or failed): wait until the user fixed the cause and asks to retry.
+            self._can_retry_send = True
+            await workflow.wait_condition(lambda: self._retry_send or self._abandoned)
+            self._can_retry_send = self._retry_send = False
+            if self._abandoned:
+                return False
+            self._last_error = None
+
+        self._marks.clear()  # a mark sent before the email existed means nothing
+        self._awaiting_manual_send = True
+        self._last_error = None
+        while True:
+            await workflow.wait_condition(lambda: bool(self._marks) or self._abandoned)
+            if self._abandoned:
+                return False
+            mark = self._marks.pop(0)
+            assert self._email_id is not None
+            try:
+                await workflow.execute_activity(
+                    RECORD_SENT,
+                    RecordSentInput(
+                        case_id=inp.case_id, email_id=self._email_id, mark=mark, now=workflow.now()
+                    ),
+                    start_to_close_timeout=DB_TIMEOUT,
+                    retry_policy=DB_RETRY,
+                )
+            except ActivityError as err:
+                self._last_error = _error_message(err)
+                continue
+            self._awaiting_manual_send = False
+            self._last_error = None
+            return True
+
+    async def _prepare_send(self, inp: CaseInput, draft_id: uuid.UUID) -> SendSummary | None:
+        try:
+            summary: SendSummary = await workflow.execute_activity(
+                PREPARE_SEND,
+                PrepareSendInput(case_id=inp.case_id, draft_id=draft_id),
+                result_type=SendSummary,
+                start_to_close_timeout=DB_TIMEOUT,
+                retry_policy=DB_RETRY,
+            )
+        except ActivityError as err:
+            self._last_error = f"Sending failed: {_error_message(err)}"
+            return None
+        return summary
 
     async def _run_draft(self, inp: CaseInput, seq: int) -> DraftSummary | None:
         try:

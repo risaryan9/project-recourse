@@ -16,7 +16,8 @@ from pydantic import BaseModel, ConfigDict, Field
 from recourse.agents.draft_graph import DraftStatus
 from recourse.agents.intake_graph import IntakeStatus
 from recourse.cases.review import Confirmation as Confirmation  # the confirm signal payload
-from recourse.db.models import Actor, CaseStatus
+from recourse.db.models import Actor, CaseStatus, OutboundStatus
+from recourse.email.channel import ChannelKind
 
 # Activity names (stable: they are recorded in workflow history).
 RUN_INTAKE = "case.run_intake"
@@ -26,6 +27,8 @@ MARK_ABANDONED = "case.mark_abandoned"
 DRAFT = "case.draft"
 APPROVE_DRAFT = "case.approve_draft"
 REJECT_DRAFT = "case.reject_draft"
+PREPARE_SEND = "case.prepare_send"
+RECORD_SENT = "case.record_sent"
 
 # Error type for ApplicationErrors caused by bad user input (never retried).
 INVALID_USER_INPUT = "InvalidUserInput"
@@ -62,6 +65,13 @@ class DraftDecision(_Model):
     draft_id: uuid.UUID
 
 
+class MarkSent(_Model):
+    """Payload of `mark_sent`: the user sent the email themselves (ManualChannel only)."""
+
+    channel: ChannelKind = ChannelKind.MANUAL
+    sent_at: datetime
+
+
 class CaseState(_Model):
     status: CaseStatus
     needs_confirmation: list[str] = Field(default_factory=list)
@@ -71,6 +81,9 @@ class CaseState(_Model):
     approved_draft_id: uuid.UUID | None = None
     drafts_used: int = 0
     can_redraft: bool = False  # waiting for a `redraft` signal after a failed draft
+    email_id: uuid.UUID | None = None  # the outbound email for the approved draft
+    awaiting_manual_send: bool = False  # waiting for `mark_sent`
+    can_retry_send: bool = False  # the send was blocked; waiting for `retry_send`
 
 
 # --- activities -------------------------------------------------------------------------------
@@ -128,6 +141,26 @@ class DraftSummary(_Model):
 class DraftDecisionInput(_Model):
     case_id: uuid.UUID
     draft_id: uuid.UUID
+    now: datetime
+
+
+class PrepareSendInput(_Model):
+    case_id: uuid.UUID
+    draft_id: uuid.UUID
+
+
+class SendSummary(_Model):
+    email_id: uuid.UUID
+    channel: ChannelKind
+    status: OutboundStatus
+    sandbox: bool
+    blocked_reasons: list[str] = Field(default_factory=list)
+
+
+class RecordSentInput(_Model):
+    case_id: uuid.UUID
+    email_id: uuid.UUID
+    mark: MarkSent
     now: datetime
 
 

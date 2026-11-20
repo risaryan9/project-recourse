@@ -109,7 +109,7 @@ Neon Postgres (+pgvector): cases, evidence, entitlements, drafts, audit_events, 
 ### CaseWorkflow states
 `NEW → EXTRACTED → ASSESSED → DRAFT_READY → AWAITING_APPROVAL → SENT_TO_BANK → AWAITING_BANK (timer) → BANK_REPLIED → JUDGED → (RESOLVED | ESCALATION_DRAFT_READY → AWAITING_APPROVAL → FILED_WITH_OMBUDSMAN → CLOSED) | ABANDONED`
 
-- **Signals:** `approve_draft(draft_id)`, `reject_draft(draft_id)` (edits, name and reason are stored on the draft row by the API, ADR-011), `redraft()` (after a draft failed closed), `mark_sent(channel, sent_at)` (ManualChannel only; GmailChannel records the send itself), `bank_replied(text|file)` (manual paste/forward), `mark_resolved(amount_received)`, `abandon()`.
+- **Signals:** `approve_draft(draft_id)`, `reject_draft(draft_id)` (edits, name and reason are stored on the draft row by the API, ADR-011), `redraft()` (after a draft failed closed), `mark_sent(channel, sent_at)` (ManualChannel only; GmailChannel records the send itself), `retry_send()` (after a blocked send was fixed, ADR-012), `bank_replied(text|file)` (manual paste/forward), `mark_resolved(amount_received)`, `abandon()`.
 - **Queries:** `get_status()`, `get_timeline()`, `get_entitlement()`.
 - **Timers:** bank response window; Ombudsman 90-day window reminder; fraud-reporting countdown; Gmail reply-watcher poll interval.
 
@@ -148,7 +148,7 @@ Neon Postgres (+pgvector): cases, evidence, entitlements, drafts, audit_events, 
 
 **Sandbox (on by default)**
 - With `EMAIL_SANDBOX=true`, every outgoing email goes to `SANDBOX_RECIPIENT`, and the UI shows a **"Sandbox — not sent to the real bank"** badge.
-- Real sending requires `EMAIL_SANDBOX=false` **and** a recipient that matches the bank contacts file.
+- Real sending requires `EMAIL_SANDBOX=false` **and** a recipient from a `verified` bank contacts entry **and** verified cited rules (ADR-012).
 
 **Reply watcher**
 - A Temporal loop calls `threads.get(threadId)` every `GMAIL_POLL_MINUTES` (default 30; in `DEMO_MODE`, every `DEMO_GMAIL_POLL_SECONDS`). The Gmail calls run in activities; the loop and its timer live in the workflow.

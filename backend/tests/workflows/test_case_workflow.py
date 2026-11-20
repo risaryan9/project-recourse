@@ -6,7 +6,7 @@ import asyncio
 import uuid
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass, field
-from datetime import date
+from datetime import UTC, date, datetime
 from decimal import Decimal
 from typing import Any
 
@@ -23,7 +23,8 @@ from recourse.agents.draft_graph import DraftStatus
 from recourse.agents.intake_graph import IntakeStatus
 from recourse.cases.assessment import CaseDetails
 from recourse.cases.drafts import MAX_DRAFTS_PER_CASE
-from recourse.db.models import Actor, CaseStatus
+from recourse.db.models import Actor, CaseStatus, OutboundStatus
+from recourse.email.channel import ChannelKind
 from recourse.rules.models import BankType
 from recourse.temporal.case_types import (
     APPROVE_DRAFT,
@@ -32,6 +33,8 @@ from recourse.temporal.case_types import (
     DRAFT,
     INVALID_USER_INPUT,
     MARK_ABANDONED,
+    PREPARE_SEND,
+    RECORD_SENT,
     REJECT_DRAFT,
     RUN_INTAKE,
     AbandonRequest,
@@ -49,7 +52,11 @@ from recourse.temporal.case_types import (
     DraftSummary,
     IntakeSummary,
     MarkAbandonedInput,
+    MarkSent,
+    PrepareSendInput,
+    RecordSentInput,
     RunIntakeInput,
+    SendSummary,
 )
 from recourse.temporal.case_workflow import CaseWorkflow
 
@@ -74,6 +81,8 @@ class FakeActivities:
     draft: list[Any] = field(default_factory=lambda: [drafted()])
     approve: list[Any] = field(default_factory=lambda: [None])
     reject: list[Any] = field(default_factory=lambda: [None])
+    prepare: list[Any] = field(default_factory=lambda: [prepared()])
+    record: list[Any] = field(default_factory=lambda: [None])
     calls: list[tuple[str, Any]] = field(default_factory=list)
 
     def _next(self, name: str, script: list[Any], arg: Any) -> Any:
@@ -112,11 +121,30 @@ class FakeActivities:
         async def reject_draft(inp: DraftDecisionInput) -> None:
             self._next(REJECT_DRAFT, self.reject, inp)
 
+        @activity.defn(name=PREPARE_SEND)
+        async def prepare_send(inp: PrepareSendInput) -> SendSummary:
+            result: SendSummary = self._next(PREPARE_SEND, self.prepare, inp)
+            return result
+
+        @activity.defn(name=RECORD_SENT)
+        async def record_sent(inp: RecordSentInput) -> None:
+            self._next(RECORD_SENT, self.record, inp)
+
         @activity.defn(name=MARK_ABANDONED)
         async def mark_abandoned(inp: MarkAbandonedInput) -> None:
             self.calls.append((MARK_ABANDONED, inp))
 
-        return [run_intake, confirm, assess, draft, approve_draft, reject_draft, mark_abandoned]
+        return [
+            run_intake,
+            confirm,
+            assess,
+            draft,
+            approve_draft,
+            reject_draft,
+            prepare_send,
+            record_sent,
+            mark_abandoned,
+        ]
 
     def names(self) -> list[str]:
         return [name for name, _ in self.calls]
@@ -124,6 +152,16 @@ class FakeActivities:
 
 def drafted(status: DraftStatus = DraftStatus.DRAFTED) -> DraftSummary:
     return DraftSummary(draft_id=uuid.uuid4(), status=status, rules_verified=False)
+
+
+def prepared(status: OutboundStatus = OutboundStatus.PREPARED, *reasons: str) -> SendSummary:
+    return SendSummary(
+        email_id=uuid.uuid4(),
+        channel=ChannelKind.MANUAL,
+        status=status,
+        sandbox=True,
+        blocked_reasons=list(reasons),
+    )
 
 
 @pytest_asyncio.fixture(scope="module", loop_scope="module")
@@ -330,7 +368,9 @@ async def test_approve_the_current_draft(env: WorkflowEnvironment) -> None:
         await handle.result()
         history = await handle.fetch_history()
 
-    assert fakes.names() == [RUN_INTAKE, CONFIRM, ASSESS, DRAFT, APPROVE_DRAFT, MARK_ABANDONED]
+    assert fakes.names() == [
+        RUN_INTAKE, CONFIRM, ASSESS, DRAFT, APPROVE_DRAFT, PREPARE_SEND, MARK_ABANDONED
+    ]  # fmt: skip
     approve_arg: DraftDecisionInput = fakes.calls[4][1]
     assert approve_arg.draft_id == first.draft_id
     await Replayer(
@@ -354,7 +394,8 @@ async def test_reject_drafts_again(env: WorkflowEnvironment) -> None:
         await handle.result()
 
     assert fakes.names() == [
-        RUN_INTAKE, CONFIRM, ASSESS, DRAFT, REJECT_DRAFT, DRAFT, APPROVE_DRAFT, MARK_ABANDONED
+        RUN_INTAKE, CONFIRM, ASSESS, DRAFT, REJECT_DRAFT, DRAFT, APPROVE_DRAFT, PREPARE_SEND,
+        MARK_ABANDONED,
     ]  # fmt: skip
     seqs = [arg.seq for name, arg in fakes.calls if name == DRAFT]
     assert seqs == [1, 2]
@@ -444,3 +485,106 @@ async def test_abandon_while_awaiting_approval(env: WorkflowEnvironment) -> None
         outcome: CaseOutcome = await handle.result()
     assert outcome.reason == "bank already paid"
     assert fakes.names()[-2:] == [DRAFT, MARK_ABANDONED]
+
+
+# =================================================================================================
+# Sending (ManualChannel)
+# =================================================================================================
+
+SENT_AT = datetime(2026, 11, 19, 10, 0, tzinfo=UTC)
+
+
+async def to_approved(env: WorkflowEnvironment, fakes: FakeActivities) -> WorkflowHandle[Any, Any]:
+    handle = await to_approval(env, fakes)
+    state = await wait_for(handle, lambda s: s.draft_id is not None)
+    assert state.draft_id is not None
+    await handle.signal(CaseWorkflow.approve_draft, DraftDecision(draft_id=state.draft_id))
+    return handle
+
+
+async def test_manual_send_to_sent_to_bank(env: WorkflowEnvironment) -> None:
+    email = prepared()
+    fakes = FakeActivities(
+        prepare=[email], record=[bad_input("The send time is in the future."), None]
+    )
+    async with worker(env, fakes):
+        handle = await to_approved(env, fakes)
+        state = await wait_for(handle, lambda s: s.awaiting_manual_send)
+        assert state.email_id == email.email_id
+        assert state.status is CaseStatus.AWAITING_APPROVAL
+
+        await handle.signal(CaseWorkflow.mark_sent, MarkSent(sent_at=SENT_AT))
+        state = await wait_for(handle, lambda s: s.last_error is not None)
+        assert state.last_error == "The send time is in the future."
+        assert state.awaiting_manual_send
+
+        await handle.signal(CaseWorkflow.mark_sent, MarkSent(sent_at=SENT_AT))
+        state = await wait_for(handle, lambda s: s.status is CaseStatus.SENT_TO_BANK)
+        assert not state.awaiting_manual_send and state.last_error is None
+
+        await handle.signal(CaseWorkflow.abandon, AbandonRequest())
+        await handle.result()
+        history = await handle.fetch_history()
+
+    record_arg: RecordSentInput = fakes.calls[-2][1]
+    assert record_arg.email_id == email.email_id and record_arg.mark.sent_at == SENT_AT
+    prepare_arg: PrepareSendInput = next(a for n, a in fakes.calls if n == PREPARE_SEND)
+    assert prepare_arg.draft_id == next(a for n, a in fakes.calls if n == APPROVE_DRAFT).draft_id
+    await Replayer(
+        workflows=[CaseWorkflow], data_converter=pydantic_data_converter
+    ).replay_workflow(history)
+
+
+async def test_blocked_send_waits_for_retry(env: WorkflowEnvironment) -> None:
+    ok = prepared()
+    fakes = FakeActivities(
+        prepare=[prepared(OutboundStatus.BLOCKED, "The bank is not known; choose your bank."), ok]
+    )
+    async with worker(env, fakes):
+        handle = await to_approved(env, fakes)
+        state = await wait_for(handle, lambda s: s.can_retry_send)
+        assert "choose your bank" in (state.last_error or "")
+        assert not state.awaiting_manual_send
+
+        await handle.signal(CaseWorkflow.retry_send)
+        state = await wait_for(handle, lambda s: s.awaiting_manual_send)
+        assert state.email_id == ok.email_id and not state.can_retry_send
+        assert state.last_error is None
+        await handle.signal(CaseWorkflow.abandon, AbandonRequest())
+        await handle.result()
+    assert fakes.names().count(PREPARE_SEND) == 2
+
+
+async def test_a_channel_that_sends_itself_skips_mark_sent(env: WorkflowEnvironment) -> None:
+    fakes = FakeActivities(prepare=[prepared(OutboundStatus.SENT)])
+    async with worker(env, fakes):
+        handle = await to_approved(env, fakes)
+        await wait_for(handle, lambda s: s.status is CaseStatus.SENT_TO_BANK)
+        await handle.signal(CaseWorkflow.abandon, AbandonRequest())
+        await handle.result()
+    assert RECORD_SENT not in fakes.names()
+
+
+async def test_mark_sent_before_the_email_exists_is_ignored(env: WorkflowEnvironment) -> None:
+    fakes = FakeActivities()
+    async with worker(env, fakes):
+        handle = await to_approval(env, fakes)
+        state = await wait_for(handle, lambda s: s.draft_id is not None)
+        await handle.signal(CaseWorkflow.mark_sent, MarkSent(sent_at=SENT_AT))  # too early
+        assert state.draft_id is not None
+        await handle.signal(CaseWorkflow.approve_draft, DraftDecision(draft_id=state.draft_id))
+        await wait_for(handle, lambda s: s.awaiting_manual_send)
+        await handle.signal(CaseWorkflow.abandon, AbandonRequest())
+        await handle.result()
+    assert RECORD_SENT not in fakes.names()
+
+
+async def test_abandon_while_waiting_for_the_user_to_send(env: WorkflowEnvironment) -> None:
+    fakes = FakeActivities()
+    async with worker(env, fakes):
+        handle = await to_approved(env, fakes)
+        await wait_for(handle, lambda s: s.awaiting_manual_send)
+        await handle.signal(CaseWorkflow.abandon, AbandonRequest())
+        outcome: CaseOutcome = await handle.result()
+    assert outcome.status is CaseStatus.ABANDONED
+    assert fakes.names()[-2:] == [PREPARE_SEND, MARK_ABANDONED]

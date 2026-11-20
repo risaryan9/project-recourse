@@ -20,6 +20,7 @@ from temporalio.testing import ActivityEnvironment
 from recourse.agents.draft_graph import DRAFT_PURPOSE
 from recourse.api.deps import get_runner, get_session_factory
 from recourse.api.main import create_app
+from recourse.config import Settings
 from recourse.db.models import Case, CaseStatus, DraftRecord, Upload, UploadFile
 from recourse.evidence.models import IST
 from recourse.llm.fake import FakeLLM
@@ -31,7 +32,10 @@ from recourse.temporal.case_types import (
     CaseState,
     Confirmation,
     ConfirmInput,
+    DraftDecisionInput,
     DraftInput,
+    MarkSent,
+    PrepareSendInput,
     RunIntakeInput,
 )
 from tests.db.test_case_activities import NONE, sms_llm
@@ -50,6 +54,9 @@ class FakeRunner:
     approved: list[uuid.UUID] = field(default_factory=list)
     rejected: list[uuid.UUID] = field(default_factory=list)
     redrafts: list[uuid.UUID] = field(default_factory=list)
+    marks: list[MarkSent] = field(default_factory=list)
+    retries: list[uuid.UUID] = field(default_factory=list)
+    can_retry_send: bool = False
     fail_start: bool = False
     last_error: str | None = None
     can_redraft: bool = False
@@ -74,9 +81,18 @@ class FakeRunner:
     async def redraft(self, case_id: uuid.UUID) -> None:
         self.redrafts.append(case_id)
 
+    async def mark_sent(self, case_id: uuid.UUID, mark: MarkSent) -> None:
+        self.marks.append(mark)
+
+    async def retry_send(self, case_id: uuid.UUID) -> None:
+        self.retries.append(case_id)
+
     async def state(self, case_id: uuid.UUID) -> CaseState | None:
         return CaseState(
-            status=CaseStatus.EXTRACTED, last_error=self.last_error, can_redraft=self.can_redraft
+            status=CaseStatus.EXTRACTED,
+            last_error=self.last_error,
+            can_redraft=self.can_redraft,
+            can_retry_send=self.can_retry_send,
         )
 
 
@@ -324,3 +340,69 @@ async def test_redraft_only_when_the_workflow_waits_for_it(
     runner.can_redraft = True
     assert (await client.post(f"/cases/{case_id}/redraft")).status_code == 202
     assert runner.redrafts == [inp.case_id]
+
+
+# =================================================================================================
+# Sending
+# =================================================================================================
+
+
+async def test_bank_list_and_choice(
+    api: tuple[httpx.AsyncClient, FakeRunner], sessions: async_sessionmaker[AsyncSession]
+) -> None:
+    client, runner = api
+    banks = (await client.get("/banks")).json()
+    assert {"pnb", "hdfc", "sbi"} <= {b["id"] for b in banks}
+    assert not any(b["verified"] for b in banks)
+
+    r = await client.post("/cases", data={"text": "Rs 2,450 debited via UPI, failed"})
+    case_id = r.json()["id"]
+    await intake(sessions, runner.started[-1])
+    assert (await client.get(f"/cases/{case_id}")).json()["bank"] is None  # "Example Bank"
+
+    assert (await client.put(f"/cases/{case_id}/bank", json={"bank_id": "nope"})).status_code == 422
+    ok = await client.put(f"/cases/{case_id}/bank", json={"bank_id": "pnb"})
+    assert ok.status_code == 200 and ok.json()["name"] == "Punjab National Bank"
+    view = (await client.get(f"/cases/{case_id}")).json()
+    assert view["bank"]["id"] == "pnb"
+    assert view["timeline"][-1]["event_type"] == "case.bank_selected"
+
+
+async def test_manual_send_through_the_api(
+    api: tuple[httpx.AsyncClient, FakeRunner], sessions: async_sessionmaker[AsyncSession]
+) -> None:
+    client, runner = api
+    case_id, draft_id = await drafted_case(client, runner, sessions)
+    assert (await client.get(f"/cases/{case_id}/email")).status_code == 404
+    assert (await client.post(f"/cases/{case_id}/email/mark-sent")).status_code == 409
+
+    await client.post(
+        f"/cases/{case_id}/drafts/{draft_id}/approve", json={"customer_name": "Asha Verma"}
+    )
+    # What the worker does after the approve_draft signal.
+    acts = CaseActivities(
+        sessions,
+        FakeLLM({}),
+        settings=Settings(email_sandbox=True, sandbox_recipient="sandbox@example.com"),
+    )
+    env = ActivityEnvironment()
+    cid, did = uuid.UUID(case_id), uuid.UUID(draft_id)
+    await env.run(acts.approve_draft, DraftDecisionInput(case_id=cid, draft_id=did, now=NOW))
+    await env.run(acts.prepare_send, PrepareSendInput(case_id=cid, draft_id=did))
+
+    email = (await client.get(f"/cases/{case_id}")).json()["email"]
+    assert email["status"] == "PREPARED" and email["sandbox"] is True
+    assert email["to"] == "sandbox@example.com"
+    assert email["mailto"].startswith("mailto:sandbox@example.com?subject=")
+    assert email["body"].endswith("Asha Verma")
+
+    future = {"sent_at": "2099-01-01T10:00:00+05:30"}
+    assert (await client.post(f"/cases/{case_id}/email/mark-sent", json=future)).status_code == 422
+    r = await client.post(f"/cases/{case_id}/email/mark-sent")
+    assert r.status_code == 202
+    [mark] = runner.marks
+    assert mark.sent_at.tzinfo is not None
+
+    assert (await client.post(f"/cases/{case_id}/email/retry")).status_code == 409
+    runner.can_retry_send = True
+    assert (await client.post(f"/cases/{case_id}/email/retry")).status_code == 202

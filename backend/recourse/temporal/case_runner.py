@@ -21,6 +21,7 @@ from recourse.temporal.case_types import (
     CaseState,
     Confirmation,
     DraftDecision,
+    MarkSent,
 )
 from recourse.temporal.case_workflow import CaseWorkflow
 
@@ -45,6 +46,8 @@ class CaseRunner(Protocol):
     async def approve_draft(self, case_id: uuid.UUID, draft_id: uuid.UUID) -> None: ...
     async def reject_draft(self, case_id: uuid.UUID, draft_id: uuid.UUID) -> None: ...
     async def redraft(self, case_id: uuid.UUID) -> None: ...
+    async def mark_sent(self, case_id: uuid.UUID, mark: MarkSent) -> None: ...
+    async def retry_send(self, case_id: uuid.UUID) -> None: ...
     async def state(self, case_id: uuid.UUID) -> CaseState | None: ...
 
 
@@ -79,6 +82,12 @@ class TemporalCaseRunner:
 
     async def redraft(self, case_id: uuid.UUID) -> None:
         await self._handle(case_id).signal(CaseWorkflow.redraft)
+
+    async def mark_sent(self, case_id: uuid.UUID, mark: MarkSent) -> None:
+        await self._handle(case_id).signal(CaseWorkflow.mark_sent, mark)
+
+    async def retry_send(self, case_id: uuid.UUID) -> None:
+        await self._handle(case_id).signal(CaseWorkflow.retry_send)
 
     async def state(self, case_id: uuid.UUID) -> CaseState | None:
         """The live workflow state, or None if the workflow cannot be reached right now."""

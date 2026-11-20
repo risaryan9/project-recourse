@@ -13,6 +13,8 @@ Tables:
 * `entitlements`: the rule engine's answer for a case (one row per case, replaced on reassessment).
 * `drafts`: every letter drafted for a case (`seq` 1, 2, ...), its approval state, and the
   final text the user approved (ADR-011).
+* `outbound_emails`: an approved letter on its way to the bank: channel, recipient, sandbox
+  flag, and whether (and when) it was sent (ADR-012). One per approved draft.
 * `audit_events`: append-only log of everything that happens to a case. Postgres rejects
   UPDATEs on it (trigger in the first migration). Details are PII-redacted before insert
   (`recourse.db.audit.record_event`).
@@ -124,6 +126,9 @@ class Case(_Timestamps, Base):
     # Short tag for email subjects, e.g. "RC-7F3K" (recourse.db.case_tag).
     case_tag: Mapped[str] = mapped_column(String(16), unique=True)
     status: Mapped[CaseStatus] = mapped_column(_str_enum(CaseStatus), default=CaseStatus.NEW)
+    # The bank the complaint goes to (an id in recourse/email/bank_contacts.yaml), if the user
+    # chose it; otherwise it is matched from the extracted bank name.
+    bank_id: Mapped[str | None] = mapped_column(String(32))
     # The user's direct answers (recourse.cases.assessment.CaseDetails as JSON).
     details: Mapped[dict[str, Any]] = mapped_column(
         JSONB, default=dict, server_default=text("'{}'::jsonb")
@@ -258,6 +263,36 @@ class DraftRecord(_Timestamps, Base):
     final_body: Mapped[str | None] = mapped_column(Text)
     reject_reason: Mapped[str | None] = mapped_column(Text)
     approved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class OutboundStatus(StrEnum):
+    BLOCKED = "BLOCKED"  # the send policy refused (reasons in `blocked_reasons`)
+    PREPARED = "PREPARED"  # ready; for ManualChannel, waiting for the user to send it
+    SENT = "SENT"
+
+
+class OutboundEmail(_Timestamps, Base):
+    __tablename__ = "outbound_emails"
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    case_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("cases.id", ondelete="CASCADE"), index=True
+    )
+    draft_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("drafts.id", ondelete="CASCADE"), unique=True
+    )
+    channel: Mapped[str] = mapped_column(String(16))  # recourse.email.channel.ChannelKind
+    status: Mapped[OutboundStatus] = mapped_column(_str_enum(OutboundStatus, length=16))
+    sandbox: Mapped[bool] = mapped_column(Boolean)
+    bank_id: Mapped[str | None] = mapped_column(String(32))
+    recipient: Mapped[str | None] = mapped_column(String(320))
+    subject: Mapped[str] = mapped_column(Text)
+    body: Mapped[str] = mapped_column(Text)
+    blocked_reasons: Mapped[list[str]] = mapped_column(JSONB, default=list)
+    sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # GmailChannel only
+    message_id: Mapped[str | None] = mapped_column(String(128))
+    thread_id: Mapped[str | None] = mapped_column(String(128))
 
 
 class AuditEvent(Base):

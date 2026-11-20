@@ -1,0 +1,174 @@
+# Grievance contacts of major Indian banks, for addressing complaint emails.
+#
+# Rules (CLAUDE.md §3 "Bank contacts file"):
+# - Values come ONLY from the bank's own official website; `source_urls` lists the pages read.
+# - Every entry starts `verified: false`. A maintainer flips it after checking the live page.
+#   Real (non-sandbox) sending is refused for unverified entries (ADR-012).
+# - `null` means "not found on the official pages read" (never guessed). `notes` says why.
+# - `sender_domains`: no bank states its sending domains, so these are the domains of the
+#   official contact addresses listed here (`sender_domains_basis: contact_emails`). Banks
+#   moved to the RBI-mandated `.bank.in` domain in 2025; old domains redirect there.
+# - Researched 2026-11-19.
+
+version: 1
+banks:
+  - id: sbi
+    name: State Bank of India
+    aliases: [sbi, state bank of india, state bank]
+    grievance_email: null
+    nodal_officer: null
+    complaint_form_url: null
+    sender_domains: []
+    sender_domains_basis: none
+    source_urls:
+      - https://sbi.bank.in/web/customer-care/grievance-redressal
+    verified: false
+    notes: "Grievance page returned 404 on the new domain; contact details not yet found."
+
+  - id: hdfc
+    name: HDFC Bank
+    aliases: [hdfc, hdfc bank, hdfc bank ltd]
+    grievance_email: support@hdfcbank.com
+    nodal_officer: null
+    complaint_form_url: https://connect.hdfc.bank.in/applications/webforms/apply/HDFC_CustomerCenter/Customer_Center.aspx
+    sender_domains: [hdfcbank.com, hdfc.bank.in]
+    sender_domains_basis: contact_emails
+    source_urls:
+      - https://www.hdfc.bank.in/contact-us
+    verified: false
+    notes: >-
+      Contact page lists "Retail Banking / ATM/Debit Cards / Mutual Fund: support@hdfcbank.com"
+      as an email channel; it does not say it is the first-level grievance address. Grievance
+      Redressal Officer page was not reachable (404/403).
+
+  - id: icici
+    name: ICICI Bank
+    aliases: [icici, icici bank, icici bank ltd]
+    grievance_email: null
+    nodal_officer: null
+    complaint_form_url: null
+    sender_domains: []
+    sender_domains_basis: none
+    source_urls:
+      - https://www.icici.bank.in/complaints
+    verified: false
+    notes: "Complaints page returned a malformed redirect; contact details not yet found."
+
+  - id: axis
+    name: Axis Bank
+    aliases: [axis, axis bank, axis bank ltd]
+    grievance_email: null
+    nodal_officer: null
+    complaint_form_url: https://application.axis.bank.in/webforms/axis-support/index.aspx?complaintpopup=y
+    sender_domains: []
+    sender_domains_basis: none
+    source_urls:
+      - https://www.axis.bank.in/contact-us
+    verified: false
+    notes: "No customer complaint email found on the contact page (only online forms)."
+
+  - id: kotak
+    name: Kotak Mahindra Bank
+    aliases: [kotak, kotak mahindra, kotak mahindra bank, kotak bank]
+    grievance_email: null
+    nodal_officer:
+      name: A Shah
+      role: Principal Nodal Officer
+      email: null
+      phone: null
+    complaint_form_url: null
+    sender_domains: []
+    sender_domains_basis: none
+    source_urls:
+      - https://www.kotak.bank.in/en/customer-service/grievance-redressal.html
+    verified: false
+    notes: >-
+      Email addresses on the grievance page are hidden by email-obfuscation and could not be
+      read by an automated fetch; check in a browser. Toll free: 1800 4100.
+
+  - id: pnb
+    name: Punjab National Bank
+    aliases: [pnb, punjab national bank]
+    grievance_email: care@pnb.bank.in
+    nodal_officer:
+      name: Sh. Ashutosh Kumar Jha
+      role: Principal Nodal Officer (General Manager, Customer Care Centre)
+      email: pno@pnb.bank.in
+      phone: "+91-124-4126244"
+    complaint_form_url: https://pnb.bank.in/CcsrmsFormComplaint.aspx
+    sender_domains: [pnb.bank.in]
+    sender_domains_basis: contact_emails
+    source_urls:
+      - https://pnb.bank.in/contact-us.html
+      - https://pnb.bank.in/Lodge-Complaint.html
+    verified: false
+    notes: 'Contact page shows "care[at]pnb[dot]bank[dot]in" under Customer Care Division.'
+
+  - id: bob
+    name: Bank of Baroda
+    aliases: [bob, bank of baroda, baroda]
+    grievance_email: cs.ho@bankofbaroda.bank.in
+    nodal_officer:
+      name: Shri Nikhil Mohan
+      role: Principal Nodal Officer (General Manager, Operations & Services)
+      email: null
+      phone: "(0265) 2316719"
+    complaint_form_url: https://bobcrm.bankofbaroda.bank.in/onlinecomplaint/
+    sender_domains: [bankofbaroda.bank.in]
+    sender_domains_basis: contact_emails
+    source_urls:
+      - https://bankofbaroda.bank.in/contact-us
+      - https://bankofbaroda.bank.in/customer-support/grievance-redressal
+    verified: false
+    notes: "Email read from a summarised (not verbatim) page; check it on the live page."
+
+  - id: canara
+    name: Canara Bank
+    aliases: [canara, canara bank]
+    grievance_email: null
+    nodal_officer:
+      name: Sri. T K Venugopal
+      role: Chief General Manager & Principal Nodal Officer
+      email: null
+      phone: "080-22239011"
+    complaint_form_url: https://crmcpgrs.canarabank.bank.in/
+    sender_domains: []
+    sender_domains_basis: none
+    source_urls:
+      - https://www.canarabank.bank.in/complaint
+      - https://www.canarabank.bank.in/details-of-principal-nodal-officer-at-head-office
+    verified: false
+    notes: "No complaint email on the pages read; toll free 1800 1030."
+
+  - id: union
+    name: Union Bank of India
+    aliases: [union bank, union bank of india, ubi]
+    grievance_email: customercare@unionbankofindia.bank.in
+    nodal_officer: null
+    complaint_form_url: https://service.unionbankportal.bank.in/portal/en/signin
+    sender_domains: [unionbankofindia.bank.in]
+    sender_domains_basis: contact_emails
+    source_urls:
+      - https://www.unionbankofindia.bank.in/en/common/grievance-redressal
+    verified: false
+    notes: 'Page says "Dedicated Customer service Email ID- customercare@unionbankofindia.bank.in".'
+
+  - id: indusind
+    name: IndusInd Bank
+    aliases: [indusind, indusind bank, indusind bank ltd]
+    grievance_email: reachus@indusind.com
+    nodal_officer:
+      name: Ms. D. Sidhwa
+      role: Principal Nodal Officer
+      email: pno@indusind.com
+      phone: "(022) 6155 3705"
+    complaint_form_url: https://www.indusind.bank.in/in/en/microsites/forms/grievance-redressal.html
+    sender_domains: [indusind.com, indusind.bank.in]
+    sender_domains_basis: contact_emails
+    source_urls:
+      - https://www.indusind.bank.in/in/en/personal/reach-us.html
+      - https://www.indusind.bank.in/in/en/personal/grievance-redressal.html
+    verified: false
+    notes: >-
+      reachus@indusind.com is listed as the "Escalation Email ID" for banking accounts and debit
+      cards; Level 2 nodal officer: nodal.officer@indusind.com.

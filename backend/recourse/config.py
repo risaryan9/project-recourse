@@ -52,6 +52,11 @@ class Settings(BaseSettings):
     demo_mode: bool = False
     demo_day_seconds: int = Field(default=60, gt=0)
 
+    # --- Email ---
+    # Sandbox (default on): every outgoing email goes to `sandbox_recipient`, never to a bank.
+    email_sandbox: bool = True
+    sandbox_recipient: str | None = None
+
     # --- API ---
     cors_origins: list[str] = ["http://localhost:3000"]
 
