@@ -1,0 +1,6 @@
+# Same rules as the backend, but long lines are allowed: the datasets and report templates
+# hold hand-written sentences and table rows that read better unwrapped.
+extend = "../backend/pyproject.toml"
+
+[lint]
+extend-ignore = ["E501"]

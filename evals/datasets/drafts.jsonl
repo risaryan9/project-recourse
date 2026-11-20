@@ -1,0 +1,10 @@
+{"id": "d-upi-transfer", "facts_from": "sms-01", "bank": "HDFC Bank", "kind": "BANK_COMPLAINT", "letter_date": "2026-11-20"}
+{"id": "d-atm", "facts_from": "sms-02", "bank": "ICICI Bank", "kind": "BANK_COMPLAINT", "letter_date": "2026-11-20"}
+{"id": "d-imps", "facts_from": "sms-03", "bank": "State Bank of India", "kind": "BANK_COMPLAINT", "letter_date": "2026-11-20"}
+{"id": "d-card-pos", "facts_from": "sms-05", "bank": "Kotak Mahindra Bank", "kind": "BANK_COMPLAINT", "letter_date": "2026-11-20"}
+{"id": "d-nach", "facts_from": "sms-09", "bank": "Union Bank of India", "kind": "BANK_COMPLAINT", "letter_date": "2026-11-20"}
+{"id": "d-upi-merchant", "facts_from": "sms-10", "bank": "IndusInd Bank", "kind": "BANK_COMPLAINT", "letter_date": "2026-11-20"}
+{"id": "d-fraud-unreported", "facts_from": "sms-04", "bank": "Axis Bank", "kind": "BANK_COMPLAINT", "letter_date": "2026-11-20", "details": {"bank_type": "COMMERCIAL_BANK", "account_type": "SAVINGS", "fault": "UNKNOWN"}}
+{"id": "d-fraud-third-party", "facts_from": "desc-03", "bank": "Kotak Mahindra Bank", "kind": "BANK_COMPLAINT", "letter_date": "2026-11-20", "details": {"bank_type": "COMMERCIAL_BANK", "account_type": "SAVINGS", "fault": "THIRD_PARTY", "reported_to_bank_date": "2026-11-18", "reported_to_ncrp_date": "2026-11-19"}}
+{"id": "o-upi-no-reply", "facts_from": "sms-01", "bank": "HDFC Bank", "kind": "OMBUDSMAN_COMPLAINT", "letter_date": "2026-12-22", "escalation": {"complained_on": "2026-11-20", "bank_response": "NO_REPLY", "complaint_ref": "HDFC/CMP/2026/884213"}}
+{"id": "o-atm-rejected", "facts_from": "sms-02", "bank": "ICICI Bank", "kind": "OMBUDSMAN_COMPLAINT", "letter_date": "2026-11-27", "escalation": {"complained_on": "2026-11-20", "bank_response": "REJECTED_NO_REASONS", "last_reply_on": "2026-11-26", "unsatisfactory": true}}

@@ -394,8 +394,10 @@ temporal server start-dev --ui-port 8233  # Web UI at http://localhost:8233
 # frontend
 cd frontend && npm install && npm run dev
 
-# evals
-uv run python ../evals/run_evals.py
+# evals (from backend/)
+uv run python ../evals/run_evals.py                  # all suites (paid: extraction, drafts, attacks)
+uv run python ../evals/run_evals.py --suites rules   # free suite only
+uv run python ../evals/make_synthetic.py             # rebuild the synthetic dataset and screenshots
 ```
 
 ### Environment variables (`.env.example`)
@@ -409,7 +411,7 @@ ANTHROPIC_TIMEOUT_SECONDS=120
 OPENAI_MAIN_MODEL=gpt-6.1-sol
 OPENAI_EXTRACT_MODEL=gpt-6.1-terra
 LLM_PROVIDERS=["anthropic","openai"]
-OPENAI_JUDGE_MODEL=
+OPENAI_JUDGE_MODEL=gpt-6.1-sol
 OPENAI_EMBED_MODEL=
 DATABASE_URL=postgresql+psycopg://...neon.tech/neondb?sslmode=require
 TEST_DATABASE_URL=
@@ -465,7 +467,7 @@ Dated milestones live in `context/initial-context.md`.
    
    Code must treat `TEMPORAL_ADDRESS` as config only. Always provide a `docker-compose` path so anyone can run the full stack locally.
    - **Escape hatch:** if hosting Temporal fails, **DBOS** (durable workflows on Postgres only) can replace it.
-2. Exact OpenAI model IDs for the judge and embeddings (check current names in the OpenAI dashboard).
+2. Exact OpenAI model ID for embeddings (check current names in the OpenAI dashboard). The judge is resolved: `OPENAI_JUDGE_MODEL=gpt-6.1-sol`.
 3. Any rule marked **VERIFY** in §4, and any bank contact marked **VERIFY**.
 4. ~~`DESIGN.md` theme~~: resolved. Custom design language in `DESIGN.md` (no shadcnblocks theme).
 
