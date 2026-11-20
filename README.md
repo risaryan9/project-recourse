@@ -142,7 +142,10 @@ Open-source libraries and tools:
 - [SQLAlchemy](https://www.sqlalchemy.org/), [Alembic](https://alembic.sqlalchemy.org/),
   [psycopg](https://www.psycopg.org/), [PyYAML](https://pyyaml.org/)
 - [Next.js](https://nextjs.org/), [React](https://react.dev/),
-  [Tailwind CSS](https://tailwindcss.com/)
+  [Tailwind CSS](https://tailwindcss.com/), [shadcn/ui](https://ui.shadcn.com/) with
+  [Base UI](https://base-ui.com/), [Motion](https://motion.dev/),
+  [Lucide](https://lucide.dev/)
+- Typeface: [Mona Sans](https://github.com/github/mona-sans) by GitHub (SIL Open Font License)
 - [uv](https://github.com/astral-sh/uv), [Ruff](https://github.com/astral-sh/ruff),
   [mypy](https://mypy-lang.org/), [pytest](https://pytest.org/)
 

@@ -297,7 +297,7 @@ The README must have a **"Security & Privacy"** section with this table and the 
 ## 6. Frontend
 
 **Stack (locked in):** Next.js + Tailwind + shadcn/ui.
-- `DESIGN.md` at the repo root holds the theme, taken from shadcnblocks themes (which theme is an open decision, §12).
+- `DESIGN.md` at the repo root holds the design language (near-black, one electric-blue accent, glass, Mona Sans), set by the landing page. Follow it for every screen.
 - Use Anthropic's **frontend-design** skill when building screens.
 - Run **Vercel's Web Interface Guidelines** review before any demo.
 
@@ -467,7 +467,7 @@ Dated milestones live in `context/initial-context.md`.
    - **Escape hatch:** if hosting Temporal fails, **DBOS** (durable workflows on Postgres only) can replace it.
 2. Exact OpenAI model IDs for the judge and embeddings (check current names in the OpenAI dashboard).
 3. Any rule marked **VERIFY** in §4, and any bank contact marked **VERIFY**.
-4. **`DESIGN.md` theme:** which shadcnblocks theme to use.
+4. ~~`DESIGN.md` theme~~: resolved. Custom design language in `DESIGN.md` (no shadcnblocks theme).
 
 ---
 
