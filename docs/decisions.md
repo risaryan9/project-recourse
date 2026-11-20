@@ -524,3 +524,44 @@ The wait can last weeks, and must shrink to minutes in `DEMO_MODE`.
   the engine's calendar dates.
 - `assess_escalation` is pure given the stored facts and `as_of`, so it can be re-run whenever
   something changes (a bank reply, the user's bank type answer).
+
+## ADR-014: Judging the bank's reply (ReplyJudgeGraph)
+
+### Context
+A bank reply decides what happens next (keep waiting, close, escalate), but it is untrusted
+text from outside: it may be phishing, spoofed, or contain a prompt injection
+(CLAUDE.md §3 ReplyJudgeGraph, §5).
+
+### Decision
+- **Stored first, judged by ID.** A reply is PII-redacted and stored in `bank_replies`
+  (migration 0006); only its ID crosses into the workflow. `judge_reply` is idempotent: a
+  judged reply is never sent to the LLM again.
+- **ReplyJudgeGraph has no tools**: `screen → (classify → judge) | suspicious`.
+  - `screen` is pure Python (`security/phishing.py`, `security/injection.py`): requests for
+    OTP/PIN/CVV/password/card details (not when negated, as in "never share your OTP"),
+    remote-access apps, pay-to-release requests, links outside the bank's and official
+    domains, a sender outside the bank's known domains, and text addressed to an AI.
+    **A reply that trips any of these never reaches the LLM**: the user gets fixed warning
+    texts, the case keeps waiting, and the reply does not count as a bank communication.
+  - `classify` (EXTRACT model) sees the reply only as `<untrusted_document>` and returns a
+    fixed label (`ACKNOWLEDGEMENT, RESOLVED, PARTIAL, REJECTED_WITH_REASONS,
+    REJECTED_NO_REASONS, NEEDS_INFO, UNCLEAR`), the complaint number (format-checked) and the
+    amounts the bank says it paid. No free text.
+  - `judge` is pure Python. **Compliance is decided by code**: paid (reversal + compensation)
+    against what the rule engine says is owed, re-assessed as of the reply date (compensation
+    accrues daily).
+- **Verdict → next action** (decided in code, acted on by the workflow):
+  suspicious → `WARN`; acknowledgement → `KEEP_WAITING` (complaint number saved);
+  needs info → `USER_ACTION`; paid in full → `PROPOSE_RESOLVED` (the user confirms);
+  partial / short payment / rejection without reasons → `ESCALATE` (an unsatisfactory reply,
+  RB-IOS 10(1)(f)); rejection with reasons / unclear → `ASK_USER` (the customer decides
+  whether it is unsatisfactory).
+- `assess_escalation` now uses genuine judged replies: the latest one is the bank's last
+  communication (it can move the filing deadline), and an unsatisfactory one makes the case
+  eligible from the reply date.
+
+### Consequences
+- A pasted reply has no sender, so the sender check is `UNKNOWN`; it only bites for Gmail.
+- The deterministic screen can have false positives; they only cost a warning, never an
+  action. False negatives are backed by the LLM-has-no-tools design.
+- "Paid" relies on the amounts the bank states; the user confirms receipt before closing.

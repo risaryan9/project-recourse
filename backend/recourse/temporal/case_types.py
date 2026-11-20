@@ -15,6 +15,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from recourse.agents.draft_graph import DraftStatus
 from recourse.agents.intake_graph import IntakeStatus
+from recourse.agents.reply_judge_graph import NextAction, ReplyLabel
 from recourse.cases.review import Confirmation as Confirmation  # the confirm signal payload
 from recourse.db.models import Actor, CaseStatus, OutboundStatus
 from recourse.email.channel import ChannelKind
@@ -30,6 +31,7 @@ REJECT_DRAFT = "case.reject_draft"
 PREPARE_SEND = "case.prepare_send"
 RECORD_SENT = "case.record_sent"
 ASSESS_ESCALATION = "case.assess_escalation"
+JUDGE_REPLY = "case.judge_reply"
 
 # Error type for ApplicationErrors caused by bad user input (never retried).
 INVALID_USER_INPUT = "InvalidUserInput"
@@ -187,6 +189,22 @@ class EscalationSummary(_Model):
     filing_deadline: date | None
     wait_days: int = Field(ge=0)  # whole days from `as_of` until `eligible_from`
     needs_bank_type: bool = False
+
+
+class JudgeReplyInput(_Model):
+    case_id: uuid.UUID
+    reply_id: uuid.UUID
+
+
+class ReplySummary(_Model):
+    """The verdict on one bank reply (no reply text: that stays in the database)."""
+
+    reply_id: uuid.UUID
+    label: ReplyLabel
+    next_action: NextAction
+    suspicious: bool
+    warnings: list[str] = Field(default_factory=list)
+    complaint_number: str | None = None
 
 
 class MarkAbandonedInput(_Model):

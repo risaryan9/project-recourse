@@ -138,6 +138,8 @@ class Case(_Timestamps, Base):
     bank_complained_on: Mapped[date | None] = mapped_column(Date)
     # Latest RBI Ombudsman escalation assessment (rules.models.EscalationAssessment as JSON).
     escalation: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
+    # The bank's complaint / ticket number, once a reply states it (for follow-up subjects).
+    bank_complaint_ref: Mapped[str | None] = mapped_column(String(40))
 
     evidence: Mapped[list[EvidenceRecord]] = relationship(
         back_populates="case",
@@ -298,6 +300,41 @@ class OutboundEmail(_Timestamps, Base):
     # GmailChannel only
     message_id: Mapped[str | None] = mapped_column(String(128))
     thread_id: Mapped[str | None] = mapped_column(String(128))
+
+
+class ReplySource(StrEnum):
+    PASTE = "PASTE"  # the user pasted or forwarded it (ManualChannel)
+    GMAIL = "GMAIL"  # the reply watcher found it in the complaint's thread
+
+
+class ReplyStatus(StrEnum):
+    PENDING = "PENDING"  # stored, not judged yet
+    JUDGED = "JUDGED"
+
+
+class BankReply(_Timestamps, Base):
+    """A message from the bank about the complaint. `body` is PII-redacted untrusted text: it is
+    only ever given to an LLM as delimited data, and never changes the case by itself."""
+
+    __tablename__ = "bank_replies"
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    case_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("cases.id", ondelete="CASCADE"), index=True
+    )
+    source: Mapped[ReplySource] = mapped_column(_str_enum(ReplySource, length=16))
+    received_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    sender: Mapped[str | None] = mapped_column(String(320))
+    body: Mapped[str] = mapped_column(Text)
+    redactions: Mapped[list[str]] = mapped_column(JSONB, default=list)
+    status: Mapped[ReplyStatus] = mapped_column(_str_enum(ReplyStatus, length=16))
+    # ReplyJudgeGraph result (agents.reply_judge_graph.ReplyVerdict as JSON), once judged.
+    verdict: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
+    label: Mapped[str | None] = mapped_column(String(32))
+    next_action: Mapped[str | None] = mapped_column(String(32))
+    suspicious: Mapped[bool | None] = mapped_column(Boolean)
+    # The reply counts as unsatisfactory for RB-IOS 10(1)(f): by the verdict, or the user's call.
+    unsatisfactory: Mapped[bool] = mapped_column(Boolean, default=False)
 
 
 class AuditEvent(Base):

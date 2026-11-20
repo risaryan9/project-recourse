@@ -27,6 +27,7 @@ from recourse.agents.draft_graph import DraftKind as GraphDraftKind
 from recourse.agents.draft_graph import DraftStatus, run_draft
 from recourse.agents.draft_slots import CUSTOMER_NAME_PLACEHOLDER, SlotError
 from recourse.agents.intake_graph import IntakeInput, IntakeStatus, run_intake
+from recourse.agents.reply_judge_graph import NextAction, ReplyInput, ReplyVerdict, judge_reply
 from recourse.cases.assessment import AssessmentError, CaseDetails, assess, missing_details
 from recourse.cases.drafts import InvalidEdit, latest_draft, recheck_final, slot_table_for
 from recourse.cases.escalation import bank_type_for, days_until, escalation_for
@@ -36,6 +37,7 @@ from recourse.db.audit import record_event
 from recourse.db.models import (
     Actor,
     AuditEvent,
+    BankReply,
     Case,
     CaseStatus,
     DraftKind,
@@ -45,6 +47,7 @@ from recourse.db.models import (
     EvidenceRecord,
     OutboundEmail,
     OutboundStatus,
+    ReplyStatus,
     Upload,
 )
 from recourse.email.channel import (
@@ -67,6 +70,7 @@ from recourse.temporal.case_types import (
     CONFIRM,
     DRAFT,
     INVALID_USER_INPUT,
+    JUDGE_REPLY,
     MARK_ABANDONED,
     PREPARE_SEND,
     RECORD_SENT,
@@ -82,9 +86,11 @@ from recourse.temporal.case_types import (
     EscalationInput,
     EscalationSummary,
     IntakeSummary,
+    JudgeReplyInput,
     MarkAbandonedInput,
     PrepareSendInput,
     RecordSentInput,
+    ReplySummary,
     RunIntakeInput,
     SendSummary,
 )
@@ -129,6 +135,7 @@ class CaseActivities:
             self.prepare_send,
             self.record_sent,
             self.assess_escalation,
+            self.judge_reply,
             self.mark_abandoned,
         ]
 
@@ -594,11 +601,26 @@ class CaseActivities:
             details = CaseDetails.model_validate(case.details)
             contact = self._bank_for(case.bank_id, evidence.payer_bank.value)
             bank_type = bank_type_for(details.bank_type, contact.bank_type if contact else None)
+            # Genuine (not suspicious) judged replies count as the bank's communications.
+            replies = list(
+                await s.scalars(
+                    select(BankReply).where(
+                        BankReply.case_id == case.id,
+                        BankReply.status == ReplyStatus.JUDGED,
+                        BankReply.suspicious.is_(False),
+                    )
+                )
+            )
+            last = max((r.received_at.astimezone(IST).date() for r in replies), default=None)
+            if last is not None:
+                last = min(max(last, complained_on), inp.as_of)
             assessment = escalation_for(
                 entitlement,
                 bank_type=bank_type,
                 complained_on=complained_on,
                 as_of=inp.as_of,
+                last_bank_communication=last,
+                reply_unsatisfactory=last is not None and any(r.unsatisfactory for r in replies),
             )
 
             case.bank_complained_on = complained_on
@@ -608,6 +630,7 @@ class CaseActivities:
             info: dict[str, Any] = {
                 "as_of": inp.as_of.isoformat(),
                 "complained_on": complained_on.isoformat(),
+                "last_bank_communication": _iso(last),
                 "bank_type": bank_type.value if bank_type else None,
                 "entity_coverage": assessment.entity_coverage,
                 "eligible_from": _iso(assessment.eligible_from),
@@ -624,6 +647,87 @@ class CaseActivities:
                 wait_days=days_until(assessment.eligible_from, inp.as_of),
                 needs_bank_type=bank_type is None,
             )
+
+    @activity.defn(name=JUDGE_REPLY)
+    async def judge_reply(self, inp: JudgeReplyInput) -> ReplySummary:
+        """Judge one stored bank reply with the ReplyJudgeGraph and store the verdict.
+
+        What is owed is re-assessed as of the day the reply arrived (compensation for delay
+        keeps growing until the money is returned). Idempotent: a judged reply is returned as
+        it is, without calling the LLM again.
+        """
+        async with self._sessions() as s:
+            reply = await s.get(BankReply, inp.reply_id)
+            if reply is None or reply.case_id != inp.case_id:
+                raise ApplicationError(f"reply {inp.reply_id} not found", non_retryable=True)
+            if reply.status is ReplyStatus.JUDGED:
+                return _reply_summary(reply)
+            case = await s.get(Case, inp.case_id)
+            assert case is not None
+            evidence = (await _latest_evidence(s, case.id)).to_evidence()
+            details = CaseDetails.model_validate(case.details)
+            ent_row = await s.scalar(
+                select(EntitlementRecord).where(EntitlementRecord.case_id == case.id)
+            )
+            if ent_row is None:
+                raise ApplicationError("the case has not been assessed", non_retryable=True)
+            received_on = reply.received_at.astimezone(IST).date()
+            try:
+                entitlement = assess(evidence, details, as_of=max(received_on, ent_row.as_of))
+            except AssessmentError:
+                entitlement = Entitlement.model_validate(ent_row.data)
+            contact = self._bank_for(case.bank_id, evidence.payer_bank.value)
+            judge_input = ReplyInput(
+                text=reply.body,
+                sender=reply.sender,
+                bank_domains=list(contact.sender_domains) if contact else [],
+                entitlement=entitlement,
+            )
+
+        try:
+            verdict = await judge_reply(self._llm, judge_input)
+        except LLMError as e:
+            if e.retryable:
+                raise
+            raise ApplicationError(str(e), type=LLM_FAILED, non_retryable=True) from e
+
+        async with self._sessions.begin() as s:
+            case = await _case_for_update(s, inp.case_id)
+            reply = await s.get(BankReply, inp.reply_id, with_for_update=True)
+            assert reply is not None
+            if reply.status is ReplyStatus.JUDGED:  # a concurrent attempt won the race
+                return _reply_summary(reply)
+            reply.status = ReplyStatus.JUDGED
+            reply.verdict = verdict.model_dump(mode="json")
+            reply.label = verdict.label.value
+            reply.next_action = verdict.next_action.value
+            reply.suspicious = verdict.suspicious
+            reply.unsatisfactory = verdict.next_action is NextAction.ESCALATE
+            if verdict.complaint_number and not verdict.suspicious:
+                case.bank_complaint_ref = verdict.complaint_number
+            case.status = (
+                CaseStatus.JUDGED
+                if verdict.next_action in JUDGED_ACTIONS
+                else CaseStatus.AWAITING_BANK
+            )
+            info: dict[str, Any] = {
+                "reply_id": str(reply.id),
+                "label": verdict.label.value,
+                "next_action": verdict.next_action.value,
+                "suspicious": verdict.suspicious,
+                "phishing_signals": verdict.phishing_signals,
+                "injection_found": verdict.injection_found,
+                "sender_check": verdict.sender_check.value,
+                "owed_inr": str(verdict.owed_inr),
+                "paid_inr": str(verdict.paid_inr),
+                "shortfall_inr": str(verdict.shortfall_inr),
+                "models": verdict.models_used,
+            }
+            if verdict.suspicious:
+                record_event(s, case.id, Actor.SYSTEM, "reply.suspicious", info)
+            else:
+                record_event(s, case.id, Actor.AGENT, "reply.judged", info)
+            return _reply_summary(reply)
 
     def _bank_for(self, bank_id: str | None, extracted_name: str | None) -> BankContact | None:
         if bank_id is not None:
@@ -690,6 +794,23 @@ async def _has_event(
         .limit(1)
     )
     return found is not None
+
+
+# Verdicts after which the case waits for the user (or escalates); the rest keep waiting.
+JUDGED_ACTIONS = {NextAction.PROPOSE_RESOLVED, NextAction.ESCALATE, NextAction.ASK_USER}
+
+
+def _reply_summary(row: BankReply) -> ReplySummary:
+    assert row.verdict is not None
+    verdict = ReplyVerdict.model_validate(row.verdict)
+    return ReplySummary(
+        reply_id=row.id,
+        label=verdict.label,
+        next_action=verdict.next_action,
+        suspicious=verdict.suspicious,
+        warnings=verdict.warnings,
+        complaint_number=None if verdict.suspicious else verdict.complaint_number,
+    )
 
 
 def _send_summary(row: OutboundEmail) -> SendSummary:
