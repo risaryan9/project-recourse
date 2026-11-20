@@ -25,9 +25,20 @@ from temporalio.exceptions import ApplicationError
 
 from recourse.agents.draft_graph import DraftKind as GraphDraftKind
 from recourse.agents.draft_graph import DraftStatus, run_draft
-from recourse.agents.draft_slots import CUSTOMER_NAME_PLACEHOLDER, SlotError
+from recourse.agents.draft_slots import (
+    CUSTOMER_NAME_PLACEHOLDER,
+    BankResponse,
+    EscalationContext,
+    SlotError,
+)
 from recourse.agents.intake_graph import IntakeInput, IntakeStatus, run_intake
-from recourse.agents.reply_judge_graph import NextAction, ReplyInput, ReplyVerdict, judge_reply
+from recourse.agents.reply_judge_graph import (
+    NextAction,
+    ReplyInput,
+    ReplyLabel,
+    ReplyVerdict,
+    judge_reply,
+)
 from recourse.cases.assessment import AssessmentError, CaseDetails, assess, missing_details
 from recourse.cases.drafts import InvalidEdit, latest_draft, recheck_final, slot_table_for
 from recourse.cases.escalation import bank_type_for, days_until, escalation_for
@@ -61,7 +72,7 @@ from recourse.email.manual import ManualChannel
 from recourse.evidence.models import IST
 from recourse.evidence.validators import EvidenceCheck
 from recourse.llm.base import Attachment, LLMClient, LLMError
-from recourse.rules.models import Entitlement
+from recourse.rules.models import Entitlement, EscalationAssessment
 from recourse.security.pii import RedactionKind
 from recourse.temporal.case_types import (
     APPROVE_DRAFT,
@@ -73,6 +84,8 @@ from recourse.temporal.case_types import (
     JUDGE_REPLY,
     MARK_ABANDONED,
     PREPARE_SEND,
+    RECORD_CLOSED,
+    RECORD_FILED,
     RECORD_RESOLVED,
     RECORD_SENT,
     REJECT_DRAFT,
@@ -90,6 +103,8 @@ from recourse.temporal.case_types import (
     JudgeReplyInput,
     MarkAbandonedInput,
     PrepareSendInput,
+    RecordClosedInput,
+    RecordFiledInput,
     RecordResolvedInput,
     RecordSentInput,
     ReplySummary,
@@ -139,6 +154,8 @@ class CaseActivities:
             self.assess_escalation,
             self.judge_reply,
             self.record_resolved,
+            self.record_filed,
+            self.record_closed,
             self.mark_abandoned,
         ]
 
@@ -308,6 +325,8 @@ class CaseActivities:
         Idempotent: if draft `seq` already exists (an earlier attempt finished), return it
         without calling the LLM again. A rejected previous draft's reason becomes feedback.
         """
+        if inp.kind is GraphDraftKind.OMBUDSMAN_COMPLAINT:
+            await self._reassess(inp.case_id, inp.letter_date)
         async with self._sessions() as s:
             existing = await _draft_by_seq(s, inp.case_id, inp.seq)
             if existing is not None:
@@ -325,10 +344,17 @@ class CaseActivities:
             previous = await _draft_by_seq(s, case.id, inp.seq - 1) if inp.seq > 1 else None
             feedback = (
                 previous.reject_reason
-                if previous is not None and previous.status is DraftRecordStatus.REJECTED
+                if previous is not None
+                and previous.status is DraftRecordStatus.REJECTED
+                and previous.kind.value == inp.kind.value
                 else None
             )
             case_tag = case.case_tag
+            escalation = (
+                await _escalation_context(s, case)
+                if inp.kind is GraphDraftKind.OMBUDSMAN_COMPLAINT
+                else None
+            )
 
         try:
             result = await run_draft(
@@ -338,6 +364,8 @@ class CaseActivities:
                 case_tag=case_tag,
                 letter_date=inp.letter_date,
                 feedback=feedback,
+                kind=inp.kind,
+                escalation=escalation,
             )
         except SlotError as e:
             raise invalid(f"This case cannot be drafted: {e}") from e
@@ -352,11 +380,12 @@ class CaseActivities:
             if existing is not None:  # a concurrent attempt won the race
                 return _draft_summary(existing)
             drafted = result.status is DraftStatus.DRAFTED
-            assert result.kind is GraphDraftKind.BANK_COMPLAINT
+            bank_letter = result.kind is GraphDraftKind.BANK_COMPLAINT
             row = DraftRecord(
                 case_id=case.id,
                 seq=inp.seq,
-                kind=DraftKind.BANK_COMPLAINT,
+                kind=DraftKind(result.kind.value),
+                context=escalation.model_dump(mode="json") if escalation else None,
                 status=DraftRecordStatus.PENDING if drafted else DraftRecordStatus.FAILED,
                 letter_date=inp.letter_date,
                 attempts=result.attempts,
@@ -376,19 +405,61 @@ class CaseActivities:
                 "seq": inp.seq,
                 "attempts": result.attempts,
                 "rules_verified": result.rules_verified,
+                "kind": result.kind.value,
                 "with_feedback": feedback is not None,
                 "models": result.models_used,
             }
             if drafted:
                 # DRAFT_READY and AWAITING_APPROVAL happen together: nothing waits in between.
-                case.status = CaseStatus.AWAITING_APPROVAL
+                case.status = (
+                    CaseStatus.AWAITING_APPROVAL
+                    if bank_letter
+                    else CaseStatus.ESCALATION_DRAFT_READY
+                )
                 record_event(s, case.id, Actor.AGENT, "draft.ready", info)
             else:
-                case.status = CaseStatus.ASSESSED
+                if bank_letter:
+                    case.status = CaseStatus.ASSESSED
                 record_event(
                     s, case.id, Actor.AGENT, "draft.failed", info | {"errors": result.errors}
                 )
             return _draft_summary(row)
+
+    async def _reassess(self, case_id: uuid.UUID, as_of: date) -> None:
+        """Bring the stored Entitlement up to `as_of` (compensation for delay keeps growing),
+        so an escalation claims what is owed today. Approval rebuilds its slots from it."""
+        async with self._sessions.begin() as s:
+            case = await _case_for_update(s, case_id)
+            row = await s.scalar(
+                select(EntitlementRecord).where(EntitlementRecord.case_id == case.id)
+            )
+            if row is None:
+                raise invalid("The case has not been assessed yet.")
+            if row.as_of >= as_of:
+                return
+            evidence = (await _latest_evidence(s, case.id)).to_evidence()
+            try:
+                entitlement = assess(
+                    evidence, CaseDetails.model_validate(case.details), as_of=as_of
+                )
+            except AssessmentError as e:
+                raise invalid(f"These facts cannot be assessed: {e}") from e
+            previous = row.total_owed_inr
+            row.as_of = as_of
+            row.covered = entitlement.covered
+            row.total_owed_inr = entitlement.total_owed_inr
+            row.data = entitlement.model_dump(mode="json")
+            record_event(
+                s,
+                case.id,
+                Actor.SYSTEM,
+                "case.reassessed",
+                {
+                    "as_of": as_of.isoformat(),
+                    "total_owed_inr": str(entitlement.total_owed_inr),
+                    "previous_total_owed_inr": str(previous),
+                },
+            )
 
     @activity.defn(name=APPROVE_DRAFT)
     async def approve_draft(self, inp: DraftDecisionInput) -> None:
@@ -437,7 +508,8 @@ class CaseActivities:
             if draft.status is not DraftRecordStatus.PENDING:
                 raise invalid("This draft is not waiting for approval.")
             draft.status = DraftRecordStatus.REJECTED
-            case.status = CaseStatus.ASSESSED
+            if draft.kind is DraftKind.BANK_COMPLAINT:
+                case.status = CaseStatus.ASSESSED
             record_event(
                 s,
                 case.id,
@@ -761,6 +833,71 @@ class CaseActivities:
                 },
             )
 
+    # --- escalation to the RBI Ombudsman ---------------------------------------------------------
+
+    @activity.defn(name=RECORD_FILED)
+    async def record_filed(self, inp: RecordFiledInput) -> None:
+        """The user filed the approved Ombudsman complaint themselves. Idempotent."""
+        async with self._sessions.begin() as s:
+            case = await _case_for_update(s, inp.case_id)
+            if case.status is CaseStatus.FILED_WITH_OMBUDSMAN:
+                return
+            if case.status is not CaseStatus.ESCALATION_DRAFT_READY:
+                raise invalid(f"A case that is {case.status.value} cannot be marked filed.")
+            draft = await s.get(DraftRecord, inp.draft_id)
+            if (
+                draft is None
+                or draft.case_id != case.id
+                or draft.kind is not DraftKind.OMBUDSMAN_COMPLAINT
+                or draft.status is not DraftRecordStatus.APPROVED
+                or draft.approved_at is None
+            ):
+                raise invalid("Approve the complaint to the RBI Ombudsman first.")
+            filed_at = inp.mark.filed_at
+            if filed_at.tzinfo is None:
+                raise invalid("The filing time needs a time zone.")
+            if filed_at > inp.now + SENT_AT_TOLERANCE:
+                raise invalid("The filing time is in the future.")
+            if filed_at < draft.approved_at - SENT_AT_TOLERANCE:
+                raise invalid("The filing time is before the complaint was approved.")
+            case.status = CaseStatus.FILED_WITH_OMBUDSMAN
+            case.ombudsman_filed_at = filed_at
+            case.ombudsman_ref = inp.mark.reference
+            record_event(
+                s,
+                case.id,
+                Actor.USER,
+                "ombudsman.filed",
+                {
+                    "draft_id": str(draft.id),
+                    "filed_at": filed_at.isoformat(),
+                    "reference": inp.mark.reference,
+                },
+            )
+
+    @activity.defn(name=RECORD_CLOSED)
+    async def record_closed(self, inp: RecordClosedInput) -> None:
+        """The Ombudsman complaint ended: the case is CLOSED. The raw upload is deleted."""
+        async with self._sessions.begin() as s:
+            case = await _case_for_update(s, inp.case_id)
+            if case.status is CaseStatus.CLOSED:
+                return
+            if case.status is not CaseStatus.FILED_WITH_OMBUDSMAN:
+                raise invalid(f"A case that is {case.status.value} cannot be closed.")
+            await s.execute(delete(Upload).where(Upload.case_id == case.id))
+            case.status = CaseStatus.CLOSED
+            amount = inp.request.amount_received_inr
+            record_event(
+                s,
+                case.id,
+                Actor.USER,
+                "case.closed",
+                {
+                    "outcome": inp.request.outcome.value,
+                    "amount_received_inr": str(amount) if amount is not None else None,
+                },
+            )
+
     def _bank_for(self, bank_id: str | None, extracted_name: str | None) -> BankContact | None:
         if bank_id is not None:
             return self._contacts.get(bank_id)
@@ -806,6 +943,51 @@ async def _current_draft_for_update(
     draft = await s.get(DraftRecord, draft_id, with_for_update=True, populate_existing=True)
     assert draft is not None
     return draft
+
+
+async def _escalation_context(s: AsyncSession, case: Case) -> EscalationContext:
+    """What the Ombudsman complaint needs: the bank complaint, how the bank responded (from the
+    genuine judged replies, decided by code) and the latest escalation assessment."""
+    if case.bank_complained_on is None or case.escalation is None:
+        raise invalid("The bank's reply window has not been worked out yet.")
+    assessment = EscalationAssessment.model_validate(case.escalation)
+    if not assessment.can_file_now:
+        flags = ", ".join(f.code.value for f in assessment.flags) or "not eligible yet"
+        raise invalid(f"A complaint to the RBI Ombudsman cannot be filed now ({flags}).")
+    replies = list(
+        await s.scalars(
+            select(BankReply)
+            .where(
+                BankReply.case_id == case.id,
+                BankReply.status == ReplyStatus.JUDGED,
+                BankReply.suspicious.is_(False),
+            )
+            .order_by(BankReply.received_at)
+        )
+    )
+    substantive = [r for r in replies if r.label not in _NOT_A_DECISION]
+    response = BankResponse.NO_REPLY
+    if substantive:
+        latest = ReplyVerdict.model_validate(substantive[-1].verdict)
+        response = _RESPONSE_FOR_LABEL.get(latest.label, BankResponse.UNSATISFACTORY)
+        if response is BankResponse.PARTIAL and latest.shortfall_inr == 0:
+            response = BankResponse.UNSATISFACTORY
+    return EscalationContext(
+        complained_on=case.bank_complained_on,
+        complaint_ref=case.bank_complaint_ref,
+        bank_response=response,
+        last_reply_on=replies[-1].received_at.astimezone(IST).date() if replies else None,
+        assessment=assessment,
+    )
+
+
+_NOT_A_DECISION = {ReplyLabel.ACKNOWLEDGEMENT.value, ReplyLabel.NEEDS_INFO.value}
+_RESPONSE_FOR_LABEL = {
+    ReplyLabel.PARTIAL: BankResponse.PARTIAL,
+    ReplyLabel.RESOLVED: BankResponse.PARTIAL,  # escalated: so it was short (checked above)
+    ReplyLabel.REJECTED_NO_REASONS: BankResponse.REJECTED_NO_REASONS,
+    ReplyLabel.REJECTED_WITH_REASONS: BankResponse.REJECTED_WITH_REASONS,
+}
 
 
 def _iso(d: date | None) -> str | None:

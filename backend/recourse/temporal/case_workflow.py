@@ -49,7 +49,7 @@ from temporalio.common import RetryPolicy
 from temporalio.exceptions import ActivityError, ApplicationError
 
 with workflow.unsafe.imports_passed_through():
-    from recourse.agents.draft_graph import DraftStatus
+    from recourse.agents.draft_graph import DraftKind, DraftStatus
     from recourse.agents.intake_graph import IntakeStatus
     from recourse.agents.reply_judge_graph import NextAction
     from recourse.cases.drafts import MAX_DRAFTS_PER_CASE
@@ -65,6 +65,8 @@ with workflow.unsafe.imports_passed_through():
         JUDGE_REPLY,
         MARK_ABANDONED,
         PREPARE_SEND,
+        RECORD_CLOSED,
+        RECORD_FILED,
         RECORD_RESOLVED,
         RECORD_SENT,
         REJECT_DRAFT,
@@ -76,6 +78,7 @@ with workflow.unsafe.imports_passed_through():
         CaseInput,
         CaseOutcome,
         CaseState,
+        CloseRequest,
         Confirmation,
         ConfirmInput,
         ConfirmOutcome,
@@ -88,9 +91,12 @@ with workflow.unsafe.imports_passed_through():
         IntakeSummary,
         JudgeReplyInput,
         MarkAbandonedInput,
+        MarkFiled,
         MarkResolved,
         MarkSent,
         PrepareSendInput,
+        RecordClosedInput,
+        RecordFiledInput,
         RecordResolvedInput,
         RecordSentInput,
         ReplySummary,
@@ -163,6 +169,17 @@ class CaseWorkflow:
         self._escalate = False
         self._can_escalate = False
         self._awaiting_bank = False  # bank_replied / mark_resolved are accepted
+        # Escalation to the RBI Ombudsman
+        self._escalation_drafts = 0
+        self._needs_bank_type = False
+        self._can_recheck = False
+        self._recheck = False
+        self._escalation_draft_id: uuid.UUID | None = None
+        self._awaiting_filing = False
+        self._filings: list[MarkFiled] = []
+        self._filing_deadline_passed = False
+        self._can_close = False
+        self._close: CloseRequest | None = None
 
     # --- signals & queries ----------------------------------------------------------------------
 
@@ -207,6 +224,21 @@ class CaseWorkflow:
         if self._can_escalate:
             self._escalate = True
 
+    @workflow.signal(name="recheck_escalation")
+    def recheck_escalation(self) -> None:
+        if self._can_recheck:
+            self._recheck = True
+
+    @workflow.signal(name="mark_filed")
+    def mark_filed(self, mark: MarkFiled) -> None:
+        if self._awaiting_filing:
+            self._filings.append(mark)
+
+    @workflow.signal(name="close")
+    def close(self, request: CloseRequest) -> None:
+        if self._can_close and self._close is None:
+            self._close = request
+
     @workflow.signal(name="abandon")
     def abandon(self, request: AbandonRequest) -> None:
         if self._abandon is None:
@@ -231,6 +263,12 @@ class CaseWorkflow:
             bank_wait_expired=self._bank_wait_expired,
             last_reply=self._last_reply,
             can_escalate=self._can_escalate,
+            needs_bank_type=self._needs_bank_type,
+            can_recheck_escalation=self._can_recheck,
+            escalation_draft_id=self._escalation_draft_id,
+            awaiting_filing=self._awaiting_filing,
+            filing_deadline_passed=self._filing_deadline_passed,
+            can_close=self._can_close,
         )
 
     # --- main flow --------------------------------------------------------------------------------
@@ -302,31 +340,48 @@ class CaseWorkflow:
                         return await self._end(inp, self._abandon.reason, Actor.USER)
                     if result == "resolved":
                         return CaseOutcome(status=CaseStatus.RESOLVED)
+                    # 7. Escalate to the RBI Ombudsman: draft, approve, the user files.
+                    if workflow.patched("escalation-v1"):
+                        ended = await self._go_to_ombudsman(inp)
+                        if ended is None:
+                            assert self._abandon is not None
+                            return await self._end(inp, self._abandon.reason, Actor.USER)
+                        return ended
 
-        # 7. Next milestone (escalation) plugs in here. Until then: wait.
+        # Cases that predate a step keep waiting here until the user ends them.
         await workflow.wait_condition(lambda: self._abandoned)
         assert self._abandon is not None
         return await self._end(inp, self._abandon.reason, Actor.USER)
 
     # --- drafting -------------------------------------------------------------------------------
 
-    async def _draft_until_approved(self, inp: CaseInput) -> bool:
+    async def _draft_until_approved(
+        self, inp: CaseInput, kind: DraftKind = DraftKind.BANK_COMPLAINT
+    ) -> bool:
         """Draft, then wait for the user's decision; redraft on rejection. False = abandoned
-        (or the draft limit was reached and the case was abandoned while waiting)."""
+        (or the draft limit was reached and the case was abandoned while waiting).
+
+        Drafts of both kinds share one numbering (`seq`); the limit applies per kind.
+        """
+        bank = kind is DraftKind.BANK_COMPLAINT
         while True:
-            if self._drafts_used >= MAX_DRAFTS_PER_CASE:
+            used = self._drafts_used if bank else self._escalation_drafts
+            if used >= MAX_DRAFTS_PER_CASE:
                 self._last_error = (
                     f"The limit of {MAX_DRAFTS_PER_CASE} drafts for this case was reached."
                 )
                 await workflow.wait_condition(lambda: self._abandoned)
                 return False
             self._drafts_used += 1
-            summary = await self._run_draft(inp, self._drafts_used)
+            if not bank:
+                self._escalation_drafts += 1
+            summary = await self._run_draft(inp, self._drafts_used, kind)
             if summary is None or summary.status is DraftStatus.FAILED:
                 # Fail closed: no letter. The user may ask for another try.
                 if summary is not None:
                     self._last_error = "A checked draft could not be produced. Please try again."
-                self._status = CaseStatus.ASSESSED
+                if bank:
+                    self._status = CaseStatus.ASSESSED
                 self._can_redraft = True
                 await workflow.wait_condition(lambda: self._redraft or self._abandoned)
                 self._can_redraft = self._redraft = False
@@ -335,17 +390,23 @@ class CaseWorkflow:
                 self._last_error = None
                 continue
 
-            self._status = CaseStatus.AWAITING_APPROVAL
+            self._status = (
+                CaseStatus.AWAITING_APPROVAL if bank else CaseStatus.ESCALATION_DRAFT_READY
+            )
             self._draft_id = summary.draft_id
             self._last_error = None
             outcome = await self._wait_for_decision(inp, summary.draft_id)
             if outcome == "abandoned":
                 return False
             if outcome == "approved":
-                self._approved_draft_id = summary.draft_id
+                if bank:
+                    self._approved_draft_id = summary.draft_id
+                else:
+                    self._escalation_draft_id = summary.draft_id
                 return True
             # rejected → draft again
-            self._status = CaseStatus.ASSESSED
+            if bank:
+                self._status = CaseStatus.ASSESSED
             self._draft_id = None
 
     # --- sending ----------------------------------------------------------------------------------
@@ -410,7 +471,7 @@ class CaseWorkflow:
             return None
         return summary
 
-    async def _run_draft(self, inp: CaseInput, seq: int) -> DraftSummary | None:
+    async def _run_draft(self, inp: CaseInput, seq: int, kind: DraftKind) -> DraftSummary | None:
         try:
             summary: DraftSummary = await workflow.execute_activity(
                 DRAFT,
@@ -418,6 +479,7 @@ class CaseWorkflow:
                     case_id=inp.case_id,
                     seq=seq,
                     letter_date=workflow.now().astimezone(IST).date(),
+                    kind=kind,
                 ),
                 result_type=DraftSummary,
                 start_to_close_timeout=LLM_TIMEOUT,
@@ -515,6 +577,126 @@ class CaseWorkflow:
 
         self._awaiting_bank = self._can_escalate = False
         return "escalate"
+
+    # --- escalation to the RBI Ombudsman ----------------------------------------------------------
+
+    async def _go_to_ombudsman(self, inp: CaseInput) -> CaseOutcome | None:
+        """Check the case can go to the Ombudsman, draft the complaint, wait for the user to
+        approve and file it, then for the outcome. None = abandoned."""
+        summary = await self._eligible(inp)
+        if summary is None:
+            return None
+        if not await self._draft_until_approved(inp, DraftKind.OMBUDSMAN_COMPLAINT):
+            return None
+        if not await self._wait_for_filing(inp, summary):
+            return None
+
+        self._status = CaseStatus.FILED_WITH_OMBUDSMAN
+        self._can_close = True
+        while True:
+            await workflow.wait_condition(lambda: self._close is not None or self._abandoned)
+            if self._abandoned:
+                return None
+            request = self._close
+            assert request is not None
+            try:
+                await workflow.execute_activity(
+                    RECORD_CLOSED,
+                    RecordClosedInput(case_id=inp.case_id, request=request),
+                    start_to_close_timeout=DB_TIMEOUT,
+                    retry_policy=DB_RETRY,
+                )
+            except ActivityError as err:
+                self._last_error = _error_message(err)
+                self._close = None
+                continue
+            self._can_close = False
+            self._last_error = None
+            self._status = CaseStatus.CLOSED
+            return CaseOutcome(status=CaseStatus.CLOSED, reason=request.outcome.value)
+
+    async def _eligible(self, inp: CaseInput) -> EscalationSummary | None:
+        """Wait until a complaint can be filed now. None = abandoned."""
+        while True:
+            summary = await self._assess_escalation(inp, "escalation.checked", None)
+            problem: str | None = None
+            if summary is None:
+                problem = self._last_error
+            elif summary.needs_bank_type:
+                self._needs_bank_type = True
+                problem = (
+                    "Tell us what kind of bank this is, so we can check the Ombudsman covers it."
+                )
+            elif summary.entity_coverage == "NOT_COVERED":
+                problem = "The RBI Ombudsman scheme does not cover this kind of bank."
+            elif summary.can_file_now:
+                self._needs_bank_type = False
+                self._last_error = None
+                return summary
+            elif summary.wait_days > 0:
+                # Not eligible yet (e.g. escalated before the waiting period ended): wait.
+                try:
+                    await workflow.wait_condition(
+                        lambda: self._abandoned, timeout=days(summary.wait_days, _scale(inp))
+                    )
+                except TimeoutError:
+                    pass
+                if self._abandoned:
+                    return None
+                continue
+            else:
+                problem = "The last day to complain to the RBI Ombudsman has passed."
+            self._last_error = problem
+            self._can_recheck = True
+            await workflow.wait_condition(lambda: self._recheck or self._abandoned)
+            self._can_recheck = self._recheck = False
+            if self._abandoned:
+                return None
+
+    async def _wait_for_filing(self, inp: CaseInput, summary: EscalationSummary) -> bool:
+        """Wait for `mark_filed`; remind when the filing deadline passes. False = abandoned."""
+        assert self._escalation_draft_id is not None
+        self._awaiting_filing = True
+        deadline = None
+        if summary.filing_deadline is not None:
+            today = workflow.now().astimezone(IST).date()
+            left = (summary.filing_deadline - today).days + 1  # through the last day
+            deadline = workflow.now() + days(max(0, left), _scale(inp))
+        while True:
+            timeout = None
+            if deadline is not None and not self._filing_deadline_passed:
+                timeout = deadline - workflow.now()
+                if timeout <= timedelta(0):
+                    self._filing_deadline_passed = True
+                    timeout = None
+            try:
+                await workflow.wait_condition(
+                    lambda: bool(self._filings) or self._abandoned, timeout=timeout
+                )
+            except TimeoutError:
+                self._filing_deadline_passed = True
+                continue
+            if self._abandoned:
+                return False
+            mark = self._filings.pop(0)
+            try:
+                await workflow.execute_activity(
+                    RECORD_FILED,
+                    RecordFiledInput(
+                        case_id=inp.case_id,
+                        draft_id=self._escalation_draft_id,
+                        mark=mark,
+                        now=workflow.now(),
+                    ),
+                    start_to_close_timeout=DB_TIMEOUT,
+                    retry_policy=DB_RETRY,
+                )
+            except ActivityError as err:
+                self._last_error = _error_message(err)
+                continue
+            self._awaiting_filing = False
+            self._last_error = None
+            return True
 
     async def _judge(self, inp: CaseInput, reply: BankReplied) -> ReplySummary | None:
         try:

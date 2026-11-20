@@ -19,7 +19,7 @@ from temporalio.exceptions import ApplicationError
 from temporalio.testing import WorkflowEnvironment
 from temporalio.worker import Replayer, Worker
 
-from recourse.agents.draft_graph import DraftStatus
+from recourse.agents.draft_graph import DraftKind, DraftStatus
 from recourse.agents.intake_graph import IntakeStatus
 from recourse.agents.reply_judge_graph import NextAction, ReplyLabel
 from recourse.cases.assessment import CaseDetails
@@ -37,6 +37,8 @@ from recourse.temporal.case_types import (
     JUDGE_REPLY,
     MARK_ABANDONED,
     PREPARE_SEND,
+    RECORD_CLOSED,
+    RECORD_FILED,
     RECORD_RESOLVED,
     RECORD_SENT,
     REJECT_DRAFT,
@@ -48,6 +50,8 @@ from recourse.temporal.case_types import (
     CaseInput,
     CaseOutcome,
     CaseState,
+    CloseOutcome,
+    CloseRequest,
     Confirmation,
     ConfirmInput,
     ConfirmOutcome,
@@ -60,9 +64,12 @@ from recourse.temporal.case_types import (
     IntakeSummary,
     JudgeReplyInput,
     MarkAbandonedInput,
+    MarkFiled,
     MarkResolved,
     MarkSent,
     PrepareSendInput,
+    RecordClosedInput,
+    RecordFiledInput,
     RecordResolvedInput,
     RecordSentInput,
     ReplySummary,
@@ -98,6 +105,8 @@ class FakeActivities:
     escalation: list[Any] = field(default_factory=list)  # empty → `waiting()`
     judge: list[Any] = field(default_factory=list)
     resolved: list[Any] = field(default_factory=lambda: [None])
+    filed: list[Any] = field(default_factory=lambda: [None])
+    closed: list[Any] = field(default_factory=lambda: [None])
     calls: list[tuple[str, Any]] = field(default_factory=list)
 
     def _next(self, name: str, script: list[Any], arg: Any) -> Any:
@@ -162,6 +171,14 @@ class FakeActivities:
         async def record_resolved(inp: RecordResolvedInput) -> None:
             self._next(RECORD_RESOLVED, self.resolved, inp)
 
+        @activity.defn(name=RECORD_FILED)
+        async def record_filed(inp: RecordFiledInput) -> None:
+            self._next(RECORD_FILED, self.filed, inp)
+
+        @activity.defn(name=RECORD_CLOSED)
+        async def record_closed(inp: RecordClosedInput) -> None:
+            self._next(RECORD_CLOSED, self.closed, inp)
+
         @activity.defn(name=MARK_ABANDONED)
         async def mark_abandoned(inp: MarkAbandonedInput) -> None:
             self.calls.append((MARK_ABANDONED, inp))
@@ -178,6 +195,8 @@ class FakeActivities:
             assess_escalation,
             judge_reply,
             record_resolved,
+            record_filed,
+            record_closed,
             mark_abandoned,
         ]
 
@@ -676,7 +695,7 @@ async def test_bank_wait_timer_expires(env: WorkflowEnvironment) -> None:
         history = await handle.fetch_history()
 
     escalations: list[EscalationInput] = [a for n, a in fakes.calls if n == ASSESS_ESCALATION]
-    assert [e.event for e in escalations] == ["bank.wait_started", "bank.wait_expired"]
+    assert [e.event for e in escalations][:2] == ["bank.wait_started", "bank.wait_expired"]
     assert escalations[0].new_status is CaseStatus.AWAITING_BANK
     assert escalations[1].new_status is None
     await Replayer(
@@ -773,7 +792,7 @@ async def test_acknowledgement_keeps_the_timer_running(env: WorkflowEnvironment)
         await handle.signal(CaseWorkflow.abandon, AbandonRequest())
         await handle.result()
         history = await handle.fetch_history()
-    assert events(fakes) == ["bank.wait_started", "bank.replied", "bank.wait_expired"]
+    assert events(fakes)[:3] == ["bank.wait_started", "bank.replied", "bank.wait_expired"]
     await Replayer(
         workflows=[CaseWorkflow], data_converter=pydantic_data_converter
     ).replay_workflow(history)
@@ -807,7 +826,7 @@ async def test_non_compliant_reply_escalates(env: WorkflowEnvironment) -> None:
         assert not state.can_escalate  # already escalating, no question for the user
         await handle.signal(CaseWorkflow.abandon, AbandonRequest())
         await handle.result()
-    assert events(fakes) == ["bank.wait_started", "bank.replied"]
+    assert events(fakes)[:2] == ["bank.wait_started", "bank.replied"]
 
 
 async def test_rejection_with_reasons_waits_for_the_user(env: WorkflowEnvironment) -> None:
@@ -825,7 +844,7 @@ async def test_rejection_with_reasons_waits_for_the_user(env: WorkflowEnvironmen
         await wait_for(handle, lambda s: not s.can_escalate)
         await handle.signal(CaseWorkflow.abandon, AbandonRequest())
         await handle.result()
-    assert events(fakes) == ["bank.wait_started", "bank.replied", "case.escalation_chosen"]
+    assert events(fakes)[:3] == ["bank.wait_started", "bank.replied", "case.escalation_chosen"]
 
 
 async def test_escalate_without_a_question_is_ignored(env: WorkflowEnvironment) -> None:
@@ -880,3 +899,112 @@ async def test_refused_resolution_keeps_waiting(env: WorkflowEnvironment) -> Non
         await handle.signal(CaseWorkflow.mark_resolved, MarkResolved(amount_received_inr=10))
         outcome: CaseOutcome = await handle.result()
     assert outcome.status is CaseStatus.RESOLVED
+
+
+# =================================================================================================
+# Escalation to the RBI Ombudsman
+# =================================================================================================
+
+FILED_AT = datetime(2026, 12, 21, 10, 0, tzinfo=UTC)
+
+
+def needs_type() -> EscalationSummary:
+    return EscalationSummary(
+        entity_coverage="UNKNOWN",
+        can_file_now=False,
+        eligible_from=date(2026, 12, 20),
+        filing_deadline=date(2027, 3, 19),
+        wait_days=0,
+        needs_bank_type=True,
+    )
+
+
+async def to_escalation_draft(
+    env: WorkflowEnvironment, fakes: FakeActivities
+) -> WorkflowHandle[Any, Any]:
+    """Send the complaint, let the bank window run out, reach the Ombudsman draft."""
+    handle = await to_awaiting_bank(env, fakes)
+    await env.sleep(timedelta(days=31))
+    await wait_for(handle, lambda s: s.status is CaseStatus.ESCALATION_DRAFT_READY)
+    return handle
+
+
+async def test_escalation_to_closed(env: WorkflowEnvironment) -> None:
+    letter = drafted()
+    fakes = FakeActivities(
+        escalation=[waiting(30), waiting(0), waiting(0)],
+        draft=[drafted(), letter],
+        approve=[None, None],
+    )
+    async with worker(env, fakes):
+        handle = await to_escalation_draft(env, fakes)
+        state: CaseState = await handle.query(CaseWorkflow.get_state)
+        assert state.draft_id == letter.draft_id and state.bank_wait_expired
+
+        await handle.signal(CaseWorkflow.mark_filed, MarkFiled(filed_at=FILED_AT))  # too early
+        await handle.signal(CaseWorkflow.approve_draft, DraftDecision(draft_id=letter.draft_id))
+        state = await wait_for(handle, lambda s: s.awaiting_filing)
+        assert state.escalation_draft_id == letter.draft_id
+
+        await handle.signal(
+            CaseWorkflow.mark_filed, MarkFiled(filed_at=FILED_AT, reference="N-202612-0042")
+        )
+        state = await wait_for(handle, lambda s: s.can_close)
+        assert state.status is CaseStatus.FILED_WITH_OMBUDSMAN and not state.awaiting_filing
+
+        await handle.signal(
+            CaseWorkflow.close,
+            CloseRequest(outcome=CloseOutcome.AWARD_RECEIVED, amount_received_inr=2750),
+        )
+        outcome: CaseOutcome = await handle.result()
+        history = await handle.fetch_history()
+
+    assert outcome == CaseOutcome(status=CaseStatus.CLOSED, reason="AWARD_RECEIVED")
+    drafts: list[DraftInput] = [a for n, a in fakes.calls if n == DRAFT]
+    assert [d.kind for d in drafts] == [DraftKind.BANK_COMPLAINT, DraftKind.OMBUDSMAN_COMPLAINT]
+    assert [d.seq for d in drafts] == [1, 2]
+    assert events(fakes) == ["bank.wait_started", "bank.wait_expired", "escalation.checked"]
+    filed: RecordFiledInput = next(a for n, a in fakes.calls if n == RECORD_FILED)
+    assert filed.draft_id == letter.draft_id and filed.mark.reference == "N-202612-0042"
+    assert fakes.names().count(RECORD_FILED) == 1  # the early mark was ignored
+    assert MARK_ABANDONED not in fakes.names()
+    await Replayer(
+        workflows=[CaseWorkflow], data_converter=pydantic_data_converter
+    ).replay_workflow(history)
+
+
+async def test_escalation_waits_for_the_bank_type(env: WorkflowEnvironment) -> None:
+    fakes = FakeActivities(
+        escalation=[waiting(30), waiting(0), needs_type(), waiting(0)],
+        draft=[drafted(), drafted()],
+    )
+    async with worker(env, fakes):
+        handle = await to_awaiting_bank(env, fakes)
+        await env.sleep(timedelta(days=31))
+        state = await wait_for(handle, lambda s: s.needs_bank_type)
+        assert state.can_recheck_escalation and "kind of bank" in (state.last_error or "")
+        await handle.signal(CaseWorkflow.recheck_escalation)
+        state = await wait_for(handle, lambda s: s.status is CaseStatus.ESCALATION_DRAFT_READY)
+        assert not state.needs_bank_type and state.last_error is None
+        await handle.signal(CaseWorkflow.abandon, AbandonRequest())
+        await handle.result()
+    assert events(fakes)[-2:] == ["escalation.checked", "escalation.checked"]
+
+
+async def test_filing_deadline_reminder(env: WorkflowEnvironment) -> None:
+    letter = drafted()
+    fakes = FakeActivities(
+        escalation=[waiting(30), waiting(0), waiting(0)],
+        draft=[drafted(), letter],
+        approve=[None, None],
+    )
+    async with worker(env, fakes):
+        handle = await to_escalation_draft(env, fakes)
+        await handle.signal(CaseWorkflow.approve_draft, DraftDecision(draft_id=letter.draft_id))
+        await wait_for(handle, lambda s: s.awaiting_filing)
+        await env.sleep(timedelta(days=200))  # past 19 Mar 2027 whatever today is
+        state = await wait_for(handle, lambda s: s.filing_deadline_passed)
+        assert state.awaiting_filing
+        await handle.signal(CaseWorkflow.abandon, AbandonRequest())
+        outcome: CaseOutcome = await handle.result()
+    assert outcome.status is CaseStatus.ABANDONED

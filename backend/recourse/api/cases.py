@@ -37,7 +37,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from recourse.agents.draft_graph import DISCLAIMER
-from recourse.agents.draft_slots import SlotError
+from recourse.agents.draft_slots import EscalationContext, SlotError, format_date, format_inr
 from recourse.agents.intake_graph import IntakeInput
 from recourse.api.deps import get_runner, get_session, get_session_factory
 from recourse.cases.assessment import CaseDetails, missing_details
@@ -59,6 +59,7 @@ from recourse.db.models import (
     BankReply,
     Case,
     CaseStatus,
+    DraftKind,
     DraftRecord,
     DraftRecordStatus,
     EntitlementRecord,
@@ -78,13 +79,16 @@ from recourse.email.manual import mailto_link
 from recourse.evidence.models import IST
 from recourse.evidence.validators import EvidenceCheck, FieldIssue
 from recourse.llm.base import Attachment
+from recourse.rules.models import BankType, Entitlement
 from recourse.security.pii import redact_text
 from recourse.temporal.case_runner import CaseRunner
 from recourse.temporal.case_types import (
     AbandonRequest,
     BankReplied,
     CaseInput,
+    CloseRequest,
     Confirmation,
+    MarkFiled,
     MarkResolved,
     MarkSent,
     ReplySummary,
@@ -211,6 +215,14 @@ class CaseView(BaseModel):
     bank_complaint_ref: str | None  # the bank's complaint number, once a reply states it
     last_reply: ReplySummary | None  # verdict on the latest bank reply (warnings included)
     can_escalate: bool  # show "Escalate to the RBI Ombudsman" / "Accept and close"
+    # Escalation to the RBI Ombudsman
+    needs_bank_type: bool  # ask for the bank's type (PUT /bank-type)
+    can_recheck_escalation: bool
+    awaiting_filing: bool  # the complaint is approved: file it on cms.rbi.org.in, then mark filed
+    filing_deadline_passed: bool
+    can_close: bool  # filed: report how it ended
+    ombudsman_filed_at: datetime | None
+    ombudsman_ref: str | None
     timeline: list[TimelineEntry]
 
 
@@ -306,6 +318,13 @@ async def get_case(case_id: uuid.UUID, session: Session, runner: Runner) -> Case
         bank_complaint_ref=case.bank_complaint_ref,
         last_reply=live.last_reply if live else None,
         can_escalate=live.can_escalate if live else False,
+        needs_bank_type=live.needs_bank_type if live else False,
+        can_recheck_escalation=live.can_recheck_escalation if live else False,
+        awaiting_filing=live.awaiting_filing if live else False,
+        filing_deadline_passed=live.filing_deadline_passed if live else False,
+        can_close=live.can_close if live else False,
+        ombudsman_filed_at=case.ombudsman_filed_at,
+        ombudsman_ref=case.ombudsman_ref,
         timeline=[
             TimelineEntry(
                 occurred_at=e.occurred_at,
@@ -414,7 +433,7 @@ async def reject_draft(
 @router.post("/{case_id}/redraft", status_code=status.HTTP_202_ACCEPTED)
 async def redraft(case_id: uuid.UUID, session: Session, runner: Runner) -> dict[str, str]:
     case = await _get_case(session, case_id)
-    if case.status is not CaseStatus.ASSESSED:
+    if case.status in ENDED:
         raise HTTPException(409, f"case is {case.status.value}, not waiting for a new draft")
     live = await runner.state(case_id)
     if live is None or not live.can_redraft:
@@ -453,6 +472,34 @@ class ReplyView(BaseModel):
     next_action: str | None
     suspicious: bool | None
     verdict: dict[str, Any] | None
+
+
+class BankTypeAnswer(BaseModel):
+    bank_type: BankType
+
+
+class FiledReport(BaseModel):
+    filed_at: datetime | None = None  # default: now
+    reference: str | None = Field(default=None, max_length=40)  # the CMS complaint number
+
+
+class FilingField(BaseModel):
+    label: str  # what the field is about (check the live form for its exact name)
+    value: str
+
+
+class OmbudsmanFiling(BaseModel):
+    """Everything the user needs to file on cms.rbi.org.in, from the approved complaint and
+    the rule engine. Recourse never files: the portal needs the customer (and a CAPTCHA)."""
+
+    portal_url: str
+    other_ways: list[str]
+    fields: list[FilingField]
+    title: str
+    complaint_text: str
+    filing_deadline: date | None
+    filing_deadline_passed: bool
+    disclaimer: str
 
 
 class ResolvedReport(BaseModel):
@@ -629,6 +676,136 @@ async def escalate(
     return {"status": "escalating"}
 
 
+@router.put("/{case_id}/bank-type", status_code=status.HTTP_202_ACCEPTED)
+async def set_bank_type(
+    case_id: uuid.UUID,
+    answer: BankTypeAnswer,
+    runner: Runner,
+    sessions: Annotated[async_sessionmaker[AsyncSession], Depends(get_session_factory)],
+) -> dict[str, str]:
+    """The user says what kind of bank it is (Ombudsman coverage depends on it)."""
+    live = await runner.state(case_id)
+    if live is None or not live.needs_bank_type:
+        raise HTTPException(409, "the case is not asking for the bank's type")
+    async with sessions.begin() as s:
+        case = await s.get(Case, case_id, with_for_update=True)
+        if case is None:
+            raise HTTPException(404, "case not found")
+        details = CaseDetails.model_validate(case.details)
+        update = CaseDetails(bank_type=answer.bank_type)
+        case.details = details.merged(update).model_dump(mode="json")
+        record_event(
+            s, case.id, Actor.USER, "case.bank_type_given", {"bank_type": answer.bank_type.value}
+        )
+    await runner.recheck_escalation(case_id)
+    return {"status": "rechecking"}
+
+
+@router.post("/{case_id}/escalation/recheck", status_code=status.HTTP_202_ACCEPTED)
+async def recheck_escalation(case_id: uuid.UUID, runner: Runner) -> dict[str, str]:
+    live = await runner.state(case_id)
+    if live is None or not live.can_recheck_escalation:
+        raise HTTPException(409, "the case is not waiting to recheck the escalation")
+    await runner.recheck_escalation(case_id)
+    return {"status": "rechecking"}
+
+
+@router.get("/{case_id}/ombudsman-filing")
+async def ombudsman_filing(case_id: uuid.UUID, session: Session) -> OmbudsmanFiling:
+    case = await _get_case(session, case_id)
+    draft = await latest_draft(session, case_id)
+    if (
+        draft is None
+        or draft.kind is not DraftKind.OMBUDSMAN_COMPLAINT
+        or draft.status is not DraftRecordStatus.APPROVED
+        or draft.final_subject is None
+        or draft.final_body is None
+        or draft.context is None
+    ):
+        raise HTTPException(404, "no approved complaint to the RBI Ombudsman yet")
+    ctx = EscalationContext.model_validate(draft.context)
+    record = await _latest_evidence(session, case_id)
+    ent_row = await session.scalar(
+        select(EntitlementRecord).where(EntitlementRecord.case_id == case_id)
+    )
+    assert record is not None and ent_row is not None
+    evidence = record.to_evidence()
+    entitlement = Entitlement.model_validate(ent_row.data)
+    contacts = load_bank_contacts()
+    bank = contacts.get(case.bank_id) if case.bank_id else contacts.match(evidence.payer_bank.value)
+    fields = [
+        FilingField(
+            label="Bank (regulated entity) complained against",
+            value=bank.name if bank else (evidence.payer_bank.value or "-"),
+        ),
+        FilingField(
+            label="Did you complain to the bank first? Date",
+            value=f"Yes, on {format_date(ctx.complained_on)}",
+        ),
+        FilingField(label="Bank's complaint reference", value=ctx.complaint_ref or "-"),
+        FilingField(
+            label="Date of the bank's last reply",
+            value=format_date(ctx.last_reply_on) if ctx.last_reply_on else "No reply",
+        ),
+        FilingField(
+            label="Amount of the disputed transaction",
+            value=format_inr(evidence.amount_inr.value) if evidence.amount_inr.value else "-",
+        ),
+    ]
+    fields += [
+        FilingField(label=f"Relief: {m.label}", value=format_inr(m.amount_inr))
+        for m in entitlement.money
+    ]
+    fields.append(
+        FilingField(label="Total relief sought", value=format_inr(entitlement.total_owed_inr))
+    )
+    deadline = ctx.assessment.filing_deadline
+    return OmbudsmanFiling(
+        portal_url="https://cms.rbi.org.in",
+        other_ways=[
+            "Email: crpc@rbi.org.in",
+            "Post: Centralised Receipt and Processing Centre, Reserve Bank of India, Chandigarh",
+        ],
+        fields=fields,
+        title=draft.final_subject,
+        complaint_text=draft.final_body,
+        filing_deadline=deadline,
+        filing_deadline_passed=deadline is not None and datetime.now(IST).date() > deadline,
+        disclaimer=DISCLAIMER,
+    )
+
+
+@router.post("/{case_id}/ombudsman/mark-filed", status_code=status.HTTP_202_ACCEPTED)
+async def mark_filed(
+    case_id: uuid.UUID, runner: Runner, report: FiledReport | None = None
+) -> dict[str, str]:
+    live = await runner.state(case_id)
+    if live is None or not live.awaiting_filing:
+        raise HTTPException(409, "there is no approved complaint waiting to be filed")
+    now = datetime.now(IST)
+    filed_at = (report.filed_at if report and report.filed_at else None) or now
+    if filed_at.tzinfo is None:
+        raise HTTPException(422, "filed_at needs a time zone")
+    if filed_at > now + timedelta(minutes=10):
+        raise HTTPException(422, "filed_at is in the future")
+    reference = report.reference.strip() if report and report.reference else None
+    try:
+        mark = MarkFiled(filed_at=filed_at, reference=reference)
+    except ValidationError as e:
+        raise HTTPException(422, _short_errors(e)) from e
+    await runner.mark_filed(case_id, mark)
+    return {"status": "recording"}
+
+
+@router.post("/{case_id}/close", status_code=status.HTTP_202_ACCEPTED)
+async def close_case(case_id: uuid.UUID, request: CloseRequest, runner: Runner) -> dict[str, str]:
+    live = await runner.state(case_id)
+    if live is None or not live.can_close:
+        raise HTTPException(409, "the case is not waiting for the Ombudsman's outcome")
+    await runner.close(case_id, request)
+    return {"status": "closing"}
+
+
 @banks_router.get("")
 async def list_banks() -> list[BankView]:
     return [_bank_view(b) for b in load_bank_contacts().banks]
@@ -690,7 +867,7 @@ async def _pending_draft(
     case = await s.get(Case, case_id, with_for_update=True)
     if case is None:
         raise HTTPException(404, "case not found")
-    if case.status is not CaseStatus.AWAITING_APPROVAL:
+    if case.status not in (CaseStatus.AWAITING_APPROVAL, CaseStatus.ESCALATION_DRAFT_READY):
         raise HTTPException(409, f"case is {case.status.value}, not waiting for approval")
     latest = await latest_draft(s, case_id)
     if latest is None or latest.id != draft_id:

@@ -20,8 +20,10 @@ from recourse.temporal.case_types import (
     BankReplied,
     CaseInput,
     CaseState,
+    CloseRequest,
     Confirmation,
     DraftDecision,
+    MarkFiled,
     MarkResolved,
     MarkSent,
 )
@@ -53,6 +55,9 @@ class CaseRunner(Protocol):
     async def bank_replied(self, case_id: uuid.UUID, reply: BankReplied) -> None: ...
     async def mark_resolved(self, case_id: uuid.UUID, mark: MarkResolved) -> None: ...
     async def escalate(self, case_id: uuid.UUID) -> None: ...
+    async def recheck_escalation(self, case_id: uuid.UUID) -> None: ...
+    async def mark_filed(self, case_id: uuid.UUID, mark: MarkFiled) -> None: ...
+    async def close(self, case_id: uuid.UUID, request: CloseRequest) -> None: ...
     async def state(self, case_id: uuid.UUID) -> CaseState | None: ...
 
 
@@ -102,6 +107,15 @@ class TemporalCaseRunner:
 
     async def escalate(self, case_id: uuid.UUID) -> None:
         await self._handle(case_id).signal(CaseWorkflow.escalate)
+
+    async def recheck_escalation(self, case_id: uuid.UUID) -> None:
+        await self._handle(case_id).signal(CaseWorkflow.recheck_escalation)
+
+    async def mark_filed(self, case_id: uuid.UUID, mark: MarkFiled) -> None:
+        await self._handle(case_id).signal(CaseWorkflow.mark_filed, mark)
+
+    async def close(self, case_id: uuid.UUID, request: CloseRequest) -> None:
+        await self._handle(case_id).signal(CaseWorkflow.close, request)
 
     async def state(self, case_id: uuid.UUID) -> CaseState | None:
         """The live workflow state, or None if the workflow cannot be reached right now."""

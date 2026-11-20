@@ -565,3 +565,44 @@ text from outside: it may be phishing, spoofed, or contain a prompt injection
 - The deterministic screen can have false positives; they only cost a warning, never an
   action. False negatives are backed by the LLM-has-no-tools design.
 - "Paid" relies on the amounts the bank states; the user confirms receipt before closing.
+
+## ADR-015: Escalation to the RBI Ombudsman
+
+### Context
+When the bank does not reply in time, or replies unsatisfactorily, the customer can complain to
+the RBI Ombudsman under RB-IOS 2026 within the filing window (CLAUDE.md §1 step 7, §4.3). The
+human always files on cms.rbi.org.in; Recourse drafts and tracks.
+
+### Decision
+- **When.** The workflow escalates when the bank window expires, when a verdict is `ESCALATE`, or
+  when the user chooses to (`escalate`, after a `JUDGED` reply; the API first marks that reply
+  unsatisfactory). While `JUDGED`, the bank timer is paused: the user decides.
+- **Eligibility comes from the rule engine.** `assess_escalation` runs again
+  (`escalation.checked`). The workflow drafts only when `can_file_now`:
+  - bank type unknown → it asks (`PUT /cases/{id}/bank-type`, then `recheck_escalation`);
+  - not covered, or the filing deadline has passed → it says so and drafts nothing;
+  - not eligible yet → it waits until it is.
+- **The same DraftGraph, a second kind.** `OMBUDSMAN_COMPLAINT` has its own prompt and the same
+  placeholder rule and mandatory `verify`. Extra slots come from an `EscalationContext` built by
+  code: the complaint date, the bank's reference (from a genuine reply), how the bank responded
+  (`BankResponse`, a fixed sentence chosen from the verdict labels, so the reply's own text
+  never reaches the drafting model) and the RB-IOS deadlines with citations. The context is
+  stored on the draft row (`drafts.context`, migration 0007) so approval rebuilds the same slot
+  table.
+- **What is owed is brought up to date.** Before an Ombudsman draft the Entitlement is
+  re-assessed as of the letter date (`case.reassessed`): delay compensation keeps growing.
+- Drafts of both kinds share one numbering (`seq`); the draft limit applies per kind.
+- **Approval does not send anything.** `GET /cases/{id}/ombudsman-filing` returns a filing
+  package: the portal, other ways to file, labelled values computed by code (bank, complaint
+  date and reference, last reply, amounts), the approved title and text, and the filing
+  deadline. The user files and reports it (`mark_filed`, optional CMS reference) →
+  `FILED_WITH_OMBUDSMAN`; a timer flags `filing_deadline_passed` as a reminder. The outcome
+  (`close`: award received, settled by the bank, rejected, withdrawn) → `CLOSED`.
+- New code path behind `workflow.patched("escalation-v1")`.
+
+### Consequences
+- The filing package labels describe what to enter; they are not the portal's exact field
+  names, which may change. The UI must tell the user to check the live form.
+- Status stays `ESCALATION_DRAFT_READY` from drafting until filing (the state query's
+  `awaiting_filing` tells the UI to show "file it yourself"), mirroring ADR-012.
+- Fraud cases escalate the same way; their bank timeline (90 or 45/60 days) sets the window.

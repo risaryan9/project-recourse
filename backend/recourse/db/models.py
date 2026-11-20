@@ -140,6 +140,9 @@ class Case(_Timestamps, Base):
     escalation: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
     # The bank's complaint / ticket number, once a reply states it (for follow-up subjects).
     bank_complaint_ref: Mapped[str | None] = mapped_column(String(40))
+    # The user filed the approved complaint with the RBI Ombudsman (cms.rbi.org.in).
+    ombudsman_filed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    ombudsman_ref: Mapped[str | None] = mapped_column(String(40))
 
     evidence: Mapped[list[EvidenceRecord]] = relationship(
         back_populates="case",
@@ -232,6 +235,7 @@ class EntitlementRecord(_Timestamps, Base):
 
 class DraftKind(StrEnum):
     BANK_COMPLAINT = "BANK_COMPLAINT"
+    OMBUDSMAN_COMPLAINT = "OMBUDSMAN_COMPLAINT"
 
 
 class DraftRecordStatus(StrEnum):
@@ -265,6 +269,9 @@ class DraftRecord(_Timestamps, Base):
     user_fill: Mapped[list[str]] = mapped_column(JSONB, default=list)
     errors: Mapped[list[str]] = mapped_column(JSONB, default=list)  # verify errors when FAILED
     models_used: Mapped[list[str]] = mapped_column(JSONB, default=list)
+    # OMBUDSMAN_COMPLAINT: the escalation context it was drafted from
+    # (agents.draft_slots.EscalationContext as JSON), so approval rebuilds the same slots.
+    context: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
     # Written by the API from the user's input; acted on by the workflow's activities.
     final_subject: Mapped[str | None] = mapped_column(Text)
     final_body: Mapped[str | None] = mapped_column(Text)

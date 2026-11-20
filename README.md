@@ -23,8 +23,12 @@ weeks until it is resolved:
 
 > ⚠️ Recourse provides information, not legal advice.
 
-**Status:** early development. The repository currently contains the project skeleton: API
-health check, a durable-workflow smoke test, the frontend shell, CI and Docker setup.
+**Status:** early development. The backend runs the whole case through its API: intake and
+extraction, the rule engine (amounts, deadlines, citations), the bank complaint with a mandatory
+verify step and per-email approval, sending through `ManualChannel`, the bank's reply window
+(with a demo mode that shrinks days to minutes), judging the bank's reply (with phishing and
+prompt-injection screening), and the complaint to the RBI Ombudsman, which the user files
+themselves. The frontend, Gmail sending and the eval suites are still to come.
 
 ## Architecture
 

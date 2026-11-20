@@ -17,7 +17,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from temporalio.testing import ActivityEnvironment
 
-from recourse.agents.draft_graph import DRAFT_PURPOSE
+from recourse.agents.draft_graph import DRAFT_PURPOSE, OMBUDSMAN_PURPOSE, DraftKind
 from recourse.agents.reply_judge_graph import NextAction, ReplyLabel
 from recourse.api.deps import get_runner, get_session_factory
 from recourse.api.main import create_app
@@ -32,18 +32,20 @@ from recourse.temporal.case_types import (
     BankReplied,
     CaseInput,
     CaseState,
+    CloseRequest,
     Confirmation,
     ConfirmInput,
     DraftDecisionInput,
     DraftInput,
     EscalationInput,
+    MarkFiled,
     MarkResolved,
     MarkSent,
     PrepareSendInput,
     ReplySummary,
     RunIntakeInput,
 )
-from tests.db.test_bank_wait_activities import sent_case
+from tests.db.test_bank_wait_activities import ELIGIBLE_DAY, OMBUDSMAN_TEMPLATE, sent_case
 from tests.db.test_case_activities import NONE, sms_llm
 from tests.unit.test_draft_graph import GOOD_FAILED
 
@@ -71,6 +73,12 @@ class FakeRunner:
     escalations: list[uuid.UUID] = field(default_factory=list)
     can_escalate: bool = False
     last_reply: ReplySummary | None = None
+    needs_bank_type: bool = False
+    awaiting_filing: bool = False
+    can_close: bool = False
+    rechecks: list[uuid.UUID] = field(default_factory=list)
+    filings: list[MarkFiled] = field(default_factory=list)
+    closes: list[CloseRequest] = field(default_factory=list)
 
     async def start(self, inp: CaseInput) -> None:
         if self.fail_start:
@@ -107,6 +115,15 @@ class FakeRunner:
     async def escalate(self, case_id: uuid.UUID) -> None:
         self.escalations.append(case_id)
 
+    async def recheck_escalation(self, case_id: uuid.UUID) -> None:
+        self.rechecks.append(case_id)
+
+    async def mark_filed(self, case_id: uuid.UUID, mark: MarkFiled) -> None:
+        self.filings.append(mark)
+
+    async def close(self, case_id: uuid.UUID, request: CloseRequest) -> None:
+        self.closes.append(request)
+
     async def state(self, case_id: uuid.UUID) -> CaseState | None:
         return CaseState(
             status=CaseStatus.EXTRACTED,
@@ -115,6 +132,9 @@ class FakeRunner:
             can_retry_send=self.can_retry_send,
             can_escalate=self.can_escalate,
             last_reply=self.last_reply,
+            needs_bank_type=self.needs_bank_type,
+            awaiting_filing=self.awaiting_filing,
+            can_close=self.can_close,
         )
 
 
@@ -487,3 +507,78 @@ async def test_bank_reply_resolve_and_escalate_through_the_api(
     ok = {"amount_received_inr": "2750.00"}
     assert (await client.post(f"/cases/{case_id}/resolved", json=ok)).status_code == 202
     assert [m.amount_received_inr for m in runner.resolved] == [2750]
+
+
+async def test_ombudsman_filing_through_the_api(
+    api: tuple[httpx.AsyncClient, FakeRunner], sessions: async_sessionmaker[AsyncSession]
+) -> None:
+    client, runner = api
+    case_id = await sent_case(sessions)
+    async with sessions.begin() as s:
+        case = await s.get(Case, case_id)
+        assert case is not None
+        case.bank_id = "pnb"
+    acts = CaseActivities(sessions, FakeLLM({OMBUDSMAN_PURPOSE: [OMBUDSMAN_TEMPLATE]}))
+    env = ActivityEnvironment()
+    await env.run(
+        acts.assess_escalation,
+        EscalationInput(case_id=case_id, as_of=ELIGIBLE_DAY, event="escalation.checked"),
+    )
+    assert (await client.get(f"/cases/{case_id}/ombudsman-filing")).status_code == 404
+    summary = await env.run(
+        acts.draft,
+        DraftInput(
+            case_id=case_id, seq=2, letter_date=ELIGIBLE_DAY, kind=DraftKind.OMBUDSMAN_COMPLAINT
+        ),
+    )
+    # The user approves it through the same endpoint as a bank letter.
+    r = await client.post(
+        f"/cases/{case_id}/drafts/{summary.draft_id}/approve", json={"customer_name": "Asha Verma"}
+    )
+    assert r.status_code == 202, r.text
+    assert runner.approved == [summary.draft_id]
+    await env.run(
+        acts.approve_draft,
+        DraftDecisionInput(case_id=case_id, draft_id=summary.draft_id, now=datetime.now(IST)),
+    )
+
+    filing = (await client.get(f"/cases/{case_id}/ombudsman-filing")).json()
+    assert filing["portal_url"] == "https://cms.rbi.org.in"
+    fields = {f["label"]: f["value"] for f in filing["fields"]}
+    assert fields["Bank (regulated entity) complained against"] == "Punjab National Bank"
+    assert fields["Did you complain to the bank first? Date"] == "Yes, on 17 November 2026"
+    assert fields["Total relief sought"].startswith("₹")
+    assert filing["complaint_text"].endswith("Asha Verma")
+    assert filing["filing_deadline"] == "2027-03-17"
+
+    # Filing and closing only when the workflow waits for them.
+    assert (await client.post(f"/cases/{case_id}/ombudsman/mark-filed")).status_code == 409
+    runner.awaiting_filing = True
+    bad_ref = {"reference": "not a ref!"}
+    r = await client.post(f"/cases/{case_id}/ombudsman/mark-filed", json=bad_ref)
+    assert r.status_code == 422
+    r = await client.post(f"/cases/{case_id}/ombudsman/mark-filed", json={"reference": "N-0042"})
+    assert r.status_code == 202 and runner.filings[0].reference == "N-0042"
+
+    close = {"outcome": "AWARD_RECEIVED", "amount_received_inr": "2750"}
+    assert (await client.post(f"/cases/{case_id}/close", json=close)).status_code == 409
+    runner.can_close = True
+    assert (await client.post(f"/cases/{case_id}/close", json=close)).status_code == 202
+    assert runner.closes[0].outcome.value == "AWARD_RECEIVED"
+
+
+async def test_bank_type_answer_rechecks_the_escalation(
+    api: tuple[httpx.AsyncClient, FakeRunner], sessions: async_sessionmaker[AsyncSession]
+) -> None:
+    client, runner = api
+    case_id = await sent_case(sessions)
+    answer = {"bank_type": "SMALL_FINANCE_BANK"}
+    assert (await client.put(f"/cases/{case_id}/bank-type", json=answer)).status_code == 409
+    runner.needs_bank_type = True
+    r = await client.put(f"/cases/{case_id}/bank-type", json={"bank_type": "NOT_A_TYPE"})
+    assert r.status_code == 422
+    assert (await client.put(f"/cases/{case_id}/bank-type", json=answer)).status_code == 202
+    assert runner.rechecks == [case_id]
+    async with sessions() as s:
+        case = await s.get(Case, case_id)
+        assert case is not None and case.details["bank_type"] == "SMALL_FINANCE_BANK"

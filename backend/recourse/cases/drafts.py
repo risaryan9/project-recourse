@@ -15,9 +15,14 @@ from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from recourse.agents.draft_slots import CUSTOMER_NAME_PLACEHOLDER, SlotTable, build_slots
+from recourse.agents.draft_slots import (
+    CUSTOMER_NAME_PLACEHOLDER,
+    EscalationContext,
+    SlotTable,
+    build_slots,
+)
 from recourse.agents.draft_verify import MAX_BODY_CHARS, MAX_SUBJECT_CHARS, check_final
-from recourse.db.models import Case, DraftRecord, EntitlementRecord, EvidenceRecord
+from recourse.db.models import Case, DraftKind, DraftRecord, EntitlementRecord, EvidenceRecord
 from recourse.rules.models import Entitlement
 
 MAX_DRAFTS_PER_CASE = 5  # every draft is a paid LLM run; the user can still edit the last one
@@ -87,8 +92,17 @@ async def slot_table_for(s: AsyncSession, case: Case, draft: DraftRecord) -> Slo
     if record is None or ent_row is None:
         raise InvalidEdit(["the case has no assessment to check the letter against"])
     entitlement = Entitlement.model_validate(ent_row.data)
+    escalation = None
+    if draft.kind is DraftKind.OMBUDSMAN_COMPLAINT:
+        if draft.context is None:
+            raise InvalidEdit(["the draft has no escalation context to check against"])
+        escalation = EscalationContext.model_validate(draft.context)
     return build_slots(
-        entitlement, record.to_evidence(), case_tag=case.case_tag, letter_date=draft.letter_date
+        entitlement,
+        record.to_evidence(),
+        case_tag=case.case_tag,
+        letter_date=draft.letter_date,
+        escalation=escalation,
     )
 
 

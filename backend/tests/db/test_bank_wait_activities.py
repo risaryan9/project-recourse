@@ -14,20 +14,30 @@ import pytest
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from temporalio.exceptions import ApplicationError
 
+from recourse.agents.draft_graph import OMBUDSMAN_PURPOSE, DraftKind, DraftStatus
 from recourse.agents.reply_judge_graph import CLASSIFY_PURPOSE, NextAction, ReplyLabel
-from recourse.db.models import BankReply, Case, CaseStatus, ReplySource, ReplyStatus
+from recourse.db.models import BankReply, Case, CaseStatus, DraftRecord, ReplySource, ReplyStatus
+from recourse.db.models import DraftKind as DbDraftKind
 from recourse.llm.fake import FakeLLM
 from recourse.temporal.case_activities import CaseActivities
 from recourse.temporal.case_types import (
+    CloseOutcome,
+    CloseRequest,
+    DraftDecisionInput,
+    DraftInput,
     EscalationInput,
     JudgeReplyInput,
+    MarkFiled,
     MarkResolved,
     MarkSent,
     PrepareSendInput,
+    RecordClosedInput,
+    RecordFiledInput,
     RecordResolvedInput,
     RecordSentInput,
 )
 from tests.db.test_case_activities import NOW, events, run
+from tests.db.test_draft_activities import approve_with
 from tests.db.test_send_activities import SANDBOX, approved_draft, sender
 
 pytestmark = pytest.mark.db
@@ -250,3 +260,90 @@ async def test_record_resolved(sessions: async_sessionmaker[AsyncSession]) -> No
         case = await s.get(Case, case_id)
         assert case is not None and case.status is CaseStatus.RESOLVED
         assert (await events(s, case_id)).count("case.resolved") == 1
+
+
+# --- the complaint to the RBI Ombudsman ---------------------------------------------------------
+
+OMBUDSMAN_TEMPLATE = {
+    "subject": "{{case.tag}} Complaint against my bank: failed UPI payment not reversed",
+    "body": (
+        "To the RBI Ombudsman,\n\n"
+        "On {{txn.date}} my account was debited {{txn.amount}} (reference {{txn.utr}}). Under "
+        "{{cite.c1}} the bank had to reverse it by {{deadline.reversal_deadline}}.\n\n"
+        "I complained to the bank on {{bank.complaint_date}}. However, {{bank.response}}. I may "
+        "therefore approach the Ombudsman under {{cite.c5}}.\n\n"
+        "Relief sought: {{money.refund}} and compensation of {{money.delay_compensation}}, a "
+        "total of {{money.total}}.\n\n"
+        "Yours faithfully,\n{{customer.name}}"
+    ),
+}
+ELIGIBLE_DAY = date(2026, 12, 18)
+
+
+async def test_ombudsman_complaint_from_draft_to_closed(
+    sessions: async_sessionmaker[AsyncSession],
+) -> None:
+    case_id = await sent_case(sessions)
+    async with sessions.begin() as s:
+        case = await s.get(Case, case_id)
+        assert case is not None
+        case.bank_id = "pnb"  # a commercial bank: covered by the scheme
+    llm = FakeLLM({OMBUDSMAN_PURPOSE: [OMBUDSMAN_TEMPLATE]})
+    acts = CaseActivities(sessions, llm, settings=SANDBOX)
+    await run(
+        acts.assess_escalation,
+        EscalationInput(
+            case_id=case_id,
+            as_of=TODAY,
+            event="bank.wait_started",
+            new_status=CaseStatus.AWAITING_BANK,
+        ),
+    )
+    letter = DraftInput(
+        case_id=case_id, seq=2, letter_date=ELIGIBLE_DAY, kind=DraftKind.OMBUDSMAN_COMPLAINT
+    )
+    with pytest.raises(ApplicationError, match="cannot be filed now"):
+        await run(acts.draft, letter)  # the waiting period has not ended yet
+    assert llm.calls == []
+
+    await run(
+        acts.assess_escalation,
+        EscalationInput(case_id=case_id, as_of=ELIGIBLE_DAY, event="escalation.checked"),
+    )
+    summary = await run(acts.draft, letter)
+    assert summary.status is DraftStatus.DRAFTED
+    async with sessions() as s:
+        case = await s.get(Case, case_id)
+        assert case is not None and case.status is CaseStatus.ESCALATION_DRAFT_READY
+        row = await s.get(DraftRecord, summary.draft_id)
+        assert row is not None and row.kind is DbDraftKind.OMBUDSMAN_COMPLAINT
+        assert row.context is not None and row.context["bank_response"] == "NO_REPLY"
+        assert row.body is not None and "17 November 2026" in row.body
+        # Re-assessed on the letter date: 33 days of delay since the 15 Nov deadline.
+        assert "₹3,300.00" in row.body and "case.reassessed" in await events(s, case_id)
+
+    # Approve (the slot table is rebuilt from the stored context), file, close.
+    await approve_with(sessions, summary.draft_id)
+    approved_at = NOW + timedelta(days=31)
+    await run(
+        acts.approve_draft,
+        DraftDecisionInput(case_id=case_id, draft_id=summary.draft_id, now=approved_at),
+    )
+    filed = RecordFiledInput(
+        case_id=case_id,
+        draft_id=summary.draft_id,
+        mark=MarkFiled(filed_at=approved_at + timedelta(hours=1), reference="N-0042"),
+        now=approved_at + timedelta(hours=2),
+    )
+    await run(acts.record_filed, filed)
+    await run(acts.record_filed, filed)  # idempotent
+    closed = RecordClosedInput(
+        case_id=case_id, request=CloseRequest(outcome=CloseOutcome.AWARD_RECEIVED)
+    )
+    await run(acts.record_closed, closed)
+    async with sessions() as s:
+        case = await s.get(Case, case_id)
+        assert case is not None and case.status is CaseStatus.CLOSED
+        assert case.ombudsman_ref == "N-0042"
+        names = await events(s, case_id)
+        assert names.count("ombudsman.filed") == 1 and names[-1] == "case.closed"

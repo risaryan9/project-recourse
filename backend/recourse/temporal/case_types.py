@@ -10,10 +10,11 @@ from __future__ import annotations
 import uuid
 from datetime import date, datetime
 from decimal import Decimal
+from enum import StrEnum
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from recourse.agents.draft_graph import DraftStatus
+from recourse.agents.draft_graph import DraftKind, DraftStatus
 from recourse.agents.intake_graph import IntakeStatus
 from recourse.agents.reply_judge_graph import NextAction, ReplyLabel
 from recourse.cases.review import Confirmation as Confirmation  # the confirm signal payload
@@ -33,6 +34,8 @@ RECORD_SENT = "case.record_sent"
 ASSESS_ESCALATION = "case.assess_escalation"
 JUDGE_REPLY = "case.judge_reply"
 RECORD_RESOLVED = "case.record_resolved"
+RECORD_FILED = "case.record_filed"
+RECORD_CLOSED = "case.record_closed"
 
 # Error type for ApplicationErrors caused by bad user input (never retried).
 INVALID_USER_INPUT = "InvalidUserInput"
@@ -88,6 +91,27 @@ class MarkResolved(_Model):
     amount_received_inr: Decimal = Field(ge=0, max_digits=14, decimal_places=2)
 
 
+class MarkFiled(_Model):
+    """Payload of `mark_filed`: the user filed the approved complaint on cms.rbi.org.in."""
+
+    filed_at: datetime
+    reference: str | None = Field(default=None, pattern=r"^[A-Za-z0-9][A-Za-z0-9/_-]{2,39}$")
+
+
+class CloseOutcome(StrEnum):
+    AWARD_RECEIVED = "AWARD_RECEIVED"  # the Ombudsman's award was paid
+    SETTLED_BY_BANK = "SETTLED_BY_BANK"  # the bank paid after the complaint was filed
+    REJECTED_BY_OMBUDSMAN = "REJECTED_BY_OMBUDSMAN"
+    WITHDRAWN = "WITHDRAWN"
+
+
+class CloseRequest(_Model):
+    """Payload of `close`: how the Ombudsman complaint ended."""
+
+    outcome: CloseOutcome
+    amount_received_inr: Decimal | None = Field(default=None, ge=0, max_digits=14, decimal_places=2)
+
+
 class CaseState(_Model):
     status: CaseStatus
     needs_confirmation: list[str] = Field(default_factory=list)
@@ -106,6 +130,13 @@ class CaseState(_Model):
     bank_wait_expired: bool = False  # the bank did not reply within its window
     last_reply: ReplySummary | None = None  # the verdict on the latest bank reply
     can_escalate: bool = False  # the user may choose to escalate (`escalate` signal)
+    # Escalation to the RBI Ombudsman
+    needs_bank_type: bool = False  # answer the bank's type, then `recheck_escalation`
+    can_recheck_escalation: bool = False
+    escalation_draft_id: uuid.UUID | None = None  # the approved Ombudsman complaint
+    awaiting_filing: bool = False  # waiting for `mark_filed`
+    filing_deadline_passed: bool = False  # reminder: the 90-day filing window has ended
+    can_close: bool = False  # filed: waiting for `close`
 
 
 # --- activities -------------------------------------------------------------------------------
@@ -152,6 +183,7 @@ class DraftInput(_Model):
     case_id: uuid.UUID
     seq: int = Field(ge=1)  # idempotency key: one draft row per (case, seq)
     letter_date: date
+    kind: DraftKind = DraftKind.BANK_COMPLAINT
 
 
 class DraftSummary(_Model):
@@ -226,6 +258,18 @@ class RecordResolvedInput(_Model):
     case_id: uuid.UUID
     mark: MarkResolved
     now: datetime
+
+
+class RecordFiledInput(_Model):
+    case_id: uuid.UUID
+    draft_id: uuid.UUID
+    mark: MarkFiled
+    now: datetime
+
+
+class RecordClosedInput(_Model):
+    case_id: uuid.UUID
+    request: CloseRequest
 
 
 class MarkAbandonedInput(_Model):

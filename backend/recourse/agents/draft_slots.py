@@ -23,12 +23,16 @@ import re
 from dataclasses import dataclass
 from datetime import date, datetime
 from decimal import Decimal
+from enum import StrEnum
+
+from pydantic import BaseModel, ConfigDict
 
 from recourse.evidence.models import IST, Evidence
 from recourse.rules.models import (
     Channel,
     Citation,
     Entitlement,
+    EscalationAssessment,
     FailedScenario,
     FailedTxnDetails,
     FraudDetails,
@@ -66,6 +70,41 @@ SCENARIO_NAMES: dict[FailedScenario, str] = {
     FailedScenario.MANDATE_REVOKED_DEBIT: "my account was debited despite a revoked mandate",
     FailedScenario.CUSTOMER_ERROR: "the payment went to the wrong recipient",
 }
+
+
+class BankResponse(StrEnum):
+    """How the bank answered the complaint, for an Ombudsman complaint (decided by code)."""
+
+    NO_REPLY = "NO_REPLY"  # no substantive reply within the time allowed
+    PARTIAL = "PARTIAL"  # paid only part of what is owed
+    REJECTED_NO_REASONS = "REJECTED_NO_REASONS"
+    REJECTED_WITH_REASONS = "REJECTED_WITH_REASONS"  # the customer does not accept the reasons
+    UNSATISFACTORY = "UNSATISFACTORY"  # any other reply the customer found unsatisfactory
+
+
+BANK_RESPONSE_TEXT: dict[BankResponse, str] = {
+    BankResponse.NO_REPLY: (
+        "the bank did not resolve my complaint or send a substantive reply within the time allowed"
+    ),
+    BankResponse.PARTIAL: "the bank paid only part of the amount I am owed",
+    BankResponse.REJECTED_NO_REASONS: "the bank rejected my complaint without giving reasons",
+    BankResponse.REJECTED_WITH_REASONS: (
+        "the bank rejected my complaint, and I do not accept the reasons it gave"
+    ),
+    BankResponse.UNSATISFACTORY: "the bank's reply did not resolve my complaint",
+}
+
+
+class EscalationContext(BaseModel):
+    """What an Ombudsman complaint needs beyond the Entitlement. Stored with the draft."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    complained_on: date
+    complaint_ref: str | None = None  # the bank's reference, from a genuine reply
+    bank_response: BankResponse
+    last_reply_on: date | None = None
+    assessment: EscalationAssessment  # rule engine: RB-IOS dates and citations
 
 
 @dataclass(frozen=True)
@@ -149,9 +188,15 @@ class SlotError(ValueError):
 
 
 def build_slots(
-    entitlement: Entitlement, evidence: Evidence, *, case_tag: str, letter_date: date
+    entitlement: Entitlement,
+    evidence: Evidence,
+    *,
+    case_tag: str,
+    letter_date: date,
+    escalation: EscalationContext | None = None,
 ) -> SlotTable:
-    """All placeholders a bank complaint for this case may use."""
+    """All placeholders a letter for this case may use: a bank complaint, or (with
+    `escalation`) a complaint to the RBI Ombudsman."""
     if not entitlement.covered:
         raise SlotError(f"case is not covered ({entitlement.not_covered_reason})")
     if evidence.case_type.value is None or evidence.case_type.value.value != entitlement.case_type:
@@ -349,6 +394,45 @@ def build_slots(
                 "How long after the bank's alert the customer reported.",
                 format_days(det.reporting_delay_days, det.reporting_day_kind.value.lower()),
             )
+    # --- Escalation to the RBI Ombudsman (rule engine: RB-IOS 2026) -------------------------------
+    if escalation is not None:
+        add(
+            "bank.complaint_date",
+            "Date the customer complained to the bank.",
+            format_date(escalation.complained_on),
+            required=True,
+        )
+        if escalation.complaint_ref is not None:
+            add(
+                "bank.complaint_ref",
+                "The bank's reference number for the customer's complaint.",
+                escalation.complaint_ref,
+                required=True,
+            )
+        add(
+            "bank.response",
+            "What the bank did about the complaint, as a first-person clause (e.g. used after "
+            "'However, ').",
+            BANK_RESPONSE_TEXT[escalation.bank_response],
+            required=True,
+        )
+        if escalation.last_reply_on is not None:
+            add(
+                "bank.reply_date",
+                "Date of the bank's last reply.",
+                format_date(escalation.last_reply_on),
+            )
+        for c in escalation.assessment.citations:
+            cite_of(c)
+        for d in escalation.assessment.deadlines:
+            name = cite_of(d.citation)
+            add(
+                f"deadline.{d.key}",
+                f"{d.label} (supported by {{{{{name}}}}}).",
+                format_date(d.due),
+            )
+            if d.key == "ombudsman_eligible_from":
+                require(name)  # why the complaint is maintainable now
     return SlotTable(slots=slots, citation_slots=citation_slots)
 
 

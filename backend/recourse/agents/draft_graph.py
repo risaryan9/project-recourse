@@ -1,4 +1,5 @@
-"""DraftGraph: write the customer's complaint to their bank, with a mandatory verify step.
+"""DraftGraph: write the customer's complaint (to their bank, or to the RBI Ombudsman), with a
+mandatory verify step.
 
     START → write (MAIN model) → verify (pure Python) ──ok──────────────→ END  status DRAFTED
               ▲                       │
@@ -29,13 +30,21 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.graph.state import CompiledStateGraph
 from pydantic import BaseModel, ConfigDict, Field
 
-from recourse.agents.draft_slots import SlotTable, build_slots, render, used_slots
+from recourse.agents.draft_slots import (
+    EscalationContext,
+    SlotError,
+    SlotTable,
+    build_slots,
+    render,
+    used_slots,
+)
 from recourse.agents.draft_verify import verify
 from recourse.evidence.models import Evidence
 from recourse.llm.base import LLMClient, LLMRequest, ModelRole
 from recourse.rules.models import Entitlement, FlagCode
 
 DRAFT_PURPOSE = "draft.bank_complaint"
+OMBUDSMAN_PURPOSE = "draft.ombudsman_complaint"
 MAX_ATTEMPTS = 3
 
 DISCLAIMER = "Recourse gives information, not legal advice. Check this letter before you send it."
@@ -47,6 +56,7 @@ DISCLAIMER = "Recourse gives information, not legal advice. Check this letter be
 
 class DraftKind(StrEnum):
     BANK_COMPLAINT = "BANK_COMPLAINT"
+    OMBUDSMAN_COMPLAINT = "OMBUDSMAN_COMPLAINT"  # filed by the user on cms.rbi.org.in
 
 
 class DraftStatus(StrEnum):
@@ -87,11 +97,7 @@ class DraftResult(BaseModel):
 # Prompt
 # =================================================================================================
 
-DRAFT_SYSTEM = """\
-You write formal complaint emails that a bank customer in India sends to their own bank about \
-a failed or fraudulent digital payment. You write as the customer, in the first person, in \
-clear, polite, firm English.
-
+_PLACEHOLDER_RULE = """\
 THE PLACEHOLDER RULE (most important):
 - You never type any number, amount, date, duration, percentage, reference number, clause \
 number, document name with a number, web address, or currency sign or word (₹, Rs, INR, rupees, \
@@ -101,7 +107,24 @@ lakh). Not even in words ("three days", "one hundred").
 - Use only placeholders from the list you are given. Never invent one.
 - Every placeholder marked REQUIRED must appear at least once. {{case.tag}} goes in the subject.
 - If you need a value that has no placeholder, leave it out.
+"""
 
+_COMMON_RULES = """\
+- Never mention OTPs, PINs, CVVs, passwords or remote-access apps. Never mention any software \
+or service that helped write the letter.
+- End with "Yours faithfully," and {{customer.name}}.
+- Plain text only: no markdown, no bullet symbols other than "-".
+"""
+
+DRAFT_SYSTEM = (
+    """\
+You write formal complaint emails that a bank customer in India sends to their own bank about \
+a failed or fraudulent digital payment. You write as the customer, in the first person, in \
+clear, polite, firm English.
+
+"""
+    + _PLACEHOLDER_RULE
+    + """
 Content:
 - Address the bank's grievance redressal officer. State the transaction facts, what went wrong, \
 what the customer is owed and under which rule (cite with the {{cite.cN}} placeholders), and \
@@ -110,11 +133,40 @@ written reply).
 - Only claim what the listed placeholders and notes support. Do not invent rules, rights, \
 deadlines or facts. Do not threaten. You may say the customer will escalate to the RBI \
 Ombudsman if the complaint is not resolved, without giving any timeline.
-- Never mention OTPs, PINs, CVVs, passwords or remote-access apps. Never mention any software \
-or service that helped write the letter.
-- End with "Yours faithfully," and {{customer.name}}.
-- Plain text only: no markdown, no bullet symbols other than "-".
 """
+    + _COMMON_RULES
+)
+
+OMBUDSMAN_SYSTEM = (
+    """\
+You write the complaint that a bank customer in India files with the RBI Ombudsman under the \
+Reserve Bank - Integrated Ombudsman Scheme, about a failed or fraudulent digital payment that \
+their bank did not put right. The customer pastes it into the complaint form on the RBI's \
+complaint portal. You write as the customer, in the first person, in clear, factual, firm \
+English.
+
+"""
+    + _PLACEHOLDER_RULE
+    + """
+Content:
+- The subject is a one-line title of the complaint, containing {{case.tag}}.
+- Address it to the RBI Ombudsman. In this order: the transaction facts and what went wrong; \
+that the customer complained to the bank on {{bank.complaint_date}} (with the bank's reference \
+if there is a placeholder for it); what the bank did, using {{bank.response}}; why the complaint \
+can now be brought to the Ombudsman (cite it); what the customer is owed and under which rules \
+(cite them); the relief sought (the amounts owed under the rules).
+- Only claim what the listed placeholders and notes support. Do not invent rules, rights, \
+deadlines or facts. Do not ask for compensation beyond the listed amounts. Do not threaten.
+- Do not quote or describe the bank's reply beyond {{bank.response}}.
+"""
+    + _COMMON_RULES
+)
+
+_SYSTEMS = {DraftKind.BANK_COMPLAINT: DRAFT_SYSTEM, DraftKind.OMBUDSMAN_COMPLAINT: OMBUDSMAN_SYSTEM}
+_PURPOSES = {
+    DraftKind.BANK_COMPLAINT: DRAFT_PURPOSE,
+    DraftKind.OMBUDSMAN_COMPLAINT: OMBUDSMAN_PURPOSE,
+}
 
 _FLAG_NOTES: dict[FlagCode, str] = {
     FlagCode.COMPENSATION_ACCRUING: (
@@ -162,7 +214,12 @@ def _feedback_block(feedback: str | None) -> str:
     )
 
 
-def _task(entitlement: Entitlement, table: SlotTable, feedback: str | None = None) -> str:
+def _task(
+    entitlement: Entitlement,
+    table: SlotTable,
+    feedback: str | None = None,
+    draft_kind: DraftKind = DraftKind.BANK_COMPLAINT,
+) -> str:
     kind = (
         "a FAILED TRANSACTION (the bank must reverse it and pay compensation for delay)"
         if entitlement.case_type == "failed_transaction"
@@ -170,8 +227,13 @@ def _task(entitlement: Entitlement, table: SlotTable, feedback: str | None = Non
     )
     notes = [_FLAG_NOTES[f.code] for f in entitlement.flags if f.code in _FLAG_NOTES]
     note_text = "\n".join(f"- {n}" for n in notes) or "- (none)"
+    what = (
+        "the complaint email to the bank"
+        if draft_kind is DraftKind.BANK_COMPLAINT
+        else "the complaint to the RBI Ombudsman"
+    )
     return (
-        f"Write the complaint email for {kind}.\n\n"
+        f"Write {what} for {kind}.\n\n"
         f"Placeholders you may use:\n{table.catalogue()}\n\n"
         f"Notes about this case:\n{note_text}"
         f"{_feedback_block(feedback)}\n\n"
@@ -197,6 +259,7 @@ def _revision_task(base: str, previous: DraftTemplate, errors: list[str]) -> str
 
 
 class DraftState(TypedDict, total=False):
+    kind: DraftKind
     entitlement: Entitlement
     table: SlotTable
     feedback: str | None
@@ -212,13 +275,14 @@ DraftGraph = CompiledStateGraph[DraftState, None, DraftState, DraftState]
 
 def build_draft_graph(llm: LLMClient) -> DraftGraph:
     async def write(state: DraftState) -> dict[str, Any]:
-        base = _task(state["entitlement"], state["table"], state.get("feedback"))
+        kind = state.get("kind", DraftKind.BANK_COMPLAINT)
+        base = _task(state["entitlement"], state["table"], state.get("feedback"), kind)
         previous = state.get("template")
         task = base if previous is None else _revision_task(base, previous, state["errors"])
         request = LLMRequest(
-            purpose=DRAFT_PURPOSE,
+            purpose=_PURPOSES[kind],
             role=ModelRole.MAIN,
-            system=DRAFT_SYSTEM,
+            system=_SYSTEMS[kind],
             task=task,
             max_tokens=4_000,
         )
@@ -242,6 +306,7 @@ def build_draft_graph(llm: LLMClient) -> DraftGraph:
         t, table = state["template"], state["table"]
         used = list(dict.fromkeys(used_slots(t.subject) + used_slots(t.body)))
         result = DraftResult(
+            kind=state.get("kind", DraftKind.BANK_COMPLAINT),
             status=DraftStatus.DRAFTED,
             attempts=state["attempts"],
             subject=render(t.subject, table),
@@ -256,6 +321,7 @@ def build_draft_graph(llm: LLMClient) -> DraftGraph:
 
     def fail(state: DraftState) -> dict[str, Any]:
         result = DraftResult(
+            kind=state.get("kind", DraftKind.BANK_COMPLAINT),
             status=DraftStatus.FAILED,
             attempts=state["attempts"],
             rules_verified=state["entitlement"].all_verified,
@@ -287,17 +353,28 @@ async def run_draft(
     case_tag: str,
     letter_date: date,
     feedback: str | None = None,
+    kind: DraftKind = DraftKind.BANK_COMPLAINT,
+    escalation: EscalationContext | None = None,
 ) -> DraftResult:
-    """Draft the bank complaint once. Raises `SlotError` if the case cannot be drafted.
+    """Draft one letter. Raises `SlotError` if the case cannot be drafted.
 
-    `feedback` is the customer's reason for rejecting an earlier draft (optional).
+    `feedback` is the customer's reason for rejecting an earlier draft (optional). An
+    `OMBUDSMAN_COMPLAINT` needs the `escalation` context.
 
     LLM errors (`LLMError`) propagate unchanged, like the IntakeGraph; the calling activity's
     retry policy uses their `retryable` flag.
     """
-    table = build_slots(entitlement, evidence, case_tag=case_tag, letter_date=letter_date)
+    if kind is DraftKind.OMBUDSMAN_COMPLAINT and escalation is None:
+        raise SlotError("an Ombudsman complaint needs the escalation context")
+    table = build_slots(
+        entitlement,
+        evidence,
+        case_tag=case_tag,
+        letter_date=letter_date,
+        escalation=escalation if kind is DraftKind.OMBUDSMAN_COMPLAINT else None,
+    )
     state = await build_draft_graph(llm).ainvoke(
-        {"entitlement": entitlement, "table": table, "feedback": feedback}
+        {"kind": kind, "entitlement": entitlement, "table": table, "feedback": feedback}
     )
     result: DraftResult = state["result"]
     return result
