@@ -52,3 +52,17 @@ async def test_check_temporal_unreachable_address() -> None:
     result = await check_temporal(settings)
     assert result.reachable is False
     assert result.error is not None
+
+
+def test_public_config_has_only_safe_flags() -> None:
+    from fastapi.testclient import TestClient
+
+    from recourse.api.main import create_app
+    from recourse.config import Settings, get_settings
+
+    app = create_app()
+    app.dependency_overrides[get_settings] = lambda: Settings(
+        email_sandbox=True, demo_mode=True, demo_day_seconds=10, sandbox_recipient="x@example.com"
+    )
+    body = TestClient(app).get("/config").json()
+    assert body == {"email_sandbox": True, "demo_mode": True, "demo_day_seconds": 10}

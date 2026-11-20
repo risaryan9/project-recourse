@@ -61,3 +61,20 @@ async def health(
 ) -> HealthResponse:
     # Always 200 while the API itself is up; Temporal status is reported in the body.
     return HealthResponse(temporal=temporal)
+
+
+class PublicConfig(BaseModel):
+    """What the UI needs to label itself honestly. No secrets, no addresses."""
+
+    email_sandbox: bool  # True: show "Sandbox: not sent to the real bank"
+    demo_mode: bool  # True: one "day" lasts demo_day_seconds
+    demo_day_seconds: int
+
+
+@router.get("/config")
+async def public_config(settings: Annotated[Settings, Depends(get_settings)]) -> PublicConfig:
+    return PublicConfig(
+        email_sandbox=settings.email_sandbox,
+        demo_mode=settings.demo_mode,
+        demo_day_seconds=settings.demo_day_seconds,
+    )

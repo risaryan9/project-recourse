@@ -80,6 +80,7 @@
   --color-blue: var(--blue);
   --color-blue-bright: var(--blue-bright);
   --color-line: var(--line);
+  --color-line-strong: var(--line-strong);
   --color-amber: var(--amber);
 
   --font-sans: var(--font-mona);
@@ -115,6 +116,10 @@
     line-height: 1.6;
     text-rendering: optimizeLegibility;
     -webkit-font-smoothing: antialiased;
+  }
+  /* Form labels sit above their field. */
+  label {
+    display: block;
   }
   ::selection {
     background: rgb(59 130 246 / 0.35);
@@ -325,6 +330,19 @@
     border-radius: 50%;
     pointer-events: none;
     background: radial-gradient(closest-side, rgb(59 130 246 / 0.16), transparent 70%);
+  }
+}
+
+/* The app: one still pool of light, no drift (calmer than the landing page). */
+@layer components {
+  .ambient-app {
+    position: fixed;
+    inset: 0;
+    z-index: 0;
+    pointer-events: none;
+    background:
+      radial-gradient(60vmax 50vmax at 100% -10%, rgb(59 130 246 / 0.09), transparent 70%),
+      var(--ink);
   }
 }
 

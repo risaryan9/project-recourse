@@ -80,6 +80,7 @@ class FakeRunner:
     rechecks: list[uuid.UUID] = field(default_factory=list)
     filings: list[MarkFiled] = field(default_factory=list)
     closes: list[CloseRequest] = field(default_factory=list)
+    terminated: list[uuid.UUID] = field(default_factory=list)
 
     async def start(self, inp: CaseInput) -> None:
         if self.fail_start:
@@ -124,6 +125,9 @@ class FakeRunner:
 
     async def close(self, case_id: uuid.UUID, request: CloseRequest) -> None:
         self.closes.append(request)
+
+    async def terminate(self, case_id: uuid.UUID, reason: str) -> None:
+        self.terminated.append(case_id)
 
     async def state(self, case_id: uuid.UUID) -> CaseState | None:
         return CaseState(
@@ -626,8 +630,44 @@ async def test_cases_belong_to_the_browser_that_created_them(
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as other:
         r = await other.get("/cases")
         assert r.status_code == 200 and r.json() == []
-        assert OWNER_COOKIE in r.cookies  # a token was issued
+        assert OWNER_COOKIE not in r.cookies  # reading never issues a token
         for path in ("", "/draft", "/replies", "/email"):
             assert (await other.get(f"/cases/{case_id}{path}")).status_code == 404
         r = await other.post(f"/cases/{case_id}/abandon")
         assert r.status_code == 404
+
+
+async def test_delete_my_data_removes_only_my_cases(
+    api: tuple[httpx.AsyncClient, FakeRunner], sessions: async_sessionmaker[AsyncSession]
+) -> None:
+    client, runner = api
+    mine = await adopt(sessions, await sent_case(sessions))
+    theirs = await sent_case(sessions)  # another browser's (no owner here)
+
+    r = await client.delete("/cases")
+    assert r.status_code == 200 and r.json() == {"deleted": 1}
+    assert runner.terminated == [mine]
+    async with sessions() as s:
+        assert await s.get(Case, mine) is None
+        assert await s.get(Case, theirs) is not None
+    assert (await client.get("/cases")).json() == []
+
+
+async def test_only_creating_a_case_issues_a_token(
+    api: tuple[httpx.AsyncClient, FakeRunner],
+) -> None:
+    """Parallel first requests must not mint competing tokens (a late one could replace the
+    token a case was created with)."""
+    client, _ = api
+    transport = client._transport
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as fresh:
+        for _ in range(2):
+            r = await fresh.get("/cases")
+            assert OWNER_COOKIE not in r.cookies
+        r = await fresh.post("/cases", data={"text": "Rs 500 debited via UPI, failed"})
+        assert r.status_code == 202 and OWNER_COOKIE in r.cookies
+        token = r.cookies[OWNER_COOKIE]
+        r = await fresh.post("/cases", data={"text": "Rs 700 debited via UPI, failed"})
+        assert OWNER_COOKIE not in r.cookies  # the existing token is kept
+        assert len((await fresh.get("/cases")).json()) == 2
+        assert fresh.cookies[OWNER_COOKIE] == token

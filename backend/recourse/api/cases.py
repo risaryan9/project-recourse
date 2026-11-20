@@ -40,7 +40,7 @@ from recourse.agents.draft_graph import DISCLAIMER
 from recourse.agents.draft_slots import EscalationContext, SlotError, format_date, format_inr
 from recourse.agents.intake_graph import IntakeInput
 from recourse.api.deps import get_runner, get_session, get_session_factory
-from recourse.api.owner import Owner, require_case_owner
+from recourse.api.owner import Owner, Reader, require_case_owner
 from recourse.cases.assessment import CaseDetails, missing_details
 from recourse.cases.drafts import (
     ApprovalEdits,
@@ -299,8 +299,10 @@ class CaseSummary(BaseModel):
 
 
 @router.get("")
-async def list_cases(owner: Owner, session: Session) -> list[CaseSummary]:
+async def list_cases(owner: Reader, session: Session) -> list[CaseSummary]:
     """The caller's cases, newest first."""
+    if owner is None:
+        return []
     cases = list(
         await session.scalars(
             select(Case).where(Case.owner_id == owner).order_by(Case.created_at.desc()).limit(100)
@@ -355,6 +357,36 @@ def _next_deadline(case: Case, ent: EntitlementRecord | None, today: date) -> Ne
         if date.fromisoformat(d["due"]) >= today
     ]
     return min(ahead, key=lambda d: d.due, default=None)
+
+
+class Deleted(BaseModel):
+    deleted: int
+
+
+@router.delete("")
+async def delete_my_cases(
+    owner: Reader,
+    runner: Runner,
+    sessions: Annotated[async_sessionmaker[AsyncSession], Depends(get_session_factory)],
+) -> Deleted:
+    """Delete every case of this browser: its workflows stop, and its rows (evidence, drafts,
+    emails, replies, audit trail) are removed. Temporal keeps its own workflow history (IDs,
+    statuses and confirmed, already-redacted facts) until its retention period ends."""
+    if owner is None:
+        return Deleted(deleted=0)
+    async with sessions() as s:
+        ids = list(await s.scalars(select(Case.id).where(Case.owner_id == owner)))
+    for case_id in ids:
+        try:
+            await runner.terminate(case_id, "the user deleted their data")
+        except Exception as e:
+            raise HTTPException(503, "could not stop a running case; nothing was deleted") from e
+    async with sessions.begin() as s:
+        for case_id in ids:
+            case = await s.get(Case, case_id)
+            if case is not None and case.owner_id == owner:
+                await s.delete(case)
+    return Deleted(deleted=len(ids))
 
 
 @router.get("/{case_id}")

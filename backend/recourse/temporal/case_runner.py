@@ -12,7 +12,7 @@ from typing import Protocol
 
 from temporalio.client import Client, WorkflowHandle
 from temporalio.contrib.pydantic import pydantic_data_converter
-from temporalio.service import RPCError
+from temporalio.service import RPCError, RPCStatusCode
 
 from recourse.config import Settings
 from recourse.temporal.case_types import (
@@ -58,6 +58,7 @@ class CaseRunner(Protocol):
     async def recheck_escalation(self, case_id: uuid.UUID) -> None: ...
     async def mark_filed(self, case_id: uuid.UUID, mark: MarkFiled) -> None: ...
     async def close(self, case_id: uuid.UUID, request: CloseRequest) -> None: ...
+    async def terminate(self, case_id: uuid.UUID, reason: str) -> None: ...
     async def state(self, case_id: uuid.UUID) -> CaseState | None: ...
 
 
@@ -116,6 +117,15 @@ class TemporalCaseRunner:
 
     async def close(self, case_id: uuid.UUID, request: CloseRequest) -> None:
         await self._handle(case_id).signal(CaseWorkflow.close, request)
+
+    async def terminate(self, case_id: uuid.UUID, reason: str) -> None:
+        """Stop a running case at once (the user deleted their data). A workflow that has
+        already finished, or never existed, is fine."""
+        try:
+            await self._handle(case_id).terminate(reason=reason)
+        except RPCError as e:
+            if e.status is not RPCStatusCode.NOT_FOUND:
+                raise
 
     async def state(self, case_id: uuid.UUID) -> CaseState | None:
         """The live workflow state, or None if the workflow cannot be reached right now."""

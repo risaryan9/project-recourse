@@ -35,8 +35,22 @@ def owner_hash(token: str) -> str:
     return hashlib.sha256(token.encode("ascii")).hexdigest()
 
 
+def current_owner(request: Request) -> str | None:
+    """The caller's owner ID (a hash), or None if this browser has no token yet.
+
+    Reads never issue a token: on a first visit a page fires several requests at once, and
+    each would mint its own token; a late response could then replace the token a case was
+    just created with, and the browser would lose its own case. Only creating a case issues
+    one (`get_owner`).
+    """
+    token = request.cookies.get(OWNER_COOKIE)
+    if token is None or not _TOKEN_RE.match(token):
+        return None
+    return owner_hash(token)
+
+
 def get_owner(request: Request, response: Response) -> str:
-    """The caller's owner ID (a hash). Issues a new token cookie if there is none."""
+    """The caller's owner ID, issuing a new token cookie if there is none (create only)."""
     token = request.cookies.get(OWNER_COOKIE)
     if token is None or not _TOKEN_RE.match(token):
         token = secrets.token_urlsafe(32)
@@ -53,12 +67,13 @@ def get_owner(request: Request, response: Response) -> str:
     return owner_hash(token)
 
 
-Owner = Annotated[str, Depends(get_owner)]
+Owner = Annotated[str, Depends(get_owner)]  # creating: issues a token if needed
+Reader = Annotated[str | None, Depends(current_owner)]  # everything else: never issues one
 
 
 async def require_case_owner(
     request: Request,
-    owner: Owner,
+    owner: Reader,
     sessions: Annotated[async_sessionmaker[AsyncSession], Depends(get_session_factory)],
 ) -> None:
     """Router dependency: a `{case_id}` the caller does not own is "not found"."""
@@ -71,5 +86,5 @@ async def require_case_owner(
         return  # the route's own validation answers 422
     async with sessions() as s:
         found = await s.scalar(select(Case.owner_id).where(Case.id == case_id))
-    if found is None or not secrets.compare_digest(found, owner):
+    if owner is None or found is None or not secrets.compare_digest(found, owner):
         raise HTTPException(404, "case not found")
