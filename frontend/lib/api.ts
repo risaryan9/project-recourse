@@ -29,6 +29,11 @@ export const ENDED: CaseStatus[] = ["RESOLVED", "CLOSED", "ABANDONED"];
 
 export type PublicConfig = { email_sandbox: boolean; demo_mode: boolean; demo_day_seconds: number };
 
+export type GmailStatus = { configured: boolean; connected: boolean; email: string | null };
+
+/** Google sign-in is a full-page navigation to the API, not a fetch. */
+export const GMAIL_CONNECT_URL = `${API_URL}/auth/google/start`;
+
 export type CaseSummary = {
   id: string;
   case_tag: string;
@@ -310,6 +315,8 @@ const put = <T>(path: string, body: unknown) =>
 
 export const api = {
   config: () => request<PublicConfig>("/config"),
+  gmailStatus: () => request<GmailStatus>("/auth/google/status"),
+  gmailDisconnect: () => request<GmailStatus>("/auth/google/disconnect", { method: "POST" }),
   listCases: () => request<CaseSummary[]>("/cases"),
   createCase: (form: FormData) =>
     request<{ id: string; case_tag: string; status: CaseStatus }>("/cases", {

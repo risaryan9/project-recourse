@@ -694,3 +694,35 @@ created with. That browser then got 404 for its own case.
 - Clearing cookies still loses access to one's cases (ADR-017).
 - The review form re-sends every field it asks the user to check, because the backend clears a
   low-confidence flag only when the value comes back as a correction.
+
+## ADR-019: Connecting Gmail (GmailChannel, phase 1: OAuth)
+
+### Context
+GmailChannel sends approved letters from the user's own Gmail and watches that thread for the
+bank's reply (CLAUDE.md §3). It needs a long-lived Google grant with the minimum scopes.
+
+### Decision
+- **Plain httpx, no Google client library.** Every Google and Gmail endpoint Recourse calls is
+  written out in our code, which is what makes the "no other Gmail endpoint" test (phase 4)
+  possible.
+- **Scopes are exactly** `openid`, `email`, `gmail.send`, `gmail.readonly`, with
+  `access_type=offline` and `prompt=consent` (a refresh token every time). A grant missing
+  either Gmail scope is refused (`scopes_missing`), not half-connected.
+- **Authorization code flow with PKCE (S256) and a random `state`.** Both live in a 10-minute
+  httpOnly `SameSite=Lax` cookie scoped to `/auth/google`; the callback compares `state` in
+  constant time. The ID token comes straight from Google's token endpoint over TLS, so only
+  `iss`, `aud` and `email_verified` are checked (OpenID Connect Core 3.1.3.7).
+- **Only the refresh token is stored, encrypted** with Fernet under `TOKEN_ENCRYPTION_KEY`
+  (`gmail_connections`, migration 0009, one row per browser owner). Access tokens are fetched
+  per use and never stored. No token is logged.
+- **Disconnect** revokes the token at Google (best effort) and always deletes the row.
+- The connection belongs to the browser's anonymous owner (ADR-017). `GET /auth/google/start`
+  is a redirect, so it issues the owner cookie on that redirect itself: FastAPI drops cookies
+  set on an injected `Response` when an endpoint returns its own response object.
+- The UI shows a Gmail chip in the header and a connect/disconnect section in Settings; Google's
+  return (`?gmail=connected` / `?gmail=error&reason=...`) becomes a plain sentence.
+
+### Consequences
+- Without Google credentials or an encryption key the server says Gmail isn't set up, and
+  ManualChannel keeps working.
+- Losing `TOKEN_ENCRYPTION_KEY` makes stored tokens unreadable; users connect again.

@@ -346,6 +346,18 @@ class BankReply(_Timestamps, Base):
     unsatisfactory: Mapped[bool] = mapped_column(Boolean, default=False)
 
 
+class GmailConnection(_Timestamps, Base):
+    """A browser owner's Gmail connection (GmailChannel). Only the refresh token is kept, and
+    only encrypted with TOKEN_ENCRYPTION_KEY; access tokens live in memory for one call."""
+
+    __tablename__ = "gmail_connections"
+
+    owner_id: Mapped[str] = mapped_column(String(64), primary_key=True)  # recourse.api.owner
+    email: Mapped[str] = mapped_column(String(320))
+    refresh_token_enc: Mapped[str] = mapped_column(Text)
+    scopes: Mapped[list[str]] = mapped_column(JSONB, default=list)
+
+
 class AuditEvent(Base):
     __tablename__ = "audit_events"
     __table_args__ = (Index("ix_audit_events_case_id_occurred_at", "case_id", "occurred_at"),)

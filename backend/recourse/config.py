@@ -57,7 +57,18 @@ class Settings(BaseSettings):
     email_sandbox: bool = True
     sandbox_recipient: str | None = None
 
+    # --- Gmail (GmailChannel; CLAUDE.md §3 "Email channel") ---
+    google_client_id: str | None = None
+    google_client_secret: SecretStr | None = None
+    google_redirect_uri: str | None = None  # must match the Google console exactly
+    # Fernet key (urlsafe base64, 32 bytes) that encrypts Gmail refresh tokens at rest.
+    token_encryption_key: SecretStr | None = None
+    gmail_poll_minutes: int = Field(default=30, gt=0)
+    demo_gmail_poll_seconds: int = Field(default=10, gt=0)
+
     # --- API ---
+    # Where the API sends the browser back to after Google sign-in.
+    frontend_url: str = "http://localhost:3000"
     cors_origins: list[str] = ["http://localhost:3000"]
     # Anonymous case ownership cookie (recourse.api.owner). Cross-site deployments need
     # samesite="none" and secure=True.

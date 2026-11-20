@@ -94,6 +94,27 @@ Smoke-test the workflow (it then shows up in the Temporal UI):
 cd backend && uv run python -m recourse.temporal.run_hello Recourse
 ```
 
+### Connecting Gmail (optional)
+Without Gmail you send each approved letter yourself (ManualChannel). To let Recourse send from
+your Gmail and watch the thread for the bank's reply:
+
+1. In the [Google Cloud console](https://console.cloud.google.com/), create a project and enable
+   the **Gmail API**.
+2. **OAuth consent screen**: External; add the scopes `openid`, `email`, `.../auth/gmail.send`
+   and `.../auth/gmail.readonly`; add your own Gmail address as a **test user**.
+3. **Credentials → Create OAuth client ID → Web application**, with the redirect URI
+   `http://localhost:8000/auth/google/callback` (it must match exactly).
+4. Put the client ID and secret in `.env` as `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET`, set
+   `GOOGLE_REDIRECT_URI` to the same URI, and generate the token key:
+   `cd backend && uv run python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"`
+   into `TOKEN_ENCRYPTION_KEY`. Restart the API.
+5. In the app: **Settings → Connect Gmail**.
+
+Gotchas: use a personal Gmail account (Workspace admins may block unverified apps); Google shows
+an "unverified app" warning (choose Advanced → continue); an app in **Testing** mode issues
+refresh tokens that expire after 7 days, and the test-user count is a permanent lifetime cap of
+100. Verification and the CASA security assessment are a post-launch step.
+
 ### Everything in Docker
 ```bash
 docker compose -f infra/docker-compose.yml up --build

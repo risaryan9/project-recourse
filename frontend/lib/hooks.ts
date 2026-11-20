@@ -2,7 +2,7 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 
-import { api, ApiError, type PublicConfig } from "@/lib/api";
+import { api, ApiError, type GmailStatus, type PublicConfig } from "@/lib/api";
 
 let configPromise: Promise<PublicConfig> | null = null;
 
@@ -76,4 +76,14 @@ export function usePoll<T>(
   }, [refresh, intervalMs]);
 
   return { data, error, loading, refresh };
+}
+
+/** Whether this browser has connected Gmail. `refresh()` after connecting or disconnecting. */
+export function useGmail(): { status: GmailStatus | null; refresh: () => void } {
+  const [status, setStatus] = useState<GmailStatus | null>(null);
+  const refresh = useCallback(() => {
+    api.gmailStatus().then(setStatus, () => setStatus(null));
+  }, []);
+  useEffect(refresh, [refresh]);
+  return { status, refresh };
 }

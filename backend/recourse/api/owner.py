@@ -49,22 +49,37 @@ def current_owner(request: Request) -> str | None:
     return owner_hash(token)
 
 
-def get_owner(request: Request, response: Response) -> str:
-    """The caller's owner ID, issuing a new token cookie if there is none (create only)."""
+def set_owner_cookie(response: Response, token: str) -> None:
+    settings = get_settings()
+    response.set_cookie(
+        OWNER_COOKIE,
+        token,
+        max_age=ONE_YEAR,
+        httponly=True,
+        secure=settings.owner_cookie_secure,
+        samesite=settings.owner_cookie_samesite,
+        path="/",
+    )
+
+
+def owner_or_new(request: Request) -> tuple[str, str | None]:
+    """(owner ID, a new token to set) - the token is None if the browser already has one.
+    For endpoints that return their own Response (e.g. a redirect), which must set it."""
     token = request.cookies.get(OWNER_COOKIE)
-    if token is None or not _TOKEN_RE.match(token):
-        token = secrets.token_urlsafe(32)
-        settings = get_settings()
-        response.set_cookie(
-            OWNER_COOKIE,
-            token,
-            max_age=ONE_YEAR,
-            httponly=True,
-            secure=settings.owner_cookie_secure,
-            samesite=settings.owner_cookie_samesite,
-            path="/",
-        )
-    return owner_hash(token)
+    if token is not None and _TOKEN_RE.match(token):
+        return owner_hash(token), None
+    token = secrets.token_urlsafe(32)
+    return owner_hash(token), token
+
+
+def get_owner(request: Request, response: Response) -> str:
+    """The caller's owner ID, issuing a new token cookie if there is none (create only).
+    Only for endpoints that return data: FastAPI drops this cookie if the endpoint returns its
+    own Response object (use `owner_or_new` there)."""
+    owner, new = owner_or_new(request)
+    if new is not None:
+        set_owner_cookie(response, new)
+    return owner
 
 
 Owner = Annotated[str, Depends(get_owner)]  # creating: issues a token if needed

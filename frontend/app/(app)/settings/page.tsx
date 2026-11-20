@@ -1,10 +1,22 @@
 "use client";
 
-import { useState } from "react";
+import { useRouter, useSearchParams } from "next/navigation";
+import { Suspense, useEffect, useState } from "react";
 
 import { FormError, Panel, QuietButton, TextButton } from "@/components/app/ui";
-import { api } from "@/lib/api";
-import { useConfig } from "@/lib/hooks";
+import { api, GMAIL_CONNECT_URL } from "@/lib/api";
+import { useConfig, useGmail } from "@/lib/hooks";
+
+const GMAIL_ERRORS: Record<string, string> = {
+  denied: "You cancelled the Google sign-in. Nothing was connected.",
+  scopes_missing: "Recourse needs both Gmail permissions (send, and read the complaint's thread). Connect again and allow both.",
+  state_mismatch: "The sign-in expired or came from another tab. Connect again from this page.",
+  no_owner: "Your browser blocked Recourse's cookie. Allow cookies for this site and connect again.",
+  exchange_failed: "Google refused the sign-in. Try again in a moment.",
+  no_refresh_token: "Google didn't grant lasting access. Remove Recourse at myaccount.google.com/permissions, then connect again.",
+  email_unverified: "That Google account has no verified email address.",
+  bad_id_token: "Google's answer couldn't be checked. Try again.",
+};
 
 function Section({ title, children }: { title: string; children: React.ReactNode }) {
   return (
@@ -15,8 +27,40 @@ function Section({ title, children }: { title: string; children: React.ReactNode
   );
 }
 
-export default function SettingsPage() {
+function Settings() {
   const config = useConfig();
+  const { status: gmail, refresh: refreshGmail } = useGmail();
+  const params = useSearchParams();
+  const router = useRouter();
+  const [actionNote, setActionNote] = useState<{ ok: boolean; text: string } | null>(null);
+  const [disconnecting, setDisconnecting] = useState(false);
+
+  // Google sends the browser back here with ?gmail=connected or ?gmail=error&reason=...
+  const result = params.get("gmail");
+  const urlNote = result
+    ? result === "connected"
+      ? { ok: true, text: "Gmail is connected." }
+      : { ok: false, text: GMAIL_ERRORS[params.get("reason") ?? ""] ?? "Gmail could not be connected. Try again." }
+    : null;
+  // Kept after the URL is tidied below (this component renders only in the browser).
+  const [returnNote] = useState(urlNote);
+  const gmailNote = actionNote ?? returnNote;
+  useEffect(() => {
+    if (result) router.replace("/settings", { scroll: false });
+  }, [result, router]);
+
+  async function disconnectGmail() {
+    setDisconnecting(true);
+    try {
+      await api.gmailDisconnect();
+      setActionNote({ ok: true, text: "Gmail is disconnected. Recourse's access was revoked and its token deleted." });
+    } catch (e) {
+      setActionNote({ ok: false, text: e instanceof Error ? e.message : String(e) });
+    } finally {
+      setDisconnecting(false);
+      refreshGmail();
+    }
+  }
   const [confirming, setConfirming] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -41,9 +85,22 @@ export default function SettingsPage() {
       <h1 className="type-title">Settings</h1>
       <div className="mt-10 flex flex-col gap-5">
         <Section title="Email">
-          <p className="text-text-2">
-            You send each approved letter from your own email, and paste the bank&apos;s reply back
-            into the case. Recourse never sends anything without your approval.
+          {gmail?.connected ? (
+            <p className="text-text-2">
+              <span className="text-text">Gmail is connected</span> as {gmail.email}. When you approve
+              a letter, Recourse sends it from this account and watches that one email thread for
+              the bank&apos;s reply.
+            </p>
+          ) : (
+            <p className="text-text-2">
+              You send each approved letter from your own email, and paste the bank&apos;s reply back
+              into the case.
+              {gmail?.configured ? " Or connect Gmail, and Recourse sends approved letters and watches for the reply for you." : ""}
+            </p>
+          )}
+          <p className="text-sm text-text-3">
+            Recourse never sends anything you haven&apos;t approved. With Gmail it reads only the
+            thread it started, and every Gmail call shows on the case&apos;s timeline.
           </p>
           {config?.email_sandbox ? (
             <p className="text-text-2">
@@ -51,10 +108,33 @@ export default function SettingsPage() {
               inbox, never to a real bank.
             </p>
           ) : null}
-          <p className="text-sm text-text-3">
-            Connecting Gmail, so Recourse can send approved letters and watch for the bank&apos;s
-            reply in that one thread, is coming later.
-          </p>
+          {gmailNote ? (
+            <p role="status" className={gmailNote.ok ? "text-text" : "text-destructive"}>
+              {gmailNote.text}
+            </p>
+          ) : null}
+          {gmail?.configured ? (
+            gmail.connected ? (
+              <div>
+                <QuietButton busy={disconnecting} onClick={disconnectGmail}>
+                  Disconnect Gmail
+                </QuietButton>
+              </div>
+            ) : (
+              <div className="flex flex-col gap-2">
+                <a href={GMAIL_CONNECT_URL} className="action-quiet w-fit">
+                  Connect Gmail
+                </a>
+                <p className="text-sm text-text-3">
+                  Google will warn that the app isn&apos;t verified yet; choose Advanced, then
+                  continue. Recourse asks to send email and to read email, and uses the reading
+                  only for the complaint&apos;s own thread.
+                </p>
+              </div>
+            )
+          ) : (
+            <p className="text-sm text-text-3">Gmail isn&apos;t set up on this server.</p>
+          )}
         </Section>
 
         {config?.demo_mode ? (
@@ -93,5 +173,14 @@ export default function SettingsPage() {
         </Section>
       </div>
     </div>
+  );
+}
+
+export default function SettingsPage() {
+  // useSearchParams needs a Suspense boundary on a prerendered page (Next.js 16).
+  return (
+    <Suspense fallback={null}>
+      <Settings />
+    </Suspense>
   );
 }
