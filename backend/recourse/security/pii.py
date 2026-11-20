@@ -42,8 +42,14 @@ _SECRET_RE = re.compile(
     r"(?i)\b(otp|one[- ]time[- ]password|cvv2?|cvc|upi[- ]?pin|m?pin|passcode)\b"
     r"([^\d\n]{0,10}?)(\d{3,8})(?!\d)"
 )
-# Passwords can be any token, so require an explicit "password: x" / "password is x" form.
-_PASSWORD_RE = re.compile(r"(?i)\b(password|passwd|pwd)(\s*(?:[:=]|\bis\b)\s*)(\S{4,64})")
+# Passwords can be any token, so mask either an explicit "password: x" / "password is x" form,
+# or "password x" where x looks like a password (it has a digit or a symbol). The second form
+# keeps everyday sentences ("never share your password with anyone") intact.
+_PASSWORD_RE = re.compile(
+    r"(?i)\b(password|passwd|pwd)"
+    r"(\s*(?:[:=]|\bis\b)\s*(?=\S{4,64})|\s+(?=\S*[\d@#$%^&*!?_~+=]\S*(?:\s|$|[.,;]))(?=\S{4,64}))"
+    r"(\S{4,64}?)(?=[.,;]?(?:\s|$))"
+)
 _ACCOUNT_RE = re.compile(
     r"(?i)\b(a/c|acct|account)(\s*(?:no\.?|number|num)?[\s:.#-]{0,5})([xX*]*)(\d{5,18})\b"
 )

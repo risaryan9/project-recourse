@@ -103,3 +103,30 @@ def test_redaction_is_idempotent() -> None:
     twice, kinds = redact_text(once)
     assert twice == once
     assert kinds == set()
+
+
+@pytest.mark.parametrize(
+    ("text", "secret"),
+    [
+        ("net banking password Secret@123. UPI Ref 631609876543", "Secret@123"),
+        ("pwd abcd9 and more", "abcd9"),
+        ("password Tr1cky", "Tr1cky"),
+    ],
+)
+def test_password_without_a_colon_is_redacted(text: str, secret: str) -> None:
+    # Found by the eval attack suite: "password Secret@123" leaked before.
+    out, kinds = redact_text(text)
+    assert secret not in out and RedactionKind.SECRET_CODE in kinds
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Never share your password with anyone.",
+        "Change your password regularly.",
+        "Your password must have 8 characters.",
+    ],
+)
+def test_everyday_sentences_about_passwords_are_kept(text: str) -> None:
+    out, kinds = redact_text(text)
+    assert out == text and not kinds
