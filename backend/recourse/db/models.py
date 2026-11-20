@@ -125,6 +125,8 @@ class Case(_Timestamps, Base):
     id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
     # Short tag for email subjects, e.g. "RC-7F3K" (recourse.db.case_tag).
     case_tag: Mapped[str] = mapped_column(String(16), unique=True)
+    # SHA-256 of the anonymous owner token of the browser that created it (recourse.api.owner).
+    owner_id: Mapped[str | None] = mapped_column(String(64), index=True)
     status: Mapped[CaseStatus] = mapped_column(_str_enum(CaseStatus), default=CaseStatus.NEW)
     # The bank the complaint goes to (an id in recourse/email/bank_contacts.yaml), if the user
     # chose it; otherwise it is matched from the extracted bank name.

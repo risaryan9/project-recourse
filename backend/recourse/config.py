@@ -59,6 +59,10 @@ class Settings(BaseSettings):
 
     # --- API ---
     cors_origins: list[str] = ["http://localhost:3000"]
+    # Anonymous case ownership cookie (recourse.api.owner). Cross-site deployments need
+    # samesite="none" and secure=True.
+    owner_cookie_secure: bool = False
+    owner_cookie_samesite: Literal["lax", "strict", "none"] = "lax"
 
 
 @lru_cache

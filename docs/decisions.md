@@ -637,3 +637,29 @@ problems the fake-LLM tests could not.
 - Old evidence rows have no `txn_time_known` and default to True (their times were shown
   before too).
 - `DISPUTED_AMOUNT` is the customer's claim, not a rule figure; the UI must label it so.
+
+## ADR-017: Anonymous case ownership
+
+### Context
+There is no login, but cases contain a person's (redacted) financial details. Without
+ownership anyone who can reach the API could list or open every case.
+
+### Decision
+- On its first request a browser gets a random token (`secrets.token_urlsafe(32)`) in an
+  httpOnly cookie `recourse_owner` (one year). Each case stores only the **SHA-256 hash** of the
+  token that created it (`cases.owner_id`, migration 0008), so a database leak exposes no
+  usable token.
+- A router-level dependency on `/cases` answers **404** for any `{case_id}` the caller does not
+  own, the same as for a case that does not exist (no existence oracle). `GET /cases` lists only
+  the caller's cases.
+- Cookie flags are config: `Lax` + not `Secure` locally (localhost:3000 and :8000 are the same
+  site); a cross-site deployment sets `OWNER_COOKIE_SAMESITE=none` and
+  `OWNER_COOKIE_SECURE=true`. CORS now allows credentials and the PUT/DELETE methods (PUT
+  routes were blocked by browsers before).
+- Cases created before this change have no owner and are unreachable through the API.
+
+### Consequences
+- Clearing cookies or switching browsers loses access to one's cases; acceptable without
+  accounts. Connecting Gmail can later attach to the same owner ID.
+- The token is a bearer secret: anyone with the cookie has the cases. It never appears in logs
+  or in the database.

@@ -428,6 +428,9 @@ GMAIL_POLL_MINUTES=30
 DEMO_MODE=true
 DEMO_DAY_SECONDS=60
 DEMO_GMAIL_POLL_SECONDS=10
+CORS_ORIGINS=["http://localhost:3000"]
+OWNER_COOKIE_SECURE=false        # true (HTTPS) when the frontend and API are on different sites
+OWNER_COOKIE_SAMESITE=lax        # none for a cross-site deployment
 ```
 
 ---

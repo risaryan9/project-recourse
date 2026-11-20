@@ -21,6 +21,7 @@ from recourse.agents.draft_graph import DRAFT_PURPOSE, OMBUDSMAN_PURPOSE, DraftK
 from recourse.agents.reply_judge_graph import NextAction, ReplyLabel
 from recourse.api.deps import get_runner, get_session_factory
 from recourse.api.main import create_app
+from recourse.api.owner import OWNER_COOKIE, owner_hash
 from recourse.config import Settings
 from recourse.db.models import BankReply, Case, CaseStatus, DraftRecord, Upload, UploadFile
 from recourse.evidence.models import IST
@@ -138,6 +139,18 @@ class FakeRunner:
         )
 
 
+TOKEN = "t" * 43  # the test browser's owner token
+
+
+async def adopt(sessions: async_sessionmaker[AsyncSession], case_id: uuid.UUID) -> uuid.UUID:
+    """Give a case made directly in the database (not via POST /cases) to the test browser."""
+    async with sessions.begin() as s:
+        case = await s.get(Case, case_id)
+        assert case is not None
+        case.owner_id = owner_hash(TOKEN)
+    return case_id
+
+
 @pytest.fixture
 async def api(
     sessions: async_sessionmaker[AsyncSession],
@@ -147,7 +160,9 @@ async def api(
     app.dependency_overrides[get_session_factory] = lambda: sessions
     app.dependency_overrides[get_runner] = lambda: runner
     transport = httpx.ASGITransport(app=app)
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+    async with httpx.AsyncClient(
+        transport=transport, base_url="http://test", cookies={OWNER_COOKIE: TOKEN}
+    ) as client:
         yield client, runner
 
 
@@ -454,7 +469,7 @@ async def test_bank_reply_resolve_and_escalate_through_the_api(
     api: tuple[httpx.AsyncClient, FakeRunner], sessions: async_sessionmaker[AsyncSession]
 ) -> None:
     client, runner = api
-    case_id = await sent_case(sessions)
+    case_id = await adopt(sessions, await sent_case(sessions))
     reply = {"text": "Complaint registered. OTP 482913 was used. Ref CMP48213."}
     # Not waiting for the bank yet (SENT_TO_BANK until the workflow starts the timer).
     assert (await client.post(f"/cases/{case_id}/bank-reply", json=reply)).status_code == 409
@@ -473,6 +488,14 @@ async def test_bank_reply_resolve_and_escalate_through_the_api(
     assert view["status"] == "AWAITING_BANK"
     assert view["bank_complained_on"] == "2026-11-17"
     assert view["escalation"]["eligible_from"] == "2026-12-18"
+    [summary] = (await client.get("/cases")).json()
+    assert summary["amount_inr"] == "2450.00" and summary["bank_name"] == "Example Bank"
+    assert summary["total_owed_inr"] is not None
+    # The earliest rule-engine date still ahead of today (none once all have passed).
+    upcoming = summary["next_deadline"]
+    if upcoming is not None:
+        assert date.fromisoformat(upcoming["due"]) >= datetime.now(IST).date()
+        assert upcoming["key"] in {"ombudsman_eligible_from", "ombudsman_filing_deadline"}
 
     early = reply | {"received_at": "2026-11-01T10:00:00+05:30"}
     assert (await client.post(f"/cases/{case_id}/bank-reply", json=early)).status_code == 422
@@ -513,7 +536,7 @@ async def test_ombudsman_filing_through_the_api(
     api: tuple[httpx.AsyncClient, FakeRunner], sessions: async_sessionmaker[AsyncSession]
 ) -> None:
     client, runner = api
-    case_id = await sent_case(sessions)
+    case_id = await adopt(sessions, await sent_case(sessions))
     async with sessions.begin() as s:
         case = await s.get(Case, case_id)
         assert case is not None
@@ -571,7 +594,7 @@ async def test_bank_type_answer_rechecks_the_escalation(
     api: tuple[httpx.AsyncClient, FakeRunner], sessions: async_sessionmaker[AsyncSession]
 ) -> None:
     client, runner = api
-    case_id = await sent_case(sessions)
+    case_id = await adopt(sessions, await sent_case(sessions))
     answer = {"bank_type": "SMALL_FINANCE_BANK"}
     assert (await client.put(f"/cases/{case_id}/bank-type", json=answer)).status_code == 409
     runner.needs_bank_type = True
@@ -582,3 +605,29 @@ async def test_bank_type_answer_rechecks_the_escalation(
     async with sessions() as s:
         case = await s.get(Case, case_id)
         assert case is not None and case.details["bank_type"] == "SMALL_FINANCE_BANK"
+
+
+async def test_cases_belong_to_the_browser_that_created_them(
+    api: tuple[httpx.AsyncClient, FakeRunner], sessions: async_sessionmaker[AsyncSession]
+) -> None:
+    client, _ = api
+    r = await client.post("/cases", data={"text": "Rs 500 debited via UPI, txn failed"})
+    assert r.status_code == 202
+    case_id = r.json()["id"]
+
+    [mine] = (await client.get("/cases")).json()
+    assert mine["id"] == case_id and mine["status"] == "NEW"
+    async with sessions() as s:
+        case = await s.get(Case, uuid.UUID(case_id))
+        assert case is not None and case.owner_id == owner_hash(TOKEN)  # only the hash
+
+    # Another browser: its own (new) token, no cases, and this case does not exist for it.
+    transport = client._transport  # same app
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as other:
+        r = await other.get("/cases")
+        assert r.status_code == 200 and r.json() == []
+        assert OWNER_COOKIE in r.cookies  # a token was issued
+        for path in ("", "/draft", "/replies", "/email"):
+            assert (await other.get(f"/cases/{case_id}{path}")).status_code == 404
+        r = await other.post(f"/cases/{case_id}/abandon")
+        assert r.status_code == 404

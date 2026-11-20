@@ -40,6 +40,7 @@ from recourse.agents.draft_graph import DISCLAIMER
 from recourse.agents.draft_slots import EscalationContext, SlotError, format_date, format_inr
 from recourse.agents.intake_graph import IntakeInput
 from recourse.api.deps import get_runner, get_session, get_session_factory
+from recourse.api.owner import Owner, require_case_owner
 from recourse.cases.assessment import CaseDetails, missing_details
 from recourse.cases.drafts import (
     ApprovalEdits,
@@ -95,7 +96,8 @@ from recourse.temporal.case_types import (
     TimeScaleInput,
 )
 
-router = APIRouter(prefix="/cases", tags=["cases"])
+# Every /cases/{case_id}/... route answers 404 for a case the caller does not own.
+router = APIRouter(prefix="/cases", tags=["cases"], dependencies=[Depends(require_case_owner)])
 banks_router = APIRouter(prefix="/banks", tags=["banks"])
 
 MAX_FILES = 5
@@ -243,6 +245,7 @@ class ReviewPreview(BaseModel):
 @router.post("", status_code=status.HTTP_202_ACCEPTED)
 async def create_case(
     runner: Runner,
+    owner: Owner,
     sessions: Annotated[async_sessionmaker[AsyncSession], Depends(get_session_factory)],
     text: Annotated[str | None, Form(max_length=20_000)] = None,
     files: Annotated[list[UploadFile] | None, File()] = None,
@@ -254,7 +257,7 @@ async def create_case(
         raise HTTPException(422, _short_errors(e)) from e
 
     redacted, kinds = redact_text(text) if text else (None, set())
-    case = await _create_case_rows(sessions, redacted, kinds, attachments)
+    case = await _create_case_rows(sessions, redacted, kinds, attachments, owner)
 
     settings = get_settings()
     inp = CaseInput(
@@ -274,6 +277,84 @@ async def create_case(
                 await s.delete(row)
         raise HTTPException(503, "could not start the case; please try again") from e
     return CaseCreated(id=case.id, case_tag=case.case_tag, status=CaseStatus.NEW)
+
+
+class NextDeadline(BaseModel):
+    key: str
+    label: str
+    due: date
+
+
+class CaseSummary(BaseModel):
+    id: uuid.UUID
+    case_tag: str
+    status: CaseStatus
+    created_at: datetime
+    updated_at: datetime
+    bank_name: str | None
+    amount_inr: Decimal | None  # the disputed transaction (user-confirmed)
+    total_owed_inr: Decimal | None  # rule engine, as of `owed_as_of`
+    owed_as_of: date | None
+    next_deadline: NextDeadline | None  # the earliest one not yet passed
+
+
+@router.get("")
+async def list_cases(owner: Owner, session: Session) -> list[CaseSummary]:
+    """The caller's cases, newest first."""
+    cases = list(
+        await session.scalars(
+            select(Case).where(Case.owner_id == owner).order_by(Case.created_at.desc()).limit(100)
+        )
+    )
+    ids = [c.id for c in cases]
+    entitlements = {
+        e.case_id: e
+        for e in await session.scalars(
+            select(EntitlementRecord).where(EntitlementRecord.case_id.in_(ids))
+        )
+    }
+    evidence: dict[uuid.UUID, EvidenceRecord] = {}
+    for r in await session.scalars(
+        select(EvidenceRecord)
+        .where(EvidenceRecord.case_id.in_(ids))
+        .order_by(EvidenceRecord.created_at)
+    ):
+        evidence[r.case_id] = r  # the latest wins
+    today = datetime.now(IST).date()
+    out = []
+    for c in cases:
+        ent = entitlements.get(c.id)
+        ev = evidence[c.id].to_evidence() if c.id in evidence else None
+        out.append(
+            CaseSummary(
+                id=c.id,
+                case_tag=c.case_tag,
+                status=c.status,
+                created_at=c.created_at,
+                updated_at=c.updated_at,
+                bank_name=ev.payer_bank.value if ev else None,
+                amount_inr=ev.amount_inr.value if ev else None,
+                total_owed_inr=ent.total_owed_inr if ent else None,
+                owed_as_of=ent.as_of if ent else None,
+                next_deadline=None if c.status in ENDED else _next_deadline(c, ent, today),
+            )
+        )
+    return out
+
+
+def _next_deadline(case: Case, ent: EntitlementRecord | None, today: date) -> NextDeadline | None:
+    """The earliest deadline from the rule engine (entitlement and escalation) still ahead."""
+    lines: list[dict[str, Any]] = []
+    if ent is not None:
+        lines += ent.data.get("deadlines", [])
+    if case.escalation is not None:
+        lines += case.escalation.get("deadlines", [])
+    ahead = [
+        NextDeadline(key=d["key"], label=d["label"], due=date.fromisoformat(d["due"]))
+        for d in lines
+        if date.fromisoformat(d["due"]) >= today
+    ]
+    return min(ahead, key=lambda d: d.due, default=None)
 
 
 @router.get("/{case_id}")
@@ -928,11 +1009,12 @@ async def _create_case_rows(
     text: str | None,
     redactions: set[Any],
     attachments: list[Attachment],
+    owner: str,
 ) -> _NewCase:
     for _ in range(5):  # retry on the (rare) case-tag collision
         try:
             async with sessions.begin() as s:
-                case = Case(case_tag=new_case_tag())
+                case = Case(case_tag=new_case_tag(), owner_id=owner)
                 s.add(case)
                 await s.flush()
                 upload = Upload(
