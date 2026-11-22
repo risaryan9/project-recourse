@@ -12,6 +12,10 @@ Ombudsman if the bank doesn't put it right.
 
 Built for [Arthaton 2026](https://arthaton.com).
 
+**[▶ Watch the demo video (4:49)](https://youtu.be/oLOBIAWI-2M)**
+
+[![Recourse demo video on YouTube](https://img.youtube.com/vi/oLOBIAWI-2M/maxresdefault.jpg)](https://youtu.be/oLOBIAWI-2M)
+
 **[Try it live](https://recourse-omega.vercel.app)** with your own Anthropic or OpenAI API key (never saved; synthetic data only; emails go to a sandbox inbox)
 
 </div>
