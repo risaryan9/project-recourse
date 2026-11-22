@@ -58,14 +58,32 @@ function Heading({ title, children }: { title: string; children?: React.ReactNod
 /* Sending the letter yourself (ManualChannel)                                               */
 /* ----------------------------------------------------------------------------------------- */
 
+const FALLBACK: Record<string, string> = {
+  gmail_access_lost:
+    "Recourse couldn't send this from your Gmail because its access has expired or was revoked. Reconnect Gmail in Settings (Disconnect, then Connect Gmail), and future letters will send automatically. This one is ready for you to send yourself.",
+  gmail_not_connected:
+    "Gmail isn't connected, so this letter is ready for you to send yourself. Connect Gmail in Settings and future letters will send automatically.",
+};
+
 function SendYourself({ c, refresh }: Props) {
   const e = c.email!;
   const { busy, error, run } = useAction(refresh);
+  // Why Gmail wasn't used for this letter, if it was meant to be.
+  const fallback = [...c.timeline].reverse().find((t) => t.event_type === "email.fallback_manual");
+  const why = FALLBACK[String(fallback?.details.reason ?? "")];
   return (
     <div className="flex flex-col gap-6">
       <Heading title="Send the letter from your email">
         Recourse never sends on its own. Copy the letter into your email, send it, then tell Recourse.
       </Heading>
+      {why ? (
+        <Notice tone="warn" title="Not sent from Gmail">
+          {why}{" "}
+          <a href="/settings" className="text-text underline underline-offset-4">
+            Open Settings
+          </a>
+        </Notice>
+      ) : null}
       {e.sandbox ? (
         <Notice title="Sandbox: not sent to the real bank">
           This address is a test inbox. Real sending stays off until the bank&apos;s address and the
