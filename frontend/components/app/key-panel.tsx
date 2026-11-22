@@ -4,6 +4,7 @@ import { useState } from "react";
 
 import { fieldClass, FormError, PrimaryButton, TextButton } from "@/components/app/ui";
 import { api, type KeyStatus } from "@/lib/api";
+import { KEYS_CHANGED } from "@/lib/hooks";
 import { clearKeys, readKeys, writeKeys } from "@/lib/keys";
 
 const REPO = "https://github.com/risaryan9/project-recourse";
@@ -32,6 +33,7 @@ export function KeyPanel({ status, onChange }: { status: KeyStatus | null; onCha
       setAnthropic("");
       setOpenai("");
       onChange();
+      window.dispatchEvent(new Event(KEYS_CHANGED));
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
@@ -47,6 +49,7 @@ export function KeyPanel({ status, onChange }: { status: KeyStatus | null; onCha
       clearKeys();
       setBusy(false);
       onChange();
+      window.dispatchEvent(new Event(KEYS_CHANGED));
     }
   }
 

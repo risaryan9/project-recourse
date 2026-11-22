@@ -137,5 +137,12 @@ export function useKeyStatus(): { status: KeyStatus | null; refresh: () => void 
     );
   }, []);
   useEffect(refresh, [refresh]);
+  useEffect(() => {
+    // Every key status on the page (nav chip, forms) updates when one of them saves or forgets.
+    window.addEventListener(KEYS_CHANGED, refresh);
+    return () => window.removeEventListener(KEYS_CHANGED, refresh);
+  }, [refresh]);
   return { status, refresh };
 }
+
+export const KEYS_CHANGED = "recourse:keys-changed";

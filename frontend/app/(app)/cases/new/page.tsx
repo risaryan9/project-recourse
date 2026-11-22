@@ -93,8 +93,11 @@ export default function NewCasePage() {
               accept={ACCEPT}
               className="sr-only"
               onChange={(e) => {
-                setFiles((cur) => [...cur, ...Array.from(e.target.files ?? [])]);
+                // Read the picked files before clearing the input: the state update runs
+                // later, when e.target.files would already be empty.
+                const picked = Array.from(e.target.files ?? []);
                 e.target.value = "";
+                setFiles((cur) => [...cur, ...picked]);
               }}
             />
             <div className="mt-3 flex flex-wrap items-center gap-3">
