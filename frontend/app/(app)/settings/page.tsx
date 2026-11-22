@@ -5,6 +5,7 @@ import { Suspense, useEffect, useState } from "react";
 
 import { FormError, Panel, QuietButton, TextButton } from "@/components/app/ui";
 import { api, GMAIL_CONNECT_URL } from "@/lib/api";
+import { GmailLogo } from "@/components/brand/gmail-logo";
 import { useConfig, useGmail } from "@/lib/hooks";
 
 const GMAIL_ERRORS: Record<string, string> = {
@@ -87,6 +88,7 @@ function Settings() {
         <Section title="Email">
           {gmail?.connected ? (
             <p className="text-text-2">
+              <GmailLogo className="mr-2 inline h-3.5 w-auto align-[-0.1em]" />
               <span className="text-text">Gmail is connected</span> as {gmail.email}. When you approve
               a letter, Recourse sends it from this account and watches that one email thread for
               the bank&apos;s reply.
@@ -122,7 +124,8 @@ function Settings() {
               </div>
             ) : (
               <div className="flex flex-col gap-2">
-                <a href={GMAIL_CONNECT_URL} className="action-quiet w-fit">
+                <a href={GMAIL_CONNECT_URL} className="action-quiet w-fit gap-2.5">
+                  <GmailLogo className="h-3.5 w-auto" />
                   Connect Gmail
                 </a>
                 <p className="text-sm text-text-3">

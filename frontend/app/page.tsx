@@ -5,6 +5,8 @@ import { CaseStory } from "@/components/landing/case-story";
 import { HeroLedger } from "@/components/landing/hero-ledger";
 import { ReplyCheck } from "@/components/landing/reply-check";
 import { Reveal } from "@/components/landing/reveal";
+import { RightsGrid } from "@/components/landing/rights-grid";
+import { SiteNav } from "@/components/landing/site-nav";
 
 const START_HREF = "/cases/new";
 
@@ -15,25 +17,6 @@ function Wordmark() {
     </span>
   );
 }
-
-/* What the rules already promise. Plain-language summaries of RBI rules (see CLAUDE.md §4). */
-const SITUATIONS = [
-  {
-    figure: "1 day",
-    title: "Your UPI transfer never arrived.",
-    body: "The money left your account but never reached the other person. Your bank has one day to reverse it. After that, it owes you ₹100 for every day of delay.",
-  },
-  {
-    figure: "5 days",
-    title: "The ATM kept your cash.",
-    body: "Your account was debited but no notes came out. The bank has five days to put the money back, then ₹100 for every day it is late.",
-  },
-  {
-    figure: "₹0",
-    title: "Money left your account without you.",
-    body: "If the fault isn't yours and you report it in time, the rules can leave you owing nothing. The window is short, so Recourse shows the deadline that applies to you.",
-  },
-];
 
 const COMMITMENTS = [
   {
@@ -57,14 +40,7 @@ export default function Home() {
 
       {/* overflow-x: clip (not hidden) keeps the pinned section's sticky working. */}
       <div className="relative z-10 overflow-x-clip">
-        <header className="mx-auto flex max-w-6xl items-center justify-between px-6 py-6">
-          <Link href="/" aria-label="Recourse home">
-            <Wordmark />
-          </Link>
-          <Link href={START_HREF} prefetch={false} className="action-quiet">
-            Start a case
-          </Link>
-        </header>
+        <SiteNav startHref={START_HREF} />
 
         <main>
           {/* Hero ------------------------------------------------------------------------ */}
@@ -91,48 +67,41 @@ export default function Home() {
             </div>
           </section>
 
-          {/* What went wrong ---------------------------------------------------------------- */}
-          <section aria-labelledby="rules-title" className="mx-auto max-w-6xl px-6 py-24 sm:py-32">
-            <Reveal>
+          {/* What the rules already promise ---------------------------------------------- */}
+          <section
+            id="rights"
+            aria-labelledby="rules-title"
+            className="mx-auto max-w-6xl scroll-mt-16 px-6 py-20 sm:py-28"
+          >
+            <Reveal className="grid gap-5 lg:grid-cols-[1fr_26rem] lg:items-end lg:gap-16">
               <h2 id="rules-title" className="type-title max-w-[17ch]">
                 The rules are already on your side.
               </h2>
-              <p className="type-lede mt-5 max-w-[48ch]">
+              <p className="type-lede max-w-[44ch]">
                 The Reserve Bank of India sets deadlines for putting failed payments right, and
                 makes banks pay you for every day they are late.
               </p>
             </Reveal>
 
-            <div className="mt-16 sm:mt-20">
-              {SITUATIONS.map((s, i) => (
-                <Reveal key={s.title} delay={i * 0.08}>
-                  <article className="grid gap-3 border-t border-line py-9 sm:grid-cols-[13rem_1fr] sm:gap-10 sm:py-11">
-                    <div className="figures text-[clamp(2.4rem,1.8rem+2vw,3.4rem)] leading-none font-[620] tracking-[-0.04em] text-text [font-stretch:86%]">
-                      {s.figure}
-                    </div>
-                    <div className="max-w-[52ch]">
-                      <h3 className="type-heading">{s.title}</h3>
-                      <p className="mt-3 text-text-2">{s.body}</p>
-                    </div>
-                  </article>
-                </Reveal>
-              ))}
-              <p className="type-small border-t border-line pt-6">
-                From RBI circular RBI/2019-20/67 on failed transactions, and RBI directions on
-                unauthorised electronic banking transactions. Conditions apply to each rule.
-              </p>
-            </div>
+            <RightsGrid />
+
+            <p className="type-small mt-6">
+              From RBI circular RBI/2019-20/67 on failed transactions, RBI directions on
+              unauthorised electronic banking transactions, and the RBI Integrated Ombudsman
+              Scheme, 2026. Conditions apply to each rule.
+            </p>
           </section>
 
           {/* How a case runs (pinned) -------------------------------------------------------- */}
-          <div id="how" className="scroll-mt-4">
+          <div id="how" className="scroll-mt-16">
             <CaseStory />
           </div>
 
           {/* Trust ------------------------------------------------------------------------- */}
           <section
+            id="safety"
             aria-labelledby="trust-title"
-            className="relative mx-auto max-w-6xl px-6 py-28 sm:py-40"
+            className="relative mx-auto max-w-6xl scroll-mt-16 px-6 py-28 sm:py-40"
           >
             <div
               className="local-glow -top-10 right-[-10%] h-[36rem] w-[36rem]"

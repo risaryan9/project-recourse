@@ -3,6 +3,7 @@
 import Link from "next/link";
 import { usePathname } from "next/navigation";
 
+import { GmailLogo } from "@/components/brand/gmail-logo";
 import { useConfig, useGmail } from "@/lib/hooks";
 import { cn } from "@/lib/utils";
 
@@ -21,10 +22,12 @@ export function AppNav() {
         <Link
           href="/settings"
           className="mr-1 hidden items-center gap-2 rounded-full border border-line px-3 py-1 text-sm text-text-2 hover:text-text sm:inline-flex"
-          title={gmail.connected ? `Sending from ${gmail.email}` : "Connect Gmail in Settings"}
+          title={gmail.connected ? `Gmail connected: sending from ${gmail.email}` : "Gmail not connected. Connect it in Settings"}
+          aria-label={gmail.connected ? "Gmail connected" : "Gmail not connected"}
         >
+          <GmailLogo className={cn("h-3 w-auto", !gmail.connected && "opacity-50 grayscale")} />
+          {gmail.connected ? "Connected" : "Not connected"}
           <span aria-hidden="true" className={cn("size-1.5 rounded-full", gmail.connected ? "bg-blue" : "bg-text-3")} />
-          {gmail.connected ? "Gmail connected" : "Gmail not connected"}
         </Link>
       ) : null}
       {config?.email_sandbox ? (

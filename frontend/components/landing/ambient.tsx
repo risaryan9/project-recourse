@@ -13,6 +13,7 @@ export function Ambient() {
 
   return (
     <div className="ambient" aria-hidden="true">
+      <div className="ambient-grid" />
       <motion.div style={reduce ? undefined : { y }} className="absolute inset-0">
         <div className="ambient-pool ambient-pool--a" />
         <div className="ambient-pool ambient-pool--b" />

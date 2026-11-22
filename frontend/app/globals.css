@@ -324,6 +324,22 @@
     background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='160' height='160'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='.85' numOctaves='2' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
   }
 
+  /* A fine grid, lit by the same light: brightest near the top-right pool, fading into the
+     black. Painted with gradients (no images), static, so it costs nothing on scroll. */
+  .ambient-grid {
+    position: absolute;
+    inset: 0;
+    --grid-line: rgb(255 255 255 / 0.045);
+    --grid-size: 64px;
+    background-image:
+      linear-gradient(to right, var(--grid-line) 1px, transparent 1px),
+      linear-gradient(to bottom, var(--grid-line) 1px, transparent 1px);
+    background-size: var(--grid-size) var(--grid-size);
+    background-position: center top;
+    -webkit-mask-image: radial-gradient(120% 90% at 70% 0%, #000 0%, rgb(0 0 0 / 0.45) 45%, transparent 80%);
+    mask-image: radial-gradient(120% 90% at 70% 0%, #000 0%, rgb(0 0 0 / 0.45) 45%, transparent 80%);
+  }
+
   /* Section-local light, for moments of meaning. */
   .local-glow {
     position: absolute;
@@ -343,6 +359,40 @@
     background:
       radial-gradient(60vmax 50vmax at 100% -10%, rgb(59 130 246 / 0.09), transparent 70%),
       var(--ink);
+  }
+  /* The app's grid: the same lines, fainter, fading out below the header. */
+  .ambient-app::after {
+    content: "";
+    position: absolute;
+    inset: 0;
+    background-image:
+      linear-gradient(to right, rgb(255 255 255 / 0.03) 1px, transparent 1px),
+      linear-gradient(to bottom, rgb(255 255 255 / 0.03) 1px, transparent 1px);
+    background-size: 64px 64px;
+    background-position: center top;
+    -webkit-mask-image: radial-gradient(110% 70% at 80% 0%, #000 0%, rgb(0 0 0 / 0.35) 50%, transparent 85%);
+    mask-image: radial-gradient(110% 70% at 80% 0%, #000 0%, rgb(0 0 0 / 0.35) 50%, transparent 85%);
+  }
+}
+
+/* Looking for the bank's reply: a ring that widens and fades, and three soft dots. */
+@keyframes mail-watch {
+  from {
+    transform: scale(0.8);
+    opacity: 0.9;
+  }
+  to {
+    transform: scale(1.45);
+    opacity: 0;
+  }
+}
+@keyframes mail-dot {
+  0%,
+  100% {
+    opacity: 0.2;
+  }
+  50% {
+    opacity: 1;
   }
 }
 
