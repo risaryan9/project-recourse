@@ -1,14 +1,16 @@
 "use client";
 
 import { useRouter } from "next/navigation";
-import { useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 
+import { Attachments } from "@/components/app/attachments";
 import { KeyPanel } from "@/components/app/key-panel";
-import { FormError, Notice, Panel, PrimaryButton, TextButton } from "@/components/app/ui";
+import { FormError, Notice, Panel, PrimaryButton } from "@/components/app/ui";
 import { api } from "@/lib/api";
 import { useKeyStatus } from "@/lib/hooks";
 
 const ACCEPT = "image/png,image/jpeg,image/webp,image/gif,application/pdf";
+const ACCEPTED = new Set(ACCEPT.split(","));
 const MAX_FILES = 5;
 const MAX_BYTES = 20 * 1024 * 1024;
 
@@ -21,6 +23,47 @@ export default function NewCasePage() {
   const input = useRef<HTMLInputElement>(null);
   const { status: keys, refresh: refreshKeys } = useKeyStatus();
   const needsKey = !!keys?.required && !keys.anthropic && !keys.openai;
+
+  const [dragging, setDragging] = useState(false);
+  const [notice, setNotice] = useState<string | null>(null);
+  const pasteCount = useRef(0); // pasted-screenshot-1.png, -2, … (the clipboard calls them all image.png)
+
+  /** Add files from the picker, a paste or a drop; skip types Recourse can't read. */
+  const addFiles = useCallback((incoming: File[], from: "paste" | "drop" | "pick") => {
+    const ok = incoming.filter((f) => ACCEPTED.has(f.type));
+    const skipped = incoming.length - ok.length;
+    if (ok.length) {
+      // Screenshots pasted from the clipboard all arrive as "image.png": number them clearly.
+      // (Named here, not inside the state update, which React may run twice.)
+      const named = ok.map((f) =>
+        from === "paste" && /^image\.\w+$/i.test(f.name)
+          ? new File([f], `pasted-screenshot-${++pasteCount.current}.${f.type.split("/")[1] || "png"}`, {
+              type: f.type,
+            })
+          : f,
+      );
+      setFiles((cur) => [...cur, ...named]);
+    }
+    setNotice(
+      skipped
+        ? `${skipped === 1 ? "One file was" : `${skipped} files were`} skipped: use PNG, JPEG, WebP, GIF or PDF.`
+        : from === "paste" && ok.length
+          ? `Pasted ${ok.length === 1 ? "a screenshot" : `${ok.length} images`}.`
+          : null,
+    );
+  }, []);
+
+  // Paste a screenshot anywhere on the page (Ctrl+V / Cmd+V). Text pastes are left alone.
+  useEffect(() => {
+    const onPaste = (e: ClipboardEvent) => {
+      const pasted = Array.from(e.clipboardData?.files ?? []);
+      if (pasted.length === 0) return;
+      e.preventDefault();
+      addFiles(pasted, "paste");
+    };
+    window.addEventListener("paste", onPaste);
+    return () => window.removeEventListener("paste", onPaste);
+  }, [addFiles]);
 
   const total = files.reduce((n, f) => n + f.size, 0);
   const tooMany = files.length > MAX_FILES;
@@ -97,32 +140,39 @@ export default function NewCasePage() {
                 // later, when e.target.files would already be empty.
                 const picked = Array.from(e.target.files ?? []);
                 e.target.value = "";
-                setFiles((cur) => [...cur, ...picked]);
+                addFiles(picked, "pick");
               }}
             />
-            <div className="mt-3 flex flex-wrap items-center gap-3">
-              <label
-                htmlFor="files"
-                className="action-quiet h-10 cursor-pointer text-sm focus-within:ring-2"
-              >
+            <div
+              onDragOver={(e) => {
+                e.preventDefault();
+                setDragging(true);
+              }}
+              onDragLeave={() => setDragging(false)}
+              onDrop={(e) => {
+                e.preventDefault();
+                setDragging(false);
+                addFiles(Array.from(e.dataTransfer.files), "drop");
+              }}
+              className={
+                "mt-3 flex flex-wrap items-center gap-x-4 gap-y-2 rounded-[1rem] border border-dashed px-4 py-4 transition-colors " +
+                (dragging ? "border-blue/70 bg-blue/[0.07]" : "border-line-strong bg-white/[0.015]")
+              }
+            >
+              <label htmlFor="files" className="action-quiet h-10 cursor-pointer text-sm focus-within:ring-2">
                 Add files
               </label>
-              {files.map((f, i) => (
-                <span
-                  key={`${f.name}-${i}`}
-                  className="inline-flex items-center gap-2 rounded-full border border-line px-3 py-1.5 text-sm text-text-2"
-                >
-                  <span className="max-w-[14rem] truncate">{f.name}</span>
-                  <TextButton
-                    className="text-sm"
-                    aria-label={`Remove ${f.name}`}
-                    onClick={() => setFiles((cur) => cur.filter((_, j) => j !== i))}
-                  >
-                    Remove
-                  </TextButton>
-                </span>
-              ))}
+              <span className="text-sm text-text-3">
+                or paste a screenshot (<kbd className="font-sans text-text-2">Ctrl</kbd>+
+                <kbd className="font-sans text-text-2">V</kbd>), or drop files here
+              </span>
             </div>
+            {notice ? (
+              <p role="status" className="mt-2 text-sm text-text-2">
+                {notice}
+              </p>
+            ) : null}
+            <Attachments files={files} onRemove={(i) => setFiles((cur) => cur.filter((_, j) => j !== i))} />
             {tooMany ? <FormError message={`Choose at most ${MAX_FILES} files.`} /> : null}
             {tooBig ? <FormError message="These files are over 20 MB in total. Remove one." /> : null}
           </div>
