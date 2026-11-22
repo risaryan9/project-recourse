@@ -34,3 +34,7 @@ Thumbs.db
 .vscode/
 
 .neon
+
+# Demo video: raw recordings and edit output (not part of the app)
+Clips/
+output/
