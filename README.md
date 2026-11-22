@@ -261,6 +261,7 @@ hand against the primary document; until then, emails stay in the sandbox.
 | Sending to the wrong place | Sandbox by default; real sending needs a verified bank contact and verified rules; nothing is sent without approval of that exact letter |
 | Personal data | Card, account and Aadhaar numbers are masked to the last four digits; OTPs, PINs, CVVs, PAN and passwords are removed. This happens before storage, and before any model call on typed text and bank replies. Uploaded images and PDFs are read by the model as they are; what is extracted from them is masked before it is stored. |
 | Visitors' AI keys | Each visitor runs cases on their own Anthropic or OpenAI key. It is checked, then held only in the open browser tab and in the API's memory for up to six hours; never written to the database, a file, a log or Temporal's history. The worker fetches it over loopback with a shared secret, refused through the public proxy ([ADR-023](docs/decisions.md)) |
+| Traces | LangSmith traces (when enabled) go to one agent and environment; uploaded files and anything shaped like an API key are replaced before a trace leaves the machine ([ADR-024](docs/decisions.md)) |
 | Gmail tokens | Refresh tokens are encrypted at rest (Fernet); Disconnect revokes access and deletes them |
 | Someone else's cases | Each case belongs to the browser that created it (an anonymous token, stored only as a hash); other browsers get "not found" |
 
@@ -372,6 +373,11 @@ With `REQUIRE_USER_KEYS=true` (the live demo), the server's own model keys are n
 visitor adds their key in the app, and Recourse holds it only in memory while their case needs
 it. Set `INTERNAL_SECRET` to a random string (the API and the worker share it). Leave
 `REQUIRE_USER_KEYS` unset to run everything on the keys in `.env`.
+
+### Tracing (LangSmith)
+Set `LANGSMITH_TRACING=true`, `LANGSMITH_API_KEY`, `LANGSMITH_ENDPOINT`, `LANGSMITH_AGENT_ID` and
+`LANGSMITH_AGENT_ENVIRONMENT`, then restart the worker. Each graph run (intake, draft, reply
+judging) and its model calls appear under that agent, grouped by case (`thread_id`).
 
 ### Demo mode
 With `DEMO_MODE=true`, one "day" lasts `DEMO_DAY_SECONDS` seconds (default 60), so a case that
@@ -495,8 +501,6 @@ infra/           docker-compose for Temporal, API and worker
   still be in memory; otherwise it asks them to add it again and retry.
 - **Hosting.** The live demo's backend runs on one laptop behind a tunnel, so it is up only while
   that machine is; a single always-on container is the next step.
-- **Tracing.** LangSmith tracing is configured but not wired in yet; today the trail is Temporal's
-  history and the audit log.
 - **Hindi drafts** and a **rule-change watcher** for new RBI circulars are planned, not built.
 
 <br>
@@ -514,6 +518,7 @@ infra/           docker-compose for Temporal, API and worker
 **Open-source libraries and tools**
 - [Temporal](https://temporal.io/) and the [Temporal Python SDK](https://github.com/temporalio/sdk-python)
 - [LangGraph](https://github.com/langchain-ai/langgraph)
+- [LangSmith](https://docs.smith.langchain.com/) SDK (tracing)
 - [FastAPI](https://fastapi.tiangolo.com/), [Uvicorn](https://www.uvicorn.org/),
   [Pydantic](https://docs.pydantic.dev/) and pydantic-settings
 - [SQLAlchemy](https://www.sqlalchemy.org/), [Alembic](https://alembic.sqlalchemy.org/),

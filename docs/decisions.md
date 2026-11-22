@@ -861,3 +861,34 @@ and activity results in its history permanently, so the key cannot travel throug
 - After the TTL or a restart, a step that runs with nobody on the page cannot use a model until
   the visitor returns.
 
+## ADR-024: LangSmith tracing, addressed to an agent, scrubbed before it leaves
+
+### Context
+Tracing was configured (`LANGSMITH_TRACING`) but not wired in: nothing exported the settings to
+the SDK and the model clients were not wrapped. Traces must land in one place, group by case,
+and never carry what must not leave the machine: uploaded images and PDFs reach the model
+unmasked, and visitors' API keys (ADR-023) must never be recorded.
+
+### Decision
+- Follow the `langchain-agent-tracing` skill (langchain-ai/langchain-skills): address traces to
+  a LangSmith **agent** (`LANGSMITH_AGENT_ID=agentic-track`, `LANGSMITH_AGENT_ENVIRONMENT=
+  production`) at `LANGSMITH_ENDPOINT` (`https://api.smith.langchain.com`), and remove legacy
+  project variables (`LANGSMITH_PROJECT`, `LANGCHAIN_*`) from the process.
+- `recourse/tracing.py` turns tracing on at worker start (only with an API key and agent ID):
+  it exports the settings to the environment, and sets a global `langsmith.Client` with input
+  and output hooks plus the agent address through `langsmith.configure`.
+- Instrumentation: LangGraph traces each graph run (named `IntakeGraph`, `DraftGraph`,
+  `ReplyJudgeGraph`); the Anthropic and OpenAI clients (the server's and visitors') are wrapped
+  with `wrap_anthropic` / `wrap_openai`, so model calls nest under the graph run. Each call is
+  instrumented once.
+- Each activity's graph run carries metadata `thread_id` = `case_id` and `step`, so one case's
+  runs form a thread.
+- `scrub` replaces bytes and long base64 (attachments) and anything shaped like an API key
+  (`sk-…`) in every run's inputs and outputs. Typed text and replies are already PII-redacted.
+- The worker flushes on shutdown.
+
+### Consequences
+- Case text (redacted), letters and verdicts are visible in the owner's LangSmith workspace,
+  including visitors' cases. Uploaded files and keys are not.
+- Without `LANGSMITH_API_KEY`, nothing is traced and nothing changes.
+

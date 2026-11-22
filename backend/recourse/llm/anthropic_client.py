@@ -44,11 +44,15 @@ class AnthropicLLM:
     def __init__(self, settings: Settings, client: anthropic.AsyncAnthropic | None = None) -> None:
         self._settings = settings
         if client is None:
+            from recourse.tracing import wrap_client
+
             key = settings.anthropic_api_key
-            client = anthropic.AsyncAnthropic(
-                api_key=key.get_secret_value() if key is not None else None,
-                max_retries=settings.anthropic_max_retries,
-                timeout=settings.anthropic_timeout_seconds,
+            client = wrap_client(
+                anthropic.AsyncAnthropic(
+                    api_key=key.get_secret_value() if key is not None else None,
+                    max_retries=settings.anthropic_max_retries,
+                    timeout=settings.anthropic_timeout_seconds,
+                )
             )
         self._client = client
 

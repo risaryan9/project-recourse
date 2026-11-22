@@ -43,11 +43,15 @@ class OpenAILLM:
     def __init__(self, settings: Settings, client: openai.AsyncOpenAI | None = None) -> None:
         self._settings = settings
         if client is None:
+            from recourse.tracing import wrap_client
+
             key = settings.openai_api_key
-            client = openai.AsyncOpenAI(
-                api_key=key.get_secret_value() if key is not None else None,
-                max_retries=settings.openai_max_retries,
-                timeout=settings.openai_timeout_seconds,
+            client = wrap_client(
+                openai.AsyncOpenAI(
+                    api_key=key.get_secret_value() if key is not None else None,
+                    max_retries=settings.openai_max_retries,
+                    timeout=settings.openai_timeout_seconds,
+                )
             )
         self._client = client
 

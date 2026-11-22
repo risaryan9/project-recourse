@@ -382,7 +382,8 @@ async def run_draft(
         escalation=escalation if kind is DraftKind.OMBUDSMAN_COMPLAINT else None,
     )
     state = await build_draft_graph(llm).ainvoke(
-        {"kind": kind, "entitlement": entitlement, "table": table, "feedback": feedback}
+        {"kind": kind, "entitlement": entitlement, "table": table, "feedback": feedback},
+        config={"run_name": "DraftGraph"},
     )
     result: DraftResult = state["result"]
     return result

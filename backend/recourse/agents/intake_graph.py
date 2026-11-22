@@ -239,7 +239,9 @@ def build_intake_graph(llm: LLMClient) -> IntakeGraph:
 async def run_intake(llm: LLMClient, intake: IntakeInput, *, now: datetime) -> IntakeResult:
     """Run the IntakeGraph once. `now` must be timezone-aware (use `workflow.now()` upstream)."""
     _require_aware(now)
-    state = await build_intake_graph(llm).ainvoke({"intake": intake, "now": now})
+    state = await build_intake_graph(llm).ainvoke(
+        {"intake": intake, "now": now}, config={"run_name": "IntakeGraph"}
+    )
     result: IntakeResult = state["result"]
     return result
 

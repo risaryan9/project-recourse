@@ -56,6 +56,11 @@ class Settings(BaseSettings):
     # --- Tracing ---
     langsmith_tracing: bool = False
     langsmith_api_key: SecretStr | None = None
+    # Agent addressing (recourse.tracing, ADR-024): traces go to this agent and environment.
+    langsmith_endpoint: str = "https://api.smith.langchain.com"
+    langsmith_agent_id: str | None = None
+    langsmith_agent_environment: str = "local"
+    langsmith_workspace_id: str | None = None
 
     # --- Demo mode: shrinks 1 "day" to demo_day_seconds ---
     demo_mode: bool = False

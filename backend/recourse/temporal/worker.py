@@ -17,6 +17,8 @@ from recourse.temporal.case_activities import CaseActivities
 from recourse.temporal.case_runner import connect
 from recourse.temporal.case_workflow import CaseWorkflow
 from recourse.temporal.workflows import HelloWorkflow
+from recourse.tracing import configure_tracing
+from recourse.tracing import flush as flush_traces
 
 WORKFLOWS = [HelloWorkflow, CaseWorkflow]
 
@@ -26,6 +28,7 @@ async def main() -> None:
         level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s"
     )
     settings = get_settings()
+    configure_tracing(settings)  # before any client is built, so model calls are wrapped
     client = await connect(settings)
     engine = make_engine(settings=settings)
     if settings.require_user_keys:
@@ -50,6 +53,7 @@ async def main() -> None:
     try:
         await worker.run()
     finally:
+        flush_traces()
         await engine.dispose()
 
 

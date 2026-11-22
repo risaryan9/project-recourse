@@ -334,6 +334,8 @@ def build_reply_judge_graph(llm: LLMClient) -> ReplyJudgeGraph:
 
 async def judge_reply(llm: LLMClient, inp: ReplyInput) -> ReplyVerdict:
     """Judge one bank reply. LLM errors (`LLMError`) propagate, as in the other graphs."""
-    state = await build_reply_judge_graph(llm).ainvoke({"inp": inp})
+    state = await build_reply_judge_graph(llm).ainvoke(
+        {"inp": inp}, config={"run_name": "ReplyJudgeGraph"}
+    )
     verdict: ReplyVerdict = state["verdict"]
     return verdict

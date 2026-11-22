@@ -125,6 +125,7 @@ from recourse.temporal.case_types import (
     SendSummary,
     ThreadSummary,
 )
+from recourse.tracing import case_trace
 
 LLM_FAILED = "LLMFailed"
 NEEDS_API_KEY = "NeedsApiKey"  # bring your own key: the owner has no key in the API right now
@@ -211,7 +212,8 @@ class CaseActivities:
             )
 
         try:
-            result = await run_intake(await self._model(inp.case_id), intake, now=inp.now)
+            with case_trace("intake", inp.case_id):
+                result = await run_intake(await self._model(inp.case_id), intake, now=inp.now)
         except LLMError as e:
             if e.retryable:
                 raise  # Temporal retries later
@@ -392,16 +394,17 @@ class CaseActivities:
             )
 
         try:
-            result = await run_draft(
-                await self._model(inp.case_id),
-                entitlement,
-                evidence,
-                case_tag=case_tag,
-                letter_date=inp.letter_date,
-                feedback=feedback,
-                kind=inp.kind,
-                escalation=escalation,
-            )
+            with case_trace(f"draft:{inp.kind.value.lower()}", inp.case_id):
+                result = await run_draft(
+                    await self._model(inp.case_id),
+                    entitlement,
+                    evidence,
+                    case_tag=case_tag,
+                    letter_date=inp.letter_date,
+                    feedback=feedback,
+                    kind=inp.kind,
+                    escalation=escalation,
+                )
         except SlotError as e:
             raise invalid(f"This case cannot be drafted: {e}") from e
         except LLMError as e:
@@ -814,7 +817,8 @@ class CaseActivities:
             )
 
         try:
-            verdict = await judge_reply(await self._model(inp.case_id), judge_input)
+            with case_trace("judge_reply", inp.case_id):
+                verdict = await judge_reply(await self._model(inp.case_id), judge_input)
         except LLMError as e:
             if e.retryable:
                 raise

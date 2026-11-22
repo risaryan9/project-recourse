@@ -117,21 +117,26 @@ def llm_from_keys(settings: Settings, keys: UserKeys) -> LLMClient:
     from recourse.llm.anthropic_client import AnthropicLLM
     from recourse.llm.fallback import FallbackLLM
     from recourse.llm.openai_client import OpenAILLM
+    from recourse.tracing import wrap_client
 
     providers: list[tuple[str, LLMClient]] = []
     for name in settings.llm_providers:
         if name == "anthropic" and keys.anthropic:
-            client = anthropic.AsyncAnthropic(
-                api_key=keys.anthropic,
-                max_retries=settings.anthropic_max_retries,
-                timeout=settings.anthropic_timeout_seconds,
+            client = wrap_client(
+                anthropic.AsyncAnthropic(
+                    api_key=keys.anthropic,
+                    max_retries=settings.anthropic_max_retries,
+                    timeout=settings.anthropic_timeout_seconds,
+                )
             )
             providers.append((name, AnthropicLLM(settings, client=client)))
         elif name == "openai" and keys.openai:
-            oclient = openai.AsyncOpenAI(
-                api_key=keys.openai,
-                max_retries=settings.openai_max_retries,
-                timeout=settings.openai_timeout_seconds,
+            oclient = wrap_client(
+                openai.AsyncOpenAI(
+                    api_key=keys.openai,
+                    max_retries=settings.openai_max_retries,
+                    timeout=settings.openai_timeout_seconds,
+                )
             )
             providers.append((name, OpenAILLM(settings, client=oclient)))
     if not providers:
