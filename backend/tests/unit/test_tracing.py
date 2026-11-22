@@ -67,6 +67,32 @@ def test_scrub_drops_attachments_and_keys() -> None:
     assert out["count"] == 3
 
 
+def test_scrub_drops_data_urls_and_embedded_base64() -> None:
+    openai_style = {
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": f"data:image/png;base64,{IMAGE_B64}"},
+                    },
+                    {
+                        "type": "file",
+                        "file": {"file_data": f"data:application/pdf;base64,{IMAGE_B64}"},
+                    },
+                ],
+            }
+        ],
+        "note": f"prefix {IMAGE_B64} suffix",
+    }
+    out = tracing._scrub_dict(openai_style)
+    blob = str(out)
+    assert IMAGE_B64[:64] not in blob
+    assert out["messages"][0]["content"][0]["image_url"]["url"] == tracing.ATTACHMENT
+    assert out["note"] == f"prefix {tracing.ATTACHMENT} suffix"
+
+
 def test_off_without_an_api_key_or_agent() -> None:
     assert tracing.configure_tracing(_settings(langsmith_tracing=True)) is False
     assert (

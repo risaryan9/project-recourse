@@ -42,6 +42,9 @@ _LEGACY_ENV = (
     "LANGCHAIN_API_KEY",
 )
 _BASE64 = re.compile(r"[A-Za-z0-9+/=\r\n]{512,}")
+# Data URLs (how OpenAI receives images) and long base64 runs inside other text.
+_DATA_URL = re.compile(r"data:[\w.+/-]+;base64,[A-Za-z0-9+/=\r\n]+")
+_BASE64_RUN = re.compile(r"[A-Za-z0-9+/=]{512,}")
 _API_KEY = re.compile(r"sk-(?:ant-|proj-)?[A-Za-z0-9_\-]{16,}")
 ATTACHMENT = "[attachment omitted]"
 KEY = "[key omitted]"
@@ -56,6 +59,8 @@ def scrub(value: Any) -> Any:
     if isinstance(value, str):
         if len(value) >= 512 and _BASE64.fullmatch(value):
             return ATTACHMENT
+        value = _DATA_URL.sub(ATTACHMENT, value)
+        value = _BASE64_RUN.sub(ATTACHMENT, value)
         return _API_KEY.sub(KEY, value)
     if isinstance(value, BaseModel):
         return scrub(value.model_dump(mode="python"))
