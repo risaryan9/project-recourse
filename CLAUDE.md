@@ -15,6 +15,11 @@
    - commit messages, branch names, PR titles/descriptions, issue text.
    
    If a task seems to need such a reference, stop and ask Aryan.
+
+   **Exceptions Aryan approved (22 Nov 2026), and nothing beyond them:** the event's name and
+   website may appear in (a) the README's single "Built for …" line under the title, and (b) the
+   close slide (`frontend/components/slides/close-slide.tsx`, `docs/slides/03-close.png`). Never
+   in code comments, docs, commit messages or anywhere else.
 3. Never `git add -f` anything under `context/`. Before every commit, check `git status` / `git diff --cached` to confirm nothing from `context/` is staged.
 
 ---
