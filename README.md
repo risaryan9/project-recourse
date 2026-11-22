@@ -33,6 +33,8 @@ files themselves), the web app and the eval suites. Hosting is still to come.
 
 ## Architecture
 
+![Recourse architecture: Next.js and FastAPI in front of one Temporal CaseWorkflow per case, which runs LangGraph agents, the rule engine and the email channel, with Claude, OpenAI as fallback, Gmail and Neon Postgres](docs/slides/01-architecture.png)
+
 ```
 Next.js frontend
    │  REST
@@ -191,6 +193,8 @@ Run them yourself (from `backend/`): `uv run python ../evals/run_evals.py` (or
 
 ## Security & Privacy
 
+![Four threats and their guards: drafts verified against the rule engine, a phishing screen and a reply judge with no tools, masked personal data and encrypted tokens, and thread-only Gmail access with per-email approval and a sandbox](docs/slides/02-safety.png)
+
 | Threat | Mitigation |
 |---|---|
 | Prompt injection in bank replies or uploads | Untrusted text is wrapped as data; the reply classifier returns a fixed set of labels and has no tools; code, not the model, decides compliance; every consequential step needs the user's approval |
@@ -252,6 +256,8 @@ Open-source libraries and tools:
 - [uv](https://github.com/astral-sh/uv), [Ruff](https://github.com/astral-sh/ruff),
   [mypy](https://mypy-lang.org/), [pytest](https://pytest.org/)
 
+- Technology logos in the diagrams: [Simple Icons](https://simpleicons.org/) (CC0)
+
 Design inspiration: [ElimentaryLabs/agent-harness-starter](https://github.com/ElimentaryLabs/agent-harness-starter)
 (MIT), for the ideas of verification as a guaranteed step, a human permission gate,
 observability by default and fake-LLM tests.
@@ -260,3 +266,5 @@ observability by default and fake-LLM tests.
 
 The repository only contains synthetic sample data. It never contains real customer data, bank
 details or credentials.
+
+<sub>Logos are trademarks of their respective owners.</sub>
