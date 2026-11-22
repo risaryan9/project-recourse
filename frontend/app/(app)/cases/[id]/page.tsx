@@ -1,12 +1,9 @@
-import { Suspense } from "react";
+import { CaseOverview } from "@/components/case/case-pages";
 
-import { Working } from "@/components/app/ui";
-import { CaseScreen } from "@/components/case/case-screen";
+// The case loads in the browser (it belongs to this browser's owner cookie), so there is
+// no server-rendered shell to navigate to instantly.
+export const instant = false;
 
-export default function CasePage({ params }: PageProps<"/cases/[id]">) {
-  return (
-    <Suspense fallback={<div className="pt-12"><Working>Loading the case</Working></div>}>
-      <CaseScreen params={params} />
-    </Suspense>
-  );
+export default function CaseOverviewPage() {
+  return <CaseOverview />;
 }

@@ -2,8 +2,6 @@
 
 import { useEffect, useState } from "react";
 
-import { Panel } from "@/components/app/ui";
-import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { api, type CaseView, type Reply } from "@/lib/api";
 import { formatDateTime, inr } from "@/lib/format";
 import { describeEvent, ENUMS, FACTS } from "@/lib/labels";
@@ -27,7 +25,8 @@ function grouped(events: CaseView["timeline"]) {
   return out;
 }
 
-function Timeline({ c }: { c: CaseView }) {
+/** Every recorded step, newest first. */
+export function ActivityLog({ c }: { c: CaseView }) {
   const events = grouped([...c.timeline].reverse());
   return (
     <ol className="divide-y divide-line">
@@ -59,7 +58,7 @@ const REPLY_LABEL: Record<string, string> = {
   UNCLEAR: "Unclear",
 };
 
-function Emails({ c }: { c: CaseView }) {
+export function LettersAndReplies({ c }: { c: CaseView }) {
   const [replies, setReplies] = useState<Reply[] | null>(null);
   const count = c.timeline.filter((e) => e.event_type.startsWith("reply.")).length;
   useEffect(() => {
@@ -112,7 +111,7 @@ function Emails({ c }: { c: CaseView }) {
   );
 }
 
-function Evidence({ c }: { c: CaseView }) {
+export function EvidenceList({ c }: { c: CaseView }) {
   const ev = c.evidence;
   if (!ev) return <p className="text-text-3">Nothing read yet.</p>;
   const rows = FACTS.filter((f) => ev.facts[f.name]?.value !== null && ev.facts[f.name]?.value !== undefined);
@@ -153,28 +152,5 @@ function Evidence({ c }: { c: CaseView }) {
         <p className="text-sm text-text-3">Sensitive codes or numbers were removed before storing.</p>
       ) : null}
     </div>
-  );
-}
-
-export function CaseTabs({ c }: { c: CaseView }) {
-  return (
-    <Panel>
-      <Tabs defaultValue="timeline">
-        <TabsList className="mb-4">
-          <TabsTrigger value="timeline">Timeline</TabsTrigger>
-          <TabsTrigger value="emails">Emails and replies</TabsTrigger>
-          <TabsTrigger value="evidence">Evidence</TabsTrigger>
-        </TabsList>
-        <TabsContent value="timeline">
-          <Timeline c={c} />
-        </TabsContent>
-        <TabsContent value="emails">
-          <Emails c={c} />
-        </TabsContent>
-        <TabsContent value="evidence">
-          <Evidence c={c} />
-        </TabsContent>
-      </Tabs>
-    </Panel>
   );
 }

@@ -33,6 +33,10 @@ Rules for blue:
 - No second accent colour. A warning (for example a scam reply) is told in words and layout,
   not in red. `--amber` exists for the app's rare states only.
 
+A fine 64 px line grid sits on the ink, lit by the same light: brightest near the top-right
+pool and fading into the black (`.ambient-grid` on the landing page, fainter in the app). It is
+static and painted with gradients, so it costs nothing on scroll.
+
 ## Glass
 
 Glass is how product UI and important content are presented: a translucent panel that catches
@@ -121,3 +125,11 @@ Same black, blue, glass and type, but calmer and denser, built for getting work 
 - One "Next action" panel per case, in `.glass .glass-lit`; everything else in plain `.glass`
   or on the ink.
 - Status as a quiet pill with a dot (blue dot when the case is waiting on something live).
+- **A case keeps one frame while it moves** (`components/case/case-shell.tsx`): the header, a
+  six-stage tracker (done, current with whose turn it is, still to come) and a sidebar with the
+  case's pages (Overview, Letters and replies, Timeline, Evidence) and key facts. Only the body
+  of the Next action panel changes from step to step; its header always reads "Step n of 6".
+  The step, stage and owner come from one function (`lib/case-progress.ts`).
+- The Timeline page draws every rule window on one date axis (time gone filled in, today as a
+  dashed line, milestones as dots). While Gmail watches the thread, a quiet widening ring says
+  Recourse is looking for the reply; pasting a reply is the fallback for one sent elsewhere.

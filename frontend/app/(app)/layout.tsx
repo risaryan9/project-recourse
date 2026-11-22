@@ -22,7 +22,7 @@ export default function AppLayout({ children }: LayoutProps<"/">) {
     <>
       <div className="ambient-app" aria-hidden="true" />
       <div className="relative z-10 flex min-h-screen flex-col">
-        <header className="mx-auto flex w-full max-w-5xl items-center justify-between px-5 py-5 sm:px-6">
+        <header className="mx-auto flex w-full max-w-6xl items-center justify-between px-5 py-5 sm:px-6">
           <Link
             href="/"
             className="text-[1.0625rem] font-[620] tracking-[-0.02em] [font-stretch:92%]"
@@ -33,9 +33,9 @@ export default function AppLayout({ children }: LayoutProps<"/">) {
             <AppNav />
           </Suspense>
         </header>
-        <main className="mx-auto w-full max-w-5xl flex-1 px-5 pb-20 sm:px-6">{children}</main>
+        <main className="mx-auto w-full max-w-6xl flex-1 px-5 pb-20 sm:px-6">{children}</main>
         <footer className="border-t border-line">
-          <p className="type-small mx-auto max-w-5xl px-5 py-6 sm:px-6">
+          <p className="type-small mx-auto max-w-6xl px-5 py-6 sm:px-6">
             Informational, not legal advice. Not affiliated with RBI or NPCI.
           </p>
         </footer>

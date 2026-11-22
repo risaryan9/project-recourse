@@ -24,6 +24,8 @@ type Poll<T> = {
   error: ApiError | null;
   loading: boolean;
   refresh: () => Promise<void>;
+  /** After an action: reload quickly until the data changes (or ~12 s pass). Needs `changeKey`. */
+  settle: () => Promise<void>;
 };
 
 /**
@@ -32,7 +34,11 @@ type Poll<T> = {
  */
 export function usePoll<T>(
   fetcher: () => Promise<T>,
-  { intervalMs = 2500, active = () => true }: { intervalMs?: number; active?: (d: T) => boolean } = {},
+  {
+    intervalMs = 2500,
+    active = () => true,
+    changeKey,
+  }: { intervalMs?: number; active?: (d: T) => boolean; changeKey?: (d: T) => string } = {},
 ): Poll<T> {
   const [data, setData] = useState<T | null>(null);
   const [error, setError] = useState<ApiError | null>(null);
@@ -75,7 +81,26 @@ export function usePoll<T>(
     };
   }, [refresh, intervalMs]);
 
-  return { data, error, loading, refresh };
+  // Actions are accepted at once (202) and applied by the case workflow a moment later, so a
+  // single reload right after one often still sees the old state. Check every 500 ms until
+  // something changes, so the screen moves as soon as the step is recorded.
+  const keyRef = useRef(changeKey);
+  useEffect(() => {
+    keyRef.current = changeKey;
+  });
+  const settle = useCallback(async () => {
+    const key = keyRef.current;
+    const before = latest.current !== null && key ? key(latest.current) : null;
+    await refresh();
+    if (before === null || !key) return;
+    const until = Date.now() + 12_000;
+    while (latest.current !== null && key(latest.current) === before && Date.now() < until) {
+      await new Promise((r) => setTimeout(r, 500));
+      await refresh();
+    }
+  }, [refresh]);
+
+  return { data, error, loading, refresh, settle };
 }
 
 /** Whether this browser has connected Gmail. `refresh()` after connecting or disconnecting. */

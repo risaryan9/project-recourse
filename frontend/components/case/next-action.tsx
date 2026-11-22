@@ -13,16 +13,19 @@ import {
   TextButton,
   Working,
 } from "@/components/app/ui";
+import { GmailLogo } from "@/components/brand/gmail-logo";
 import { LetterReview } from "@/components/case/letter-review";
 import { ReviewFacts } from "@/components/case/review-facts";
 import { api, type Bank, type CaseView, type Filing, type ReplySummary } from "@/lib/api";
+import { currentStage, nextStep, OWNER_LABEL, STAGES, type Owner, type StepKey } from "@/lib/case-progress";
 import { daysFromToday, formatDate, formatDateTime, inr } from "@/lib/format";
 import { ENUMS } from "@/lib/labels";
+import { cn } from "@/lib/utils";
 
-type Props = { c: CaseView; refresh: () => void };
+type Props = { c: CaseView; refresh: () => void | Promise<void> };
 
 /** Run an API call with busy/error state; refresh the case afterwards. */
-function useAction(refresh: () => void) {
+function useAction(refresh: () => void | Promise<void>) {
   const [busy, setBusy] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const run = async (key: string, fn: () => Promise<unknown>) => {
@@ -30,7 +33,9 @@ function useAction(refresh: () => void) {
     setError(null);
     try {
       await fn();
-      refresh();
+      // Stay busy until the case has actually moved (see usePoll's settle), so the form
+      // doesn't reappear for a moment as if nothing happened.
+      await refresh();
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
@@ -200,14 +205,25 @@ function LastReply({ r }: { r: ReplySummary }) {
   return <Notice title="Latest reply from the bank">{VERDICT[r.next_action]}</Notice>;
 }
 
-function ReplyForm({ c, refresh }: Props) {
+function ReplyForm({ c, refresh, fallback = false }: Props & { fallback?: boolean }) {
   const { busy, error, run } = useAction(refresh);
   const [open, setOpen] = useState(false);
   const [text, setText] = useState("");
   const [sender, setSender] = useState("");
-  if (!open) return <QuietButton onClick={() => setOpen(true)}>Paste the bank&apos;s reply</QuietButton>;
+  if (!open) {
+    return fallback ? (
+      <p className="text-sm text-text-3">
+        Bank replied in a different email, or by letter?{" "}
+        <TextButton className="text-sm text-text-2 underline underline-offset-4 hover:text-text" onClick={() => setOpen(true)}>
+          Paste its reply instead
+        </TextButton>
+      </p>
+    ) : (
+      <QuietButton onClick={() => setOpen(true)}>Paste the bank&apos;s reply</QuietButton>
+    );
+  }
   return (
-    <div className="flex flex-col gap-3">
+    <div className="flex w-full flex-col gap-3">
       <label htmlFor="reply" className="text-sm text-text-2">
         The bank&apos;s reply, exactly as you received it
       </label>
@@ -271,26 +287,69 @@ function ResolvedForm({ c, refresh, label = "I got my money" }: Props & { label?
   );
 }
 
+/** "2 min ago", kept fresh while the panel is open. */
+function useAgo(iso: string | null): string | null {
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    const t = setInterval(() => setNow(Date.now()), 5000);
+    return () => clearInterval(t);
+  }, []);
+  if (!iso) return null;
+  const secs = Math.max(0, Math.round((now - new Date(iso).getTime()) / 1000));
+  if (secs < 10) return "just now";
+  if (secs < 60) return `${secs} seconds ago`;
+  const mins = Math.round(secs / 60);
+  if (mins < 60) return `${mins} ${mins === 1 ? "minute" : "minutes"} ago`;
+  return formatDateTime(iso);
+}
+
+/** Recourse is watching the email's Gmail thread: a quiet, living sign that it is looking. */
+function MailWatch({ c }: { c: CaseView }) {
+  const ago = useAgo(c.last_thread_check);
+  return (
+    <div role="status" className="flex items-center gap-4 rounded-[1rem] border border-line bg-white/[0.02] px-4 py-3.5">
+      <span aria-hidden="true" className="relative grid size-10 shrink-0 place-items-center">
+        <span className="absolute inset-0 rounded-full border border-blue/40 motion-safe:animate-[mail-watch_2.8s_var(--ease-calm)_infinite]" />
+        <span className="absolute inset-0 rounded-full border border-blue/30 motion-safe:animate-[mail-watch_2.8s_var(--ease-calm)_1.4s_infinite]" />
+        <span className="relative grid size-8 place-items-center rounded-full bg-white/[0.06]">
+          <GmailLogo className="h-3 w-auto" />
+        </span>
+      </span>
+      <div className="min-w-0">
+        <p className="text-[0.95rem] text-text">
+          Looking for the bank&apos;s reply
+          <span aria-hidden="true" className="inline-flex w-5">
+            <span className="motion-safe:animate-[mail-dot_1.4s_ease-in-out_infinite]">.</span>
+            <span className="motion-safe:animate-[mail-dot_1.4s_ease-in-out_0.2s_infinite]">.</span>
+            <span className="motion-safe:animate-[mail-dot_1.4s_ease-in-out_0.4s_infinite]">.</span>
+          </span>
+        </p>
+        <p className="text-sm text-text-3">
+          Watching this email&apos;s thread in your Gmail{ago ? `, last checked ${ago}` : ""}. A reply there is
+          checked against the rules as soon as it arrives.
+        </p>
+      </div>
+    </div>
+  );
+}
+
 function WaitingForBank({ c, refresh }: Props) {
   const esc = c.escalation;
   const until = esc?.waiting_period_ends;
   const days = until ? daysFromToday(until) : null;
+  const deadline = until
+    ? `Your bank has until ${formatDate(until, { long: true })} to put it right${
+        days !== null && days >= 0 ? `, ${days === 0 ? "today" : `${days} days from now`}` : ""
+      }.`
+    : "";
   return (
     <div className="flex flex-col gap-6">
       <Heading title="Waiting for your bank">
-        {until
-          ? `Your bank has until ${formatDate(until, { long: true })} to put it right${
-              days !== null && days >= 0 ? `, ${days === 0 ? "today" : `${days} days from now`}` : ""
-            }. When it replies, paste the reply here and Recourse checks it against the rules.`
-          : "When your bank replies, paste the reply here and Recourse checks it against the rules."}
+        {c.watching_thread
+          ? `${deadline} Recourse is looking out for the reply, so there's nothing you need to do.`
+          : `${deadline} When it replies, paste the reply here and Recourse checks it against the rules.`}
       </Heading>
-      {c.watching_thread ? (
-        <p className="text-sm text-text-2">
-          Recourse is watching this email&apos;s thread in your Gmail for the bank&apos;s reply
-          {c.last_thread_check ? ` (last checked ${formatDateTime(c.last_thread_check)})` : ""}. Replies
-          that arrive there are checked automatically.
-        </p>
-      ) : null}
+      {c.watching_thread ? <MailWatch c={c} /> : null}
       {c.bank_complaint_ref ? (
         <p className="text-sm text-text-3">
           Bank&apos;s complaint number: <span className="text-text-2">{c.bank_complaint_ref}</span>
@@ -299,7 +358,7 @@ function WaitingForBank({ c, refresh }: Props) {
       {c.last_reply ? <LastReply r={c.last_reply} /> : null}
       <FormError message={c.last_error} />
       <div className="flex flex-col items-start gap-4">
-        <ReplyForm c={c} refresh={refresh} />
+        <ReplyForm c={c} refresh={refresh} fallback={c.watching_thread} />
         <ResolvedForm c={c} refresh={refresh} />
       </div>
     </div>
@@ -514,7 +573,7 @@ function Ended({ c }: { c: CaseView }) {
   );
 }
 
-function Stop({ c, refresh }: Props) {
+export function StopCase({ c, refresh }: Props) {
   const { error, run } = useAction(refresh);
   const [sure, setSure] = useState(false);
   return (
@@ -539,61 +598,70 @@ function Stop({ c, refresh }: Props) {
   );
 }
 
-function Body({ c, refresh }: Props) {
-  const draft = c.draft;
-  if (c.status === "RESOLVED" || c.status === "CLOSED" || c.status === "ABANDONED") return <Ended c={c} />;
-  if (c.status === "NEW" || (c.status === "EXTRACTED" && !c.evidence)) return <Working>Reading your evidence. This takes a few seconds.</Working>;
-  if (c.status === "EXTRACTED") return <ReviewFacts c={c} onDone={refresh} />;
-  if (c.needs_bank_type) return <BankTypeForm c={c} refresh={refresh} />;
-  if (c.can_recheck_escalation) {
-    return (
-      <div className="flex flex-col gap-5">
-        <Heading title="The Ombudsman complaint can't be prepared yet">{c.last_error}</Heading>
-        <div>
-          <QuietButton onClick={async () => { await api.recheckEscalation(c.id); refresh(); }}>Check again</QuietButton>
+function Body({ c, refresh, step }: Props & { step: StepKey }) {
+  switch (step) {
+    case "ended":
+      return <Ended c={c} />;
+    case "reading":
+      return <Working>Reading your evidence. This takes a few seconds.</Working>;
+    case "review_facts":
+      return <ReviewFacts c={c} onDone={refresh} />;
+    case "bank_type":
+      return <BankTypeForm c={c} refresh={refresh} />;
+    case "recheck_escalation":
+      return (
+        <div className="flex flex-col gap-5">
+          <Heading title="The Ombudsman complaint can't be prepared yet">{c.last_error}</Heading>
+          <div>
+            <QuietButton onClick={async () => { await api.recheckEscalation(c.id); refresh(); }}>Check again</QuietButton>
+          </div>
         </div>
-      </div>
-    );
-  }
-  if (c.can_redraft) {
-    return (
-      <div className="flex flex-col gap-5">
-        <Heading title="The letter didn't pass its checks">
-          Recourse only shows letters whose every amount and date matches the rules. This one
-          didn&apos;t, so it was held back. Try once more.
+      );
+    case "redraft":
+      return (
+        <div className="flex flex-col gap-5">
+          <Heading title="The letter didn't pass its checks">
+            Recourse only shows letters whose every amount and date matches the rules. This one
+            didn&apos;t, so it was held back. Try once more.
+          </Heading>
+          <div>
+            <PrimaryButton onClick={async () => { await api.redraft(c.id); refresh(); }}>Write it again</PrimaryButton>
+          </div>
+        </div>
+      );
+    case "review_letter":
+      return <LetterReview key={c.draft!.id} c={c} draft={c.draft!} onDone={refresh} />;
+    case "blocked_send":
+      return <BlockedSend c={c} refresh={refresh} />;
+    case "gmail_retry":
+      return <GmailRetry c={c} refresh={refresh} />;
+    case "gmail_sending":
+      return <Working>Sending the letter from your Gmail.</Working>;
+    case "send_yourself":
+      return <SendYourself c={c} refresh={refresh} />;
+    case "file_ombudsman":
+      return <FilingPackage c={c} refresh={refresh} />;
+    case "close":
+      return <CloseForm c={c} refresh={refresh} />;
+    case "decision":
+      return <Decision c={c} refresh={refresh} />;
+    case "preparing_ombudsman":
+      return <Working>Preparing your complaint to the RBI Ombudsman. Every figure is checked first.</Working>;
+    case "waiting_bank":
+      return <WaitingForBank c={c} refresh={refresh} />;
+    case "not_covered":
+      return (
+        <Heading title="These rules don't cover this case">
+          See what the rules say beside this panel. You can still contact your bank directly.
         </Heading>
-        <div>
-          <PrimaryButton onClick={async () => { await api.redraft(c.id); refresh(); }}>Write it again</PrimaryButton>
-        </div>
-      </div>
-    );
+      );
+    case "drafting":
+      return <Working>Writing your letter and checking every figure in it.</Working>;
+    case "starting_wait":
+      return <Working>Starting the bank&apos;s reply window.</Working>;
+    default:
+      return <Working>Working on your case.</Working>;
   }
-  if (draft?.status === "PENDING" && (c.status === "AWAITING_APPROVAL" || c.status === "ESCALATION_DRAFT_READY")) {
-    return <LetterReview key={draft.id} c={c} draft={draft} onDone={refresh} />;
-  }
-  if (c.can_retry_send && c.email?.status === "BLOCKED") return <BlockedSend c={c} refresh={refresh} />;
-  if (c.can_retry_send && c.email?.channel === "GMAIL") return <GmailRetry c={c} refresh={refresh} />;
-  if (c.email?.channel === "GMAIL" && c.status === "AWAITING_APPROVAL" && c.email.status !== "SENT") {
-    return <Working>Sending the letter from your Gmail.</Working>;
-  }
-  if (c.email?.status === "PREPARED" && c.status === "AWAITING_APPROVAL") return <SendYourself c={c} refresh={refresh} />;
-  if (c.awaiting_filing) return <FilingPackage c={c} refresh={refresh} />;
-  if (c.can_close) return <CloseForm c={c} refresh={refresh} />;
-  if (c.status === "JUDGED" && c.can_escalate) return <Decision c={c} refresh={refresh} />;
-  if (c.status === "JUDGED" || c.bank_wait_expired || c.status === "ESCALATION_DRAFT_READY") {
-    return <Working>Preparing your complaint to the RBI Ombudsman. Every figure is checked first.</Working>;
-  }
-  if (c.status === "AWAITING_BANK") return <WaitingForBank c={c} refresh={refresh} />;
-  if (c.status === "ASSESSED" && c.entitlement && !c.entitlement.covered) {
-    return (
-      <Heading title="These rules don't cover this case">
-        See what the rules say on the right. You can still contact your bank directly.
-      </Heading>
-    );
-  }
-  if (c.status === "ASSESSED") return <Working>Writing your letter and checking every figure in it.</Working>;
-  if (c.status === "SENT_TO_BANK") return <Working>Starting the bank&apos;s reply window.</Working>;
-  return <Working>Working on your case.</Working>;
 }
 
 /** With the Ombudsman, the bank can still answer or pay: show late replies, and let the user
@@ -602,31 +670,51 @@ function BankCanStillAnswer({ c, refresh }: Props) {
   return (
     <div className="flex flex-col gap-4 border-t border-line pt-6">
       <p className="text-sm text-text-2">
-        Your bank can still reply or pay while this goes to the Ombudsman.
-        {c.watching_thread
-          ? ` Recourse keeps watching the email's Gmail thread${
-              c.last_thread_check ? ` (last checked ${formatDateTime(c.last_thread_check)})` : ""
-            }.`
-          : ""}{" "}
-        A late reply is checked and shown here; it doesn&apos;t change your Ombudsman steps.
+        Your bank can still reply or pay while this goes to the Ombudsman. A late reply is checked
+        and shown here; it doesn&apos;t change your Ombudsman steps.
       </p>
+      {c.watching_thread ? <MailWatch c={c} /> : null}
       {c.last_reply ? <LastReply r={c.last_reply} /> : null}
-      <div className="flex flex-wrap items-start gap-x-6 gap-y-3">
-        <ReplyForm c={c} refresh={refresh} />
+      <div className="flex flex-col items-start gap-3">
+        <ReplyForm c={c} refresh={refresh} fallback={c.watching_thread} />
         <ResolvedForm c={c} refresh={refresh} />
       </div>
     </div>
   );
 }
 
+const OWNER_DOT: Record<Owner, string> = {
+  you: "bg-blue",
+  recourse: "bg-blue motion-safe:animate-[pulse_2.4s_ease-in-out_infinite]",
+  bank: "bg-text-2",
+  done: "bg-text-3",
+};
+
+/**
+ * The one place to act. Its frame never changes: a header with the step and whose turn it is,
+ * then the step's own content. Only the content below the header changes as the case moves.
+ */
 export function NextAction({ c, refresh }: Props) {
   const ended = c.status === "RESOLVED" || c.status === "CLOSED" || c.status === "ABANDONED";
   const late = c.can_resolve && !["AWAITING_BANK", "JUDGED", "SENT_TO_BANK"].includes(c.status);
+  const step = nextStep(c);
+  const stage = currentStage(c);
   return (
-    <Panel lit aria-label="Next action" className="flex flex-col gap-8">
-      <Body c={c} refresh={refresh} />
-      {late && !ended ? <BankCanStillAnswer c={c} refresh={refresh} /> : null}
-      {!ended && c.status !== "NEW" ? <Stop c={c} refresh={refresh} /> : null}
+    <Panel lit aria-labelledby="next-action-title" className="flex flex-col p-0 sm:p-0">
+      <div className="flex flex-wrap items-center justify-between gap-x-4 gap-y-2 border-b border-line px-5 py-3.5 sm:px-6">
+        <h2 id="next-action-title" className="text-sm text-text-2">
+          Step <span className="figures">{stage + 1}</span> of <span className="figures">{STAGES.length}</span>:{" "}
+          <span className="text-text">{STAGES[stage].label}</span>
+        </h2>
+        <span className="inline-flex items-center gap-2 text-sm text-text-2">
+          <span aria-hidden="true" className={cn("size-1.5 rounded-full", OWNER_DOT[step.owner])} />
+          {OWNER_LABEL[step.owner]}
+        </span>
+      </div>
+      <div className="flex flex-col gap-8 px-5 py-6 sm:px-6 sm:py-7">
+        <Body c={c} refresh={refresh} step={step.key} />
+        {late && !ended ? <BankCanStillAnswer c={c} refresh={refresh} /> : null}
+      </div>
     </Panel>
   );
 }

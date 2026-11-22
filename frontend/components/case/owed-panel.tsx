@@ -1,8 +1,9 @@
 "use client";
 
 import { Notice, Panel } from "@/components/app/ui";
-import type { CaseView, Citation, DeadlineLine } from "@/lib/api";
-import { daysFromToday, formatDate, inr } from "@/lib/format";
+import type { CaseView, Citation } from "@/lib/api";
+import { caseToday, dayToIso, elapsed, windows } from "@/lib/case-progress";
+import { formatDate, inr } from "@/lib/format";
 import { cn } from "@/lib/utils";
 
 /** The clause behind a figure, linked to the RBI's own page. */
@@ -21,25 +22,6 @@ export function Cite({ c, className }: { c: Citation; className?: string }) {
     >
       {c.para}, {ref}
     </a>
-  );
-}
-
-function Deadline({ d }: { d: DeadlineLine }) {
-  const days = daysFromToday(d.due);
-  return (
-    <li className="flex flex-col gap-0.5 py-3">
-      <div className="flex items-baseline justify-between gap-4">
-        <span className={cn("text-[0.95rem]", d.passed ? "text-text-3" : "text-text")}>{d.label}</span>
-        <span className="figures shrink-0 text-[0.95rem] text-text">{formatDate(d.due)}</span>
-      </div>
-      <div className="flex items-baseline justify-between gap-4">
-        <Cite c={d.citation} />
-        <span className="shrink-0 text-sm text-text-3">
-          {d.passed ? "passed" : days === 0 ? "today" : `in ${days} days`}
-          {d.approximate ? ", approx." : ""}
-        </span>
-      </div>
-    </li>
   );
 }
 
@@ -63,8 +45,6 @@ export function OwedPanel({ c }: { c: CaseView }) {
   const fraud = ent.case_type === "fraud";
   const reportBy = ent.deadlines.find((d) => d.key === "report_for_zero_liability" && !d.passed);
   const unverified = [...ent.citations, ...(c.escalation?.citations ?? [])].some((x) => !x.verified);
-  const esc = c.escalation;
-  const escDeadlines = esc?.deadlines ?? [];
 
   return (
     <Panel aria-labelledby="owed-title" className="flex flex-col gap-5">
@@ -117,23 +97,66 @@ export function OwedPanel({ c }: { c: CaseView }) {
         </ul>
       ) : null}
 
-      {ent.deadlines.length || escDeadlines.length ? (
-        <div>
-          <h3 className="text-sm text-text-2">Dates that matter</h3>
-          <ul className="mt-1 divide-y divide-line">
-            {[...ent.deadlines, ...escDeadlines].map((d) => (
-              <Deadline key={d.key} d={d} />
-            ))}
-          </ul>
-        </div>
-      ) : null}
-
       {unverified ? (
         <p className="text-sm leading-relaxed text-text-3">
           Each figure quotes the RBI document it links to. A final human check of these rules is
           still pending, so emails stay in the sandbox.
         </p>
       ) : null}
+    </Panel>
+  );
+}
+
+/** Every deadline with a bar of how much of its window has gone, nearest first. */
+export function DatesPanel({ c }: { c: CaseView }) {
+  const today = caseToday(c);
+  const ws = windows(c).sort((a, b) => {
+    const pa = a.end < today ? 1 : 0;
+    const pb = b.end < today ? 1 : 0;
+    return pa - pb || a.end - b.end;
+  });
+  return (
+    <Panel aria-labelledby="dates-title" className="flex flex-col gap-1">
+      <div className="flex items-baseline justify-between gap-3">
+        <h2 id="dates-title" className="text-sm text-text-2">
+          Dates that matter
+        </h2>
+        <span className="text-sm text-text-3">Today {formatDate(dayToIso(today))}</span>
+      </div>
+      {ws.length === 0 ? (
+        <p className="mt-2 text-sm text-text-3">Dates appear once the case is assessed.</p>
+      ) : (
+        <ul className="divide-y divide-line">
+          {ws.map((w) => {
+            const left = w.end - today;
+            const passed = left < 0;
+            const used = elapsed(w, today);
+            return (
+              <li key={w.key} className="flex flex-col gap-1.5 py-3">
+                <div className="flex items-baseline justify-between gap-3">
+                  <span className={cn("text-[0.93rem]", passed ? "text-text-3" : "text-text")} title={w.line.label}>
+                    {w.name}
+                  </span>
+                  <span className="figures shrink-0 text-[0.93rem] text-text">{formatDate(w.line.due)}</span>
+                </div>
+                <div className="h-1 overflow-hidden rounded-full bg-white/[0.07]" aria-hidden="true">
+                  <div
+                    className={cn("h-full origin-left rounded-full transition-transform duration-700 ease-[var(--ease-calm)]", passed ? "bg-text-3/60" : "bg-blue")}
+                    style={{ transform: `scaleX(${used})` }}
+                  />
+                </div>
+                <div className="flex items-baseline justify-between gap-3">
+                  <Cite c={w.line.citation} />
+                  <span className="shrink-0 text-sm text-text-3">
+                    {passed ? "passed" : left === 0 ? "today" : `${left} ${left === 1 ? "day" : "days"} left`}
+                    {w.line.approximate ? ", approx." : ""}
+                  </span>
+                </div>
+              </li>
+            );
+          })}
+        </ul>
+      )}
     </Panel>
   );
 }
