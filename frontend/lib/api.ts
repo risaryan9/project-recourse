@@ -31,8 +31,9 @@ export type PublicConfig = { email_sandbox: boolean; demo_mode: boolean; demo_da
 
 export type GmailStatus = { configured: boolean; connected: boolean; email: string | null };
 
-/** Google sign-in is a full-page navigation to the API, not a fetch. */
-export const GMAIL_CONNECT_URL = `${API_URL}/auth/google/start`;
+/** Google sign-in is a full-page navigation to the API, not a fetch. Behind this site's own
+ * proxy (API_URL "/api"), sign-in stays at /auth/* so its cookie path matches (proxy.ts). */
+export const GMAIL_CONNECT_URL = API_URL.startsWith("/") ? "/auth/google/start" : `${API_URL}/auth/google/start`;
 
 export type CaseSummary = {
   id: string;

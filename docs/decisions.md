@@ -796,3 +796,33 @@ it sat in the thread. Banks often answer late, and a late payment should end the
 ### Consequences
 - The case page shows "your bank can still reply or pay" under the Ombudsman steps.
 - A late "we paid" reply never closes the case by itself; the user confirms the money arrived.
+
+## ADR-022: Hosting: frontend on Vercel, the API through a tunnel, served from one origin
+
+### Context
+Temporal, the worker and the API need a host, and no paid or card-backed host is available
+(CLAUDE.md §12). The frontend is a Next.js app that fits Vercel's free plan. Two problems appear
+when the browser calls an API on another site: the owner cookie becomes a third-party cookie,
+which Safari and Firefox block by default (cases would vanish), and a free ngrok tunnel answers
+browser requests with an interstitial warning page instead of the API's JSON.
+
+### Decision
+- **Frontend on Vercel** (project `recourse`, production `https://recourse-omega.vercel.app`).
+  `frontend/vercel.json` pins the framework to Next.js.
+- **Temporal, worker and API run on Aryan's laptop**, reachable through ngrok's static free domain.
+- **One origin.** `frontend/proxy.ts` forwards `/api/*` (prefix removed) and `/auth/*` (path
+  kept, because the Google sign-in state cookie is scoped to `/auth/google`) to `BACKEND_URL`,
+  adding `ngrok-skip-browser-warning` and dropping the browser's `Host`. The owner cookie is
+  first-party, no CORS is involved, and the tunnel's warning page never appears.
+- Vercel environment: `NEXT_PUBLIC_API_URL=/api`, `BACKEND_URL=<tunnel URL>` (secret). Locally
+  `BACKEND_URL` is unset, the proxy does nothing, and the browser calls the API directly.
+- Backend `.env`: `FRONTEND_URL` and `GOOGLE_REDIRECT_URI` use the Vercel origin
+  (`/auth/google/callback`), `OWNER_COOKIE_SECURE=true`, `EMAIL_SANDBOX=true`.
+
+### Consequences
+- The live app works only while the laptop, the tunnel and the services are running.
+- The Google redirect URI is on the stable Vercel origin, so a tunnel change only needs
+  `BACKEND_URL` updated and a redeploy.
+- Uploads pass through Vercel's proxy; very large files may hit its request limits.
+- A single container on a free host (or DBOS) remains the path to always-on hosting.
+

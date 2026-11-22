@@ -436,6 +436,7 @@ DEMO_MODE=true
 DEMO_DAY_SECONDS=60
 DEMO_GMAIL_POLL_SECONDS=10
 FRONTEND_URL=http://localhost:3000   # where the API sends the browser back after Google sign-in
+# Vercel (frontend) env, not this file: NEXT_PUBLIC_API_URL=/api, BACKEND_URL=<API's public URL> (ADR-022)
 CORS_ORIGINS=["http://localhost:3000"]
 OWNER_COOKIE_SECURE=false        # true (HTTPS) when the frontend and API are on different sites
 OWNER_COOKIE_SAMESITE=lax        # none for a cross-site deployment
@@ -467,9 +468,7 @@ Dated milestones live in `context/initial-context.md`.
 
 ## 12. Open technical decisions (ask Aryan before resolving)
 
-1. **Production hosting for Temporal + worker + API** (no card available). Candidates:
-   - a single container on a no-card free host (e.g. Render free: sleeps after ~15 min idle, ~30–50 s cold start, 512 MB),
-   - Aryan's machine plus a free tunnel.
+1. ~~Production hosting~~: resolved (ADR-022). Frontend on Vercel (`https://recourse-omega.vercel.app`); Temporal, worker and API on Aryan's laptop behind an ngrok tunnel; `frontend/proxy.ts` serves `/api/*` and `/auth/*` from the Vercel origin. Always-on alternative if needed: a single container on a no-card free host.
    
    Code must treat `TEMPORAL_ADDRESS` as config only. Always provide a `docker-compose` path so anyone can run the full stack locally.
    - **Escape hatch:** if hosting Temporal fails, **DBOS** (durable workflows on Postgres only) can replace it.

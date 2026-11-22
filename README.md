@@ -12,6 +12,8 @@ Ombudsman if the bank doesn't put it right.
 
 Built for [Arthaton 2026](https://arthaton.com).
 
+**[Try it live](https://recourse-omega.vercel.app)** (synthetic data only; emails go to a sandbox inbox)
+
 </div>
 
 ![Recourse landing page: "When a payment goes wrong, the rules say what you're owed", with an example case where ₹2,950.00 is owed](docs/screenshots/00-landing.png)
@@ -394,6 +396,22 @@ case closes. To test it, reply to the letter from the sandbox inbox, in the same
 > "unverified app" warning: choose Advanced, then continue. An app in **Testing** mode issues
 > refresh tokens that expire after 7 days, and its test-user count is a lifetime cap of 100.
 
+### Deploying (Vercel + a tunnel)
+The live demo runs the frontend on Vercel and the rest (Temporal, worker, API) on one machine
+behind an [ngrok](https://ngrok.com/) tunnel. `frontend/proxy.ts` serves the API from the
+site's own origin, so the owner cookie stays first-party ([ADR-022](docs/decisions.md)).
+
+```bash
+ngrok http 8000                                   # note the https URL (a free static domain)
+cd frontend
+vercel env add NEXT_PUBLIC_API_URL production     # /api
+vercel env add BACKEND_URL production             # the ngrok URL
+vercel deploy --prod
+```
+In the backend `.env`, set `FRONTEND_URL` to the Vercel URL, `GOOGLE_REDIRECT_URI` to
+`<Vercel URL>/auth/google/callback` (and add it in the Google Cloud console), and
+`OWNER_COOKIE_SECURE=true`.
+
 ### Everything in Docker
 ```bash
 docker compose -f infra/docker-compose.yml up --build
@@ -465,6 +483,8 @@ infra/           docker-compose for Temporal, API and worker
   launch.
 - **Uploaded images and PDFs** reach the model unmasked; only typed text and replies are masked
   first.
+- **Hosting.** The live demo's backend runs on one laptop behind a tunnel, so it is up only while
+  that machine is; a single always-on container is the next step.
 - **Tracing.** LangSmith tracing is configured but not wired in yet; today the trail is Temporal's
   history and the audit log.
 - **Hindi drafts** and a **rule-change watcher** for new RBI circulars are planned, not built.
