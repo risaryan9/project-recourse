@@ -2,7 +2,7 @@ import { SlideFrame } from "@/components/slides/frame";
 
 const LINKS = [
   { label: "Code", value: "github.com/risaryan9/project-recourse" },
-  { label: "Live", value: "Link to follow" },
+  { label: "Live", value: "recourse-omega.vercel.app" },
   { label: "GitHub", value: "github.com/risaryan9" },
   { label: "LinkedIn", value: "linkedin.com/in/aryanr19" },
 ];
