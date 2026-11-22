@@ -6,7 +6,7 @@ Run with: uv run fastapi dev recourse/api/main.py
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from recourse.api import cases, gmail, health
+from recourse.api import cases, gmail, health, keys
 from recourse.config import get_settings
 
 
@@ -24,6 +24,8 @@ def create_app() -> FastAPI:
     app.include_router(cases.router)
     app.include_router(cases.banks_router)
     app.include_router(gmail.router)
+    app.include_router(keys.router)
+    app.include_router(keys.internal_router)
     return app
 
 

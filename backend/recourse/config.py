@@ -44,6 +44,15 @@ class Settings(BaseSettings):
     temporal_namespace: str = "default"
     temporal_task_queue: str = "recourse-cases"
 
+    # --- Bring your own key (ADR-023) ---
+    # True: model calls for a case use only the key its owner gave in the UI, held in the API's
+    # memory (never stored); the server's own keys are never used for visitors.
+    require_user_keys: bool = False
+    user_key_ttl_minutes: int = Field(default=360, gt=0)
+    # The worker fetches a case's key from the API over loopback with this shared secret.
+    internal_secret: SecretStr | None = None
+    api_internal_url: str = "http://127.0.0.1:8000"
+
     # --- Tracing ---
     langsmith_tracing: bool = False
     langsmith_api_key: SecretStr | None = None

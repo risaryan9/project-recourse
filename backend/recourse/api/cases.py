@@ -40,6 +40,7 @@ from recourse.agents.draft_graph import DISCLAIMER
 from recourse.agents.draft_slots import EscalationContext, SlotError, format_date, format_inr
 from recourse.agents.intake_graph import IntakeInput
 from recourse.api.deps import get_runner, get_session, get_session_factory
+from recourse.api.keys import NeedsKeys
 from recourse.api.owner import Owner, Reader, require_case_owner
 from recourse.cases.assessment import CaseDetails, missing_details
 from recourse.cases.drafts import (
@@ -253,7 +254,7 @@ class ReviewPreview(BaseModel):
 # =================================================================================================
 
 
-@router.post("", status_code=status.HTTP_202_ACCEPTED)
+@router.post("", status_code=status.HTTP_202_ACCEPTED, dependencies=[NeedsKeys])
 async def create_case(
     runner: Runner,
     owner: Owner,
@@ -469,7 +470,7 @@ async def get_case(case_id: uuid.UUID, session: Session, runner: Runner) -> Case
     )
 
 
-@router.post("/{case_id}/confirm", status_code=status.HTTP_202_ACCEPTED)
+@router.post("/{case_id}/confirm", status_code=status.HTTP_202_ACCEPTED, dependencies=[NeedsKeys])
 async def confirm_case(
     case_id: uuid.UUID, confirmation: Confirmation, session: Session, runner: Runner
 ) -> ReviewPreview:
@@ -546,7 +547,11 @@ async def approve_draft(
     return view
 
 
-@router.post("/{case_id}/drafts/{draft_id}/reject", status_code=status.HTTP_202_ACCEPTED)
+@router.post(
+    "/{case_id}/drafts/{draft_id}/reject",
+    status_code=status.HTTP_202_ACCEPTED,
+    dependencies=[NeedsKeys],
+)
 async def reject_draft(
     case_id: uuid.UUID,
     draft_id: uuid.UUID,
@@ -562,7 +567,7 @@ async def reject_draft(
     return {"status": "redrafting"}
 
 
-@router.post("/{case_id}/redraft", status_code=status.HTTP_202_ACCEPTED)
+@router.post("/{case_id}/redraft", status_code=status.HTTP_202_ACCEPTED, dependencies=[NeedsKeys])
 async def redraft(case_id: uuid.UUID, session: Session, runner: Runner) -> dict[str, str]:
     case = await _get_case(session, case_id)
     if case.status in ENDED:
@@ -697,7 +702,9 @@ async def retry_send(case_id: uuid.UUID, session: Session, runner: Runner) -> di
     return {"status": "retrying"}
 
 
-@router.post("/{case_id}/bank-reply", status_code=status.HTTP_202_ACCEPTED)
+@router.post(
+    "/{case_id}/bank-reply", status_code=status.HTTP_202_ACCEPTED, dependencies=[NeedsKeys]
+)
 async def add_bank_reply(
     case_id: uuid.UUID,
     reply: ReplyIn,
@@ -785,7 +792,7 @@ async def mark_resolved(
     return {"status": "resolving"}
 
 
-@router.post("/{case_id}/escalate", status_code=status.HTTP_202_ACCEPTED)
+@router.post("/{case_id}/escalate", status_code=status.HTTP_202_ACCEPTED, dependencies=[NeedsKeys])
 async def escalate(
     case_id: uuid.UUID,
     runner: Runner,
@@ -808,7 +815,7 @@ async def escalate(
     return {"status": "escalating"}
 
 
-@router.put("/{case_id}/bank-type", status_code=status.HTTP_202_ACCEPTED)
+@router.put("/{case_id}/bank-type", status_code=status.HTTP_202_ACCEPTED, dependencies=[NeedsKeys])
 async def set_bank_type(
     case_id: uuid.UUID,
     answer: BankTypeAnswer,
@@ -833,7 +840,9 @@ async def set_bank_type(
     return {"status": "rechecking"}
 
 
-@router.post("/{case_id}/escalation/recheck", status_code=status.HTTP_202_ACCEPTED)
+@router.post(
+    "/{case_id}/escalation/recheck", status_code=status.HTTP_202_ACCEPTED, dependencies=[NeedsKeys]
+)
 async def recheck_escalation(case_id: uuid.UUID, runner: Runner) -> dict[str, str]:
     live = await runner.state(case_id)
     if live is None or not live.can_recheck_escalation:

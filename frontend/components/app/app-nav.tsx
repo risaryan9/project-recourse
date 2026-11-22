@@ -4,7 +4,7 @@ import Link from "next/link";
 import { usePathname } from "next/navigation";
 
 import { GmailLogo } from "@/components/brand/gmail-logo";
-import { useConfig, useGmail } from "@/lib/hooks";
+import { useConfig, useGmail, useKeyStatus } from "@/lib/hooks";
 import { cn } from "@/lib/utils";
 
 const LINKS = [
@@ -16,8 +16,19 @@ export function AppNav() {
   const path = usePathname();
   const config = useConfig();
   const { status: gmail } = useGmail();
+  const { status: keys } = useKeyStatus(); // also re-sends this tab's key if the API lost it
+  const needsKey = !!keys?.required && !keys.anthropic && !keys.openai;
   return (
     <div className="flex items-center gap-1 sm:gap-2">
+      {needsKey ? (
+        <Link
+          href="/settings"
+          className="mr-1 inline-flex items-center gap-2 rounded-full border border-blue/45 bg-blue/10 px-3 py-1 text-sm text-text"
+        >
+          <span aria-hidden="true" className="size-1.5 rounded-full bg-blue" />
+          Add your AI key
+        </Link>
+      ) : null}
       {gmail?.configured ? (
         <Link
           href="/settings"

@@ -3,8 +3,10 @@
 import { useRouter } from "next/navigation";
 import { useRef, useState } from "react";
 
+import { KeyPanel } from "@/components/app/key-panel";
 import { FormError, Notice, Panel, PrimaryButton, TextButton } from "@/components/app/ui";
 import { api } from "@/lib/api";
+import { useKeyStatus } from "@/lib/hooks";
 
 const ACCEPT = "image/png,image/jpeg,image/webp,image/gif,application/pdf";
 const MAX_FILES = 5;
@@ -17,6 +19,8 @@ export default function NewCasePage() {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const input = useRef<HTMLInputElement>(null);
+  const { status: keys, refresh: refreshKeys } = useKeyStatus();
+  const needsKey = !!keys?.required && !keys.anthropic && !keys.openai;
 
   const total = files.reduce((n, f) => n + f.size, 0);
   const tooMany = files.length > MAX_FILES;
@@ -46,7 +50,14 @@ export default function NewCasePage() {
         anything it is unsure of.
       </p>
 
-      <Panel lit className="mt-10">
+      {needsKey ? (
+        <Panel lit className="mt-10 flex flex-col gap-4">
+          <h2 className="type-heading">First, add your AI key</h2>
+          <KeyPanel status={keys} onChange={refreshKeys} />
+        </Panel>
+      ) : null}
+
+      <Panel lit={!needsKey} className={needsKey ? "mt-6 opacity-60" : "mt-10"}>
         <form
           onSubmit={(e) => {
             e.preventDefault();
@@ -122,7 +133,7 @@ export default function NewCasePage() {
           <FormError message={error} />
 
           <div className="flex flex-wrap items-center gap-4">
-            <PrimaryButton type="submit" busy={busy} disabled={empty || tooMany || tooBig}>
+            <PrimaryButton type="submit" busy={busy} disabled={empty || tooMany || tooBig || needsKey}>
               Read my evidence
             </PrimaryButton>
           </div>

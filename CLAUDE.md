@@ -278,6 +278,7 @@ Save every primary source PDF into `docs/sources/` with a `SOURCES.md` index (ti
 - **Phishing detection:** flag any "bank reply" that asks for OTP/PIN/CVV/password, remote-access apps (AnyDesk etc.), or a payment to "unlock" a refund.
 - **Human approval gate:** no outbound message, filing, or irreversible action without an explicit `approve_draft` signal for that specific item. GmailChannel sends only after it; ManualChannel shows a draft, a copy button and a `mailto:` link.
 - **Gmail access:** thread-only, minimal scopes, every call audited (§3 "Email channel").
+- **Visitors' AI keys (ADR-023):** never persisted or logged, never passed through Temporal; held in the API's memory per owner with a TTL; the worker fetches them over loopback with `INTERNAL_SECRET`. `UserKeys` must never print a key.
 - **Secrets:** only via env vars. `.env` is git-ignored; ship `.env.example`. Never log API keys or OAuth tokens.
 - **Disclaimer:** "informational, not legal advice" in the UI and in drafts.
 - **Adversarial test suite** is mandatory (§8).
@@ -440,6 +441,10 @@ FRONTEND_URL=http://localhost:3000   # where the API sends the browser back afte
 CORS_ORIGINS=["http://localhost:3000"]
 OWNER_COOKIE_SECURE=false        # true (HTTPS) when the frontend and API are on different sites
 OWNER_COOKIE_SAMESITE=lax        # none for a cross-site deployment
+REQUIRE_USER_KEYS=false          # true: visitors run cases on their own AI key, held in memory only (ADR-023)
+INTERNAL_SECRET=                 # shared by API and worker for the worker's key lookup (required with the above)
+USER_KEY_TTL_MINUTES=360
+API_INTERNAL_URL=http://127.0.0.1:8000
 ```
 
 ---

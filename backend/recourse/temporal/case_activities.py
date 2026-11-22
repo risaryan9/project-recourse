@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import re
 import uuid
+from collections.abc import Awaitable, Callable
 from datetime import date, timedelta
 from typing import Any
 
@@ -79,6 +80,7 @@ from recourse.email.oauth import GoogleOAuth, OAuthError
 from recourse.evidence.models import IST
 from recourse.evidence.validators import EvidenceCheck
 from recourse.llm.base import Attachment, LLMClient, LLMError
+from recourse.llm.user_keys import NEEDS_KEY_MESSAGE, MissingUserKeys
 from recourse.rules.models import Entitlement, EscalationAssessment
 from recourse.security.pii import RedactionKind, redact_text
 from recourse.temporal.case_types import (
@@ -125,6 +127,7 @@ from recourse.temporal.case_types import (
 )
 
 LLM_FAILED = "LLMFailed"
+NEEDS_API_KEY = "NeedsApiKey"  # bring your own key: the owner has no key in the API right now
 
 
 def invalid(message: str) -> ApplicationError:
@@ -139,8 +142,9 @@ class CaseActivities:
     def __init__(
         self,
         sessions: async_sessionmaker[AsyncSession],
-        llm: LLMClient,
+        llm: LLMClient | None,
         *,
+        llm_for: Callable[[uuid.UUID], Awaitable[LLMClient]] | None = None,
         settings: Settings | None = None,
         contacts: BankContacts | None = None,
         channels: dict[ChannelKind, EmailChannel] | None = None,
@@ -148,6 +152,8 @@ class CaseActivities:
     ) -> None:
         self._sessions = sessions
         self._llm = llm
+        # Bring your own key (ADR-023): the client for a case, from its owner's key in the API.
+        self._llm_for = llm_for
         self._settings = settings or get_settings()
         self._contacts = contacts or load_bank_contacts()
         self._channels: dict[ChannelKind, EmailChannel] = channels or {
@@ -155,6 +161,18 @@ class CaseActivities:
         }
         # One HTTP client for Google (OAuth + Gmail); tests pass a mocked one.
         self._http = http
+
+    async def _model(self, case_id: uuid.UUID) -> LLMClient:
+        """The model client for this case: the owner's own key when keys are required."""
+        if self._llm_for is not None:
+            try:
+                return await self._llm_for(case_id)
+            except MissingUserKeys:
+                raise ApplicationError(
+                    NEEDS_KEY_MESSAGE, type=NEEDS_API_KEY, non_retryable=True
+                ) from None
+        assert self._llm is not None, "no model client configured"
+        return self._llm
 
     def all(self) -> list[Any]:
         return [
@@ -193,7 +211,7 @@ class CaseActivities:
             )
 
         try:
-            result = await run_intake(self._llm, intake, now=inp.now)
+            result = await run_intake(await self._model(inp.case_id), intake, now=inp.now)
         except LLMError as e:
             if e.retryable:
                 raise  # Temporal retries later
@@ -375,7 +393,7 @@ class CaseActivities:
 
         try:
             result = await run_draft(
-                self._llm,
+                await self._model(inp.case_id),
                 entitlement,
                 evidence,
                 case_tag=case_tag,
@@ -796,7 +814,7 @@ class CaseActivities:
             )
 
         try:
-            verdict = await judge_reply(self._llm, judge_input)
+            verdict = await judge_reply(await self._model(inp.case_id), judge_input)
         except LLMError as e:
             if e.retryable:
                 raise

@@ -5,8 +5,9 @@ import { Suspense, useEffect, useState } from "react";
 
 import { FormError, Panel, QuietButton, TextButton } from "@/components/app/ui";
 import { api, GMAIL_CONNECT_URL } from "@/lib/api";
+import { KeyPanel } from "@/components/app/key-panel";
 import { GmailLogo } from "@/components/brand/gmail-logo";
-import { useConfig, useGmail } from "@/lib/hooks";
+import { useConfig, useGmail, useKeyStatus } from "@/lib/hooks";
 
 const GMAIL_ERRORS: Record<string, string> = {
   denied: "You cancelled the Google sign-in. Nothing was connected.",
@@ -31,6 +32,7 @@ function Section({ title, children }: { title: string; children: React.ReactNode
 function Settings() {
   const config = useConfig();
   const { status: gmail, refresh: refreshGmail } = useGmail();
+  const { status: keyStatus, refresh: refreshKeys } = useKeyStatus();
   const params = useSearchParams();
   const router = useRouter();
   const [actionNote, setActionNote] = useState<{ ok: boolean; text: string } | null>(null);
@@ -85,6 +87,11 @@ function Settings() {
     <div className="mx-auto max-w-2xl pt-8 sm:pt-12">
       <h1 className="type-title">Settings</h1>
       <div className="mt-10 flex flex-col gap-5">
+        {config?.require_user_keys ? (
+          <Section title="Your AI key">
+            <KeyPanel status={keyStatus} onChange={refreshKeys} />
+          </Section>
+        ) : null}
         <Section title="Email">
           {gmail?.connected ? (
             <p className="text-text-2">

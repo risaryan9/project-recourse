@@ -2,7 +2,8 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 
-import { api, ApiError, type GmailStatus, type PublicConfig } from "@/lib/api";
+import { api, ApiError, type GmailStatus, type KeyStatus, type PublicConfig } from "@/lib/api";
+import { readKeys } from "@/lib/keys";
 
 let configPromise: Promise<PublicConfig> | null = null;
 
@@ -108,6 +109,32 @@ export function useGmail(): { status: GmailStatus | null; refresh: () => void } 
   const [status, setStatus] = useState<GmailStatus | null>(null);
   const refresh = useCallback(() => {
     api.gmailStatus().then(setStatus, () => setStatus(null));
+  }, []);
+  useEffect(refresh, [refresh]);
+  return { status, refresh };
+}
+
+/**
+ * Bring your own key (ADR-023): whether the API holds this browser's key. If it doesn't but
+ * this tab has one (the API restarted, or its memory copy expired), send it again quietly.
+ */
+export function useKeyStatus(): { status: KeyStatus | null; refresh: () => void } {
+  const [status, setStatus] = useState<KeyStatus | null>(null);
+  const refresh = useCallback(() => {
+    api.keyStatus().then(
+      async (s) => {
+        const local = readKeys();
+        if (s.required && !s.anthropic && !s.openai && local) {
+          try {
+            s = await api.saveKeys(local);
+          } catch {
+            /* the key no longer works: show the form */
+          }
+        }
+        setStatus(s);
+      },
+      () => setStatus(null),
+    );
   }, []);
   useEffect(refresh, [refresh]);
   return { status, refresh };

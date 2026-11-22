@@ -69,6 +69,7 @@ class PublicConfig(BaseModel):
     email_sandbox: bool  # True: show "Sandbox: not sent to the real bank"
     demo_mode: bool  # True: one "day" lasts demo_day_seconds
     demo_day_seconds: int
+    require_user_keys: bool  # True: each visitor runs cases on their own AI key (ADR-023)
 
 
 @router.get("/config")
@@ -77,4 +78,5 @@ async def public_config(settings: Annotated[Settings, Depends(get_settings)]) ->
         email_sandbox=settings.email_sandbox,
         demo_mode=settings.demo_mode,
         demo_day_seconds=settings.demo_day_seconds,
+        require_user_keys=settings.require_user_keys,
     )

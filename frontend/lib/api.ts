@@ -3,6 +3,8 @@
  * anonymous owner cookie (`credentials: "include"`), so a browser sees only its own cases.
  */
 
+import { readKeys, type LocalKeys } from "@/lib/keys";
+
 export const API_URL = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
 
 /* ----------------------------------------------------------------------------------------- */
@@ -27,7 +29,20 @@ export type CaseStatus =
 
 export const ENDED: CaseStatus[] = ["RESOLVED", "CLOSED", "ABANDONED"];
 
-export type PublicConfig = { email_sandbox: boolean; demo_mode: boolean; demo_day_seconds: number };
+export type PublicConfig = {
+  email_sandbox: boolean;
+  demo_mode: boolean;
+  demo_day_seconds: number;
+  require_user_keys: boolean;
+};
+
+/** Bring your own key (ADR-023): whether this browser's keys are in the API's memory. */
+export type KeyStatus = {
+  required: boolean;
+  anthropic: boolean;
+  openai: boolean;
+  expires_in_seconds: number | null;
+};
 
 export type GmailStatus = { configured: boolean; connected: boolean; email: string | null };
 
@@ -286,7 +301,7 @@ function describe(detail: unknown): string {
   return "Something went wrong.";
 }
 
-async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
+async function request<T>(path: string, init: RequestInit = {}, retried = false): Promise<T> {
   let res: Response;
   try {
     res = await fetch(`${API_URL}${path}`, {
@@ -300,6 +315,19 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
     });
   } catch {
     throw new ApiError(0, "Recourse can't be reached right now. Check your connection and try again.");
+  }
+  if (res.status === 428 && !retried && path !== "/keys") {
+    // The API no longer holds this browser's key (it restarted, or the key expired): send
+    // the copy kept in this tab once, then try again.
+    const local = readKeys();
+    if (local) {
+      try {
+        await request<KeyStatus>("/keys", { method: "PUT", body: JSON.stringify(local) }, true);
+        return await request<T>(path, init, true);
+      } catch {
+        /* fall through to the API's own message */
+      }
+    }
   }
   if (!res.ok) {
     let detail: unknown;
@@ -320,6 +348,9 @@ const put = <T>(path: string, body: unknown) =>
 
 export const api = {
   config: () => request<PublicConfig>("/config"),
+  keyStatus: () => request<KeyStatus>("/keys"),
+  saveKeys: (keys: LocalKeys) => put<KeyStatus>("/keys", keys),
+  forgetKeys: () => request<KeyStatus>("/keys", { method: "DELETE" }),
   gmailStatus: () => request<GmailStatus>("/auth/google/status"),
   gmailDisconnect: () => request<GmailStatus>("/auth/google/disconnect", { method: "POST" }),
   listCases: () => request<CaseSummary[]>("/cases"),

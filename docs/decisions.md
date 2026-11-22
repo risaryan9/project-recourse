@@ -826,3 +826,38 @@ browser requests with an interstitial warning page instead of the API's JSON.
 - Uploads pass through Vercel's proxy; very large files may hit its request limits.
 - A single container on a free host (or DBOS) remains the path to always-on hosting.
 
+## ADR-023: Bring your own key (visitors pay for their own model calls)
+
+### Context
+The live demo runs on the owner's laptop (ADR-022). Model calls cost money, so a public visitor
+must run their case on their own Anthropic or OpenAI key, and that key must not be kept. Most
+model calls run in Temporal activities, sometimes long after the request (a bank reply arriving
+in Gmail, the Ombudsman draft when the bank's window ends), and Temporal keeps workflow inputs
+and activity results in its history permanently, so the key cannot travel through Temporal.
+
+### Decision
+- `REQUIRE_USER_KEYS=true`: the server's own keys are never used for cases; the worker builds no
+  default client.
+- **Browser:** the visitor enters a key in the UI; it is kept in `sessionStorage` (this tab only)
+  and sent once to `PUT /keys`.
+- **API:** checks it with a free call (list models), then holds it in a process-memory
+  `KeyVault`, per owner (the anonymous browser ID), expiring after `USER_KEY_TTL_MINUTES` (360).
+  Never written to the database, a file, a log, Temporal, or any response except the internal
+  one. `UserKeys` cannot print a key. `DELETE /keys` forgets it.
+- **Worker:** an activity that needs a model asks `GET /internal/keys/{case_id}` over loopback
+  with `INTERNAL_SECRET`, builds the clients for that call and drops them. The endpoint answers
+  404 to any request carrying a forwarding header (everything through Vercel or ngrok), without
+  the secret, or when no key is held.
+- **Gate:** actions that start model work (create, confirm, reject/redraft, bank reply, escalate,
+  bank type, recheck) return 428 `NEEDS_API_KEY` without a key. The UI shows the key form; the
+  client re-sends the tab's copy once on a 428 or on page load if the API lost it (restart).
+- A background step that runs while the key is gone fails with "Add your AI key, then try
+  again": a draft can be written again, a pasted reply re-checked.
+
+### Consequences
+- The owner pays nothing for visitors; visitors can verify the claim in the source.
+- Wording in the UI is exact: "never saved" (not "not stored anywhere"): the key lives in the
+  tab and in server memory while needed.
+- After the TTL or a restart, a step that runs with nobody on the page cannot use a model until
+  the visitor returns.
+

@@ -12,7 +12,7 @@ Ombudsman if the bank doesn't put it right.
 
 Built for [Arthaton 2026](https://arthaton.com).
 
-**[Try it live](https://recourse-omega.vercel.app)** (synthetic data only; emails go to a sandbox inbox)
+**[Try it live](https://recourse-omega.vercel.app)** with your own Anthropic or OpenAI API key (never saved; synthetic data only; emails go to a sandbox inbox)
 
 </div>
 
@@ -260,6 +260,7 @@ hand against the primary document; until then, emails stay in the sandbox.
 | Wrong amounts or invented rules | Amounts and dates come only from the rule engine; a mandatory verify step rejects any letter with a typed number or an unknown rule |
 | Sending to the wrong place | Sandbox by default; real sending needs a verified bank contact and verified rules; nothing is sent without approval of that exact letter |
 | Personal data | Card, account and Aadhaar numbers are masked to the last four digits; OTPs, PINs, CVVs, PAN and passwords are removed. This happens before storage, and before any model call on typed text and bank replies. Uploaded images and PDFs are read by the model as they are; what is extracted from them is masked before it is stored. |
+| Visitors' AI keys | Each visitor runs cases on their own Anthropic or OpenAI key. It is checked, then held only in the open browser tab and in the API's memory for up to six hours; never written to the database, a file, a log or Temporal's history. The worker fetches it over loopback with a shared secret, refused through the public proxy ([ADR-023](docs/decisions.md)) |
 | Gmail tokens | Refresh tokens are encrypted at rest (Fernet); Disconnect revokes access and deletes them |
 | Someone else's cases | Each case belongs to the browser that created it (an anonymous token, stored only as a hash); other browsers get "not found" |
 
@@ -365,6 +366,12 @@ Open http://localhost:3000 and choose **Start a case**: paste a bank SMS (synthe
 or upload a screenshot from [`data/synthetic/screens/`](data/synthetic/screens/). `/status`
 shows whether the API and Temporal are up. Cases belong to the browser that created them (an
 anonymous cookie; no account).
+
+### Bring your own key
+With `REQUIRE_USER_KEYS=true` (the live demo), the server's own model keys are never used: each
+visitor adds their key in the app, and Recourse holds it only in memory while their case needs
+it. Set `INTERNAL_SECRET` to a random string (the API and the worker share it). Leave
+`REQUIRE_USER_KEYS` unset to run everything on the keys in `.env`.
 
 ### Demo mode
 With `DEMO_MODE=true`, one "day" lasts `DEMO_DAY_SECONDS` seconds (default 60), so a case that
@@ -483,6 +490,9 @@ infra/           docker-compose for Temporal, API and worker
   launch.
 - **Uploaded images and PDFs** reach the model unmasked; only typed text and replies are masked
   first.
+- **Your key and background steps.** A step that runs while nobody is on the page (a bank reply
+  arriving in Gmail, the Ombudsman draft when the bank's window ends) needs the visitor's key to
+  still be in memory; otherwise it asks them to add it again and retry.
 - **Hosting.** The live demo's backend runs on one laptop behind a tunnel, so it is up only while
   that machine is; a single always-on container is the next step.
 - **Tracing.** LangSmith tracing is configured but not wired in yet; today the trail is Temporal's

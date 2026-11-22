@@ -11,6 +11,7 @@ from temporalio.worker import Worker
 from recourse.config import get_settings
 from recourse.db.session import make_engine, make_session_factory
 from recourse.llm import get_llm
+from recourse.llm.user_keys import CaseKeyResolver
 from recourse.temporal.activities import say_hello
 from recourse.temporal.case_activities import CaseActivities
 from recourse.temporal.case_runner import connect
@@ -27,7 +28,13 @@ async def main() -> None:
     settings = get_settings()
     client = await connect(settings)
     engine = make_engine(settings=settings)
-    cases = CaseActivities(make_session_factory(engine), get_llm(settings))
+    if settings.require_user_keys:
+        # Bring your own key (ADR-023): never the server's keys; each case uses its owner's.
+        cases = CaseActivities(
+            make_session_factory(engine), None, llm_for=CaseKeyResolver(settings)
+        )
+    else:
+        cases = CaseActivities(make_session_factory(engine), get_llm(settings))
     worker = Worker(
         client,
         task_queue=settings.temporal_task_queue,

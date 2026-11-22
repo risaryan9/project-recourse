@@ -62,7 +62,16 @@ def test_public_config_has_only_safe_flags() -> None:
 
     app = create_app()
     app.dependency_overrides[get_settings] = lambda: Settings(
-        email_sandbox=True, demo_mode=True, demo_day_seconds=10, sandbox_recipient="x@example.com"
+        email_sandbox=True,
+        demo_mode=True,
+        demo_day_seconds=10,
+        sandbox_recipient="x@example.com",
+        require_user_keys=True,
     )
     body = TestClient(app).get("/config").json()
-    assert body == {"email_sandbox": True, "demo_mode": True, "demo_day_seconds": 10}
+    assert body == {
+        "email_sandbox": True,
+        "demo_mode": True,
+        "demo_day_seconds": 10,
+        "require_user_keys": True,
+    }
